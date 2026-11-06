@@ -10,6 +10,12 @@
 //! therefore never delays a sample, and a sample never waits for a client: the tick only tries
 //! the mutex, and leaves the queue's work for the next sample if the socket thread has it.
 //!
+//! What the socket thread tells a waiting client shows that it is alive, not that anything is
+//! being scheduled, so it tells them only while the sampling thread is: a thread whose signals
+//! are unreadable, or that is stuck, does not do the queue's work, and once it has not for the
+//! silence limit (`Core::stalled`) the waiting clients are sent away with an error, which they
+//! take as the queue being unavailable, and so is any that asks, until the work resumes.
+//!
 //! Neither thread touches a file. `queue.tsv` and `sizes.tsv` are written by a thread of their
 //! own (`spool`), fed through a bounded queue that drops what it cannot take. That thread
 //! keeps the latest snapshot of a file it could not write and writes it again (`FileWriter`).
@@ -92,6 +98,10 @@ struct Core {
     /// Notes that did not fit in `log`.
     lost_notes: u64,
     dry_run: bool,
+    /// When the sampling thread last did the queue's work (see `Broker::tick`): the start,
+    /// until it does. The socket thread keeps clients waiting only while this is recent
+    /// (`stalled`). Monotonic.
+    scheduled_at: Instant,
 }
 
 fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
@@ -99,7 +109,19 @@ fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
     core.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a client that cannot be kept waiting is told, once the sampling thread has stopped
+/// scheduling; a client takes any error as the queue being unavailable and runs its command.
+const NOT_SCHEDULING: &str = "the queue is not scheduling";
+
 impl Core {
+    /// Whether the sampling thread has not done the queue's work for `after`: it is not
+    /// sampling (the signals are unreadable, or it is stuck), so nothing here would ever be
+    /// admitted, and the lines the socket thread can still send would only keep clients from
+    /// running their commands. A dry run holds nobody, so it never stalls.
+    fn stalled(&self, after: Duration) -> bool {
+        !self.dry_run && self.scheduled_at.elapsed() >= after
+    }
+
     fn note(&mut self, kind: &'static str, text: String) {
         if self.log.len() < MAX_NOTES {
             self.log.push((kind, text));
@@ -402,6 +424,7 @@ impl Broker {
             log,
             lost_notes: 0,
             dry_run: opts.dry_run,
+            scheduled_at: Instant::now(),
         }));
         let files = (!opts.dry_run)
             .then(|| spawn_files(&opts.state_dir, &core, RETRY_EVERY))
@@ -468,6 +491,7 @@ impl Broker {
                 Err(TryLockError::WouldBlock) => return notes,
             };
             let core = &mut *guard;
+            core.scheduled_at = Instant::now();
             let lost = core.take_notes(&mut notes);
             for &(id, bytes) in &self.seen {
                 core.sched.observe(id, bytes);
@@ -829,6 +853,12 @@ struct Ctx<'a> {
     dry_run: bool,
     /// A waiting client is told where it stands at least this often.
     keep_alive: Duration,
+    /// Past this long since the sampling thread last did the queue's work (`Core::stalled`),
+    /// waiting clients are sent away instead of being told where they stand, and a client that
+    /// asks is waiting from that moment, so it is too. As long as a client waits in silence
+    /// before it gives up on the daemon: the lines of the socket thread, which can only show
+    /// that it is alive, never hold a client for longer than the silence would have.
+    stalled_after: Duration,
 }
 
 impl Ctx<'_> {
@@ -927,27 +957,31 @@ impl Ctx<'_> {
         }
     }
 
-    /// Tells every waiting client where it stands, and every admitted one to go.
+    /// Tells every waiting client where it stands, and every admitted one to go; if the
+    /// sampling thread has stopped scheduling, sends the waiting ones away instead.
     fn deliver(&self, conns: &mut [Conn], view: &mut Snapshot) {
         if conns.iter().all(|c| c.id.is_none()) {
             return;
         }
-        {
+        let stalled = {
             let core = lock(self.core);
             core.sched
                 .snapshot(&|signature| core.sizes.get(signature), view);
-        }
+            core.stalled(self.stalled_after)
+        };
         for conn in conns.iter_mut() {
             let Some(id) = conn.id.filter(|_| !conn.closing && !conn.dead) else {
                 continue;
             };
             if let Some(w) = view.waiting.iter().find(|w| w.id == id) {
                 let standing = (w.position, w.need);
-                // Said again when nothing changed: a client that hears nothing for a while
-                // takes the daemon to be gone and runs its command.
-                if !self.dry_run
+                if stalled {
+                    conn.refuse(NOT_SCHEDULING);
+                } else if !self.dry_run
                     && (conn.told != Some(standing) || conn.told_at.elapsed() >= self.keep_alive)
                 {
+                    // Said again when nothing changed: a client that hears nothing for a
+                    // while takes the daemon to be gone and runs its command.
                     conn.told = Some(standing);
                     conn.told_at = Instant::now();
                     conn.say(&Reply::Queued {
@@ -982,6 +1016,7 @@ fn serve(
         files,
         dry_run,
         keep_alive: wire::timing().keep_alive,
+        stalled_after: wire::timing().silence,
     };
     let mut conns: Vec<Conn> = Vec::new();
     let mut view = Snapshot::default();
@@ -1690,6 +1725,7 @@ mod tests {
             files: None,
             dry_run: false,
             keep_alive: wire::KEEP_ALIVE,
+            stalled_after: wire::SILENCE,
         };
         let conn = |start_us: u64| Conn {
             stream: stream.try_clone().unwrap(),
@@ -1759,6 +1795,64 @@ mod tests {
         tick_until(&mut broker, &mut time, 80, || {
             client.line(Duration::from_millis(20)).as_deref() == Some("GO")
         });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The silence limit, as this process has it, and a moment more.
+    fn past_the_silence() -> Duration {
+        wire::timing().silence + Duration::from_secs(1)
+    }
+
+    /// The lines of the socket thread show that it is alive, not that anything is scheduled.
+    /// Once the sampling thread has not done the queue's work for the silence limit (its
+    /// signals unreadable, or stuck in a file), a waiting client is sent away with an error
+    /// (which it takes as the queue being unavailable and runs its command) instead of being
+    /// told its place for ever, and so is one that asks; when sampling resumes the queue
+    /// serves clients again.
+    #[test]
+    fn clients_are_sent_away_while_the_sampling_thread_is_not_scheduling() {
+        let (mut broker, socket, dir) = broker("stalled", false);
+        let core = Arc::clone(&broker.core);
+        let mut waiting = Client::connect(&socket);
+        waiting.request("first");
+        assert!(waiting.next().starts_with("QUEUED\t1\t"));
+        let mut time = 1000.0;
+        tick_n(&mut broker, &mut time, 35, 3);
+
+        // The sampling thread stops: its last tick is older than the limit.
+        lock(&core).scheduled_at = Instant::now().checked_sub(past_the_silence()).unwrap();
+        assert_eq!(waiting.next(), "ERROR\tthe queue is not scheduling");
+        assert!(waiting.hung_up());
+        let mut late = Client::connect(&socket);
+        late.request("second");
+        assert_eq!(late.next(), "ERROR\tthe queue is not scheduling");
+        assert!(late.hung_up());
+
+        // Sampling resumes, and a client that asks is served.
+        let silence = wire::timing().silence;
+        tick_until(&mut broker, &mut time, 80, || !lock(&core).stalled(silence));
+        let mut again = Client::connect(&socket);
+        again.request("third");
+        assert!(again.next().starts_with("QUEUED\t"));
+        let mut go = None;
+        tick_until(&mut broker, &mut time, 80, || {
+            go = again.line(Duration::from_millis(20));
+            go.is_some()
+        });
+        assert_eq!(go.as_deref(), Some("GO"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dry run holds nobody: its clients have their go-ahead at once and are never sent
+    /// away, whatever the sampling thread is doing.
+    #[test]
+    fn a_dry_run_never_sends_a_client_away_for_a_stalled_sampler() {
+        let (broker, socket, dir) = broker("stalled-dry", true);
+        lock(&broker.core).scheduled_at = Instant::now().checked_sub(past_the_silence()).unwrap();
+        let mut client = Client::connect(&socket);
+        client.request("tests");
+        assert_eq!(client.next(), "GO");
+        assert!(client.line(Duration::from_millis(500)).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1933,6 +2027,7 @@ mod tests {
             log: Vec::new(),
             lost_notes: 0,
             dry_run: false,
+            scheduled_at: Instant::now(),
         })
     }
 

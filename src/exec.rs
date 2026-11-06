@@ -4,7 +4,8 @@
 //! The client never stands between a command and the machine for longer than the daemon says.
 //! If the socket is missing or refuses, or the daemon sends an error, hangs up, does not answer
 //! the request within `FIRST_ANSWER`, or says nothing at all for `wire::SILENCE` after that (it
-//! tells every client that waits where it stands at least every `wire::KEEP_ALIVE`), it says so
+//! tells every client that waits where it stands at least every `wire::KEEP_ALIVE`, for as long
+//! as its sampling loop is scheduling the queue), it says so
 //! on one line of stderr and runs the command at once. A command
 //! started by one that was already admitted (`MEMBRAKE_ADMITTED` is set) is run directly, so
 //! the heavy commands a heavy command starts do not queue behind it.

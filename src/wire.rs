@@ -13,6 +13,9 @@
 //!
 //! A client that is waiting is told where it stands at least every `KEEP_ALIVE`, whether or not
 //! that changed, and takes a daemon that says nothing for `SILENCE` to have stopped answering.
+//! That holds while the daemon's sampling loop is scheduling the queue: once it has not for
+//! `SILENCE` (its signals are unreadable, or it is stuck), a waiting client, and any that
+//! asks, is sent `ERROR the queue is not scheduling` instead, and runs its command.
 //!
 //! Nothing a client sends is trusted: the daemon sanitizes every string and bounds every line.
 //! `STARTED` is accepted once, after `GO`, and only for the group of a command that this client
