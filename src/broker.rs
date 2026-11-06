@@ -11,13 +11,17 @@
 //! the mutex, and leaves the queue's work for the next sample if the socket thread has it.
 //!
 //! Neither thread touches a file. `queue.tsv` and `sizes.tsv` are written by a thread of their
-//! own (`spool`), fed through a bounded queue that drops what it cannot take. (The exceptions
-//! are start-up, which reads `sizes.tsv`, and shutdown, which removes the socket.)
+//! own (`spool`), fed through a bounded queue that drops what it cannot take. That thread
+//! keeps the latest snapshot of a file it could not write and writes it again (`FileWriter`).
+//! (The exceptions are start-up, which reads `sizes.tsv`, and shutdown, which removes the
+//! socket.)
 //!
 //! Clients are identified by the kernel, never by what they claim: the peer pid and uid come
-//! from the socket itself, and the session is worked out here from the peer pid. The group a
-//! client says its command runs as is checked against the kernel too, and only that group is
-//! ever measured.
+//! from the socket itself, together with the start time of the process that has that pid when
+//! the connection is accepted, and the session is worked out here from the peer pid. The group
+//! a client says its command runs as is checked against the kernel too (its leader must be a
+//! child of that same process, which must still be there), and only that group is ever
+//! measured.
 //!
 //! Trust model: the socket is writable by every local user, so any of them may ask for a turn.
 //! That is meant for a Mac with one user. Nothing a client sends can do more than take a place
@@ -43,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What the queue has learned, in the state directory.
 pub const SIZES_FILE: &str = "sizes.tsv";
@@ -176,45 +180,125 @@ enum FileWork {
     Done(mpsc::Sender<()>),
 }
 
+/// How long the thread that writes the files waits before it tries again what it could not
+/// write (it also tries again whenever it is given something new).
+const RETRY_EVERY: Duration = Duration::from_secs(5);
+
+/// The thread that writes `queue.tsv` and `sizes.tsv`. A write that fails is not forgotten: the
+/// latest snapshot of that file is kept here and written again, every `retry_every` and
+/// whenever something new arrives, until a write works. A newer snapshot takes the place of
+/// an older one that never got written, so the producers hand over what they have once and
+/// never wait to hear whether it was written.
+struct FileWriter {
+    status: PathBuf,
+    status_tmp: PathBuf,
+    sizes: PathBuf,
+    sizes_tmp: PathBuf,
+    /// The latest snapshot of each file that is not on disk yet.
+    unwritten_status: Option<String>,
+    unwritten_sizes: Option<Arc<Sizes>>,
+    retry_every: Duration,
+    last_try: Instant,
+    failures: Failures,
+}
+
+/// Says that a write failed: once for each file, not on every attempt, until a write of it
+/// works again.
+struct Failures {
+    core: Arc<Mutex<Core>>,
+    retry_every: Duration,
+    said: Vec<PathBuf>,
+}
+
+impl Failures {
+    /// Whether the write worked; if not, says so.
+    fn worked(&mut self, result: io::Result<()>, path: &Path) -> bool {
+        let Err(e) = result else {
+            self.said.retain(|p| p != path);
+            return true;
+        };
+        if !self.said.iter().any(|p| p == path) {
+            self.said.push(path.to_path_buf());
+            let text = format!(
+                "cannot write {}: {e}; trying again every {} s",
+                path.display(),
+                self.retry_every.as_secs()
+            );
+            lock(&self.core).note("warn", text);
+        }
+        false
+    }
+}
+
+impl FileWriter {
+    /// One turn of the thread: something offered, or (None) a second with nothing offered.
+    fn work(&mut self, work: Option<FileWork>) {
+        match work {
+            Some(FileWork::Status(text)) => self.unwritten_status = Some(text),
+            Some(FileWork::Sizes(table)) => self.unwritten_sizes = Some(table),
+            Some(FileWork::Remove) => {
+                // The broker is going: a snapshot that never got written is not to appear now.
+                self.unwritten_status = None;
+                let _ = fs::remove_file(&self.status);
+                return;
+            }
+            Some(FileWork::Done(done)) => {
+                let _ = done.send(());
+                return;
+            }
+            None if self.last_try.elapsed() < self.retry_every => return,
+            None => {}
+        }
+        self.write_unwritten();
+    }
+
+    fn write_unwritten(&mut self) {
+        if self.unwritten_status.is_none() && self.unwritten_sizes.is_none() {
+            return;
+        }
+        self.last_try = Instant::now();
+        if let Some(text) = &self.unwritten_status {
+            let result = write_atomic(&self.status, &self.status_tmp, text.as_bytes());
+            if self.failures.worked(result, &self.status) {
+                self.unwritten_status = None;
+            }
+        }
+        if let Some(table) = &self.unwritten_sizes {
+            let result = write_atomic(&self.sizes, &self.sizes_tmp, table.render().as_bytes());
+            if self.failures.worked(result, &self.sizes) {
+                self.unwritten_sizes = None;
+            }
+        }
+    }
+}
+
 /// Starts the thread that writes `queue.tsv` and `sizes.tsv` in `state_dir`. What it cannot
 /// write, and what it is too far behind to be given, is said in the next tick's notes.
-fn spawn_files(state_dir: &Path, core: &Arc<Mutex<Core>>) -> Result<Spool<FileWork>, String> {
-    let status = state_dir.join(QUEUE_FILE);
-    let status_tmp = state_dir.join(format!("{QUEUE_FILE}.tmp"));
-    let sizes = state_dir.join(SIZES_FILE);
-    let sizes_tmp = state_dir.join(format!("{SIZES_FILE}.tmp"));
-    let (on_failure, on_loss) = (Arc::clone(core), Arc::clone(core));
-    let mut failing = false;
-    Spool::spawn(
+fn spawn_files(
+    state_dir: &Path,
+    core: &Arc<Mutex<Core>>,
+    retry_every: Duration,
+) -> Result<Spool<FileWork>, String> {
+    let mut writer = FileWriter {
+        status: state_dir.join(QUEUE_FILE),
+        status_tmp: state_dir.join(format!("{QUEUE_FILE}.tmp")),
+        sizes: state_dir.join(SIZES_FILE),
+        sizes_tmp: state_dir.join(format!("{SIZES_FILE}.tmp")),
+        unwritten_status: None,
+        unwritten_sizes: None,
+        retry_every,
+        last_try: Instant::now(),
+        failures: Failures {
+            core: Arc::clone(core),
+            retry_every,
+            said: Vec::new(),
+        },
+    };
+    let on_loss = Arc::clone(core);
+    Spool::spawn_idling(
         "membrake-queue-files",
         FILE_QUEUE,
-        move |work| {
-            let (result, path) = match work {
-                FileWork::Status(text) => {
-                    (write_atomic(&status, &status_tmp, text.as_bytes()), &status)
-                }
-                FileWork::Sizes(table) => (
-                    write_atomic(&sizes, &sizes_tmp, table.render().as_bytes()),
-                    &sizes,
-                ),
-                FileWork::Remove => {
-                    let _ = fs::remove_file(&status);
-                    return;
-                }
-                FileWork::Done(done) => {
-                    let _ = done.send(());
-                    return;
-                }
-            };
-            match result {
-                Ok(()) => failing = false,
-                // Said once, not on every attempt.
-                Err(e) if !std::mem::replace(&mut failing, true) => {
-                    lock(&on_failure).note("warn", format!("cannot write {}: {e}", path.display()));
-                }
-                Err(_) => {}
-            }
-        },
+        move |work| writer.work(work),
         move |lost| {
             let text = format!(
                 "{lost} queue file write(s) were dropped while the disk was not keeping up"
@@ -261,6 +345,8 @@ pub struct Broker {
     inspector: Inspector,
     /// Where the queue stood at the last tick, copied out of the core.
     view: Snapshot,
+    /// On how many samples the queue's work was done (see `scheduled`).
+    scheduled: u64,
 }
 
 impl Broker {
@@ -318,7 +404,7 @@ impl Broker {
             dry_run: opts.dry_run,
         }));
         let files = (!opts.dry_run)
-            .then(|| spawn_files(&opts.state_dir, &core))
+            .then(|| spawn_files(&opts.state_dir, &core, RETRY_EVERY))
             .transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_core, thread_stop, thread_files) =
@@ -339,7 +425,15 @@ impl Broker {
             seen: Vec::with_capacity(16),
             inspector: Inspector::new(),
             view: Snapshot::default(),
+            scheduled: 0,
         })
+    }
+
+    /// On how many samples the queue's work was done: the group measuring, the scheduler's
+    /// step, the snapshot. A sample on which the socket thread had the queue does none of it
+    /// and is not counted.
+    pub fn scheduled(&self) -> u64 {
+        self.scheduled
     }
 
     /// One sample: measures the admitted groups, decides whether the next request starts, and
@@ -392,6 +486,7 @@ impl Broker {
             (admitted, lost)
         };
         // From here on the socket thread has the core again.
+        self.scheduled += 1;
         if lost > 0 {
             notes.push(lost_note(lost));
         }
@@ -591,9 +686,11 @@ fn bind(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-/// Who is on the other end, as the kernel says.
+/// Who is on the other end, as the kernel says: the process (pid and start time, which tell it
+/// from whoever has the pid next) that made the connection, and its user.
 struct Peer {
     pid: i32,
+    start_us: u64,
     uid: u32,
 }
 
@@ -620,7 +717,20 @@ impl Peer {
         if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Peer { pid, uid })
+        // The pid alone is only a number: the connection can outlive the process (handed on
+        // by inheritance or by a passed descriptor) and the pid can be given to another.
+        let start_us = match jobs::probe(pid) {
+            Probe::Found(p) => p.start_us,
+            Probe::Gone => return Err(io::Error::other("the client has already exited")),
+            Probe::Unreadable(e) => return Err(e),
+        };
+        Ok(Peer { pid, start_us, uid })
+    }
+
+    /// Whether the process that made the connection is still there as itself: its pid still
+    /// has the start time it had when it connected.
+    fn is_alive(&self) -> bool {
+        matches!(jobs::probe(self.pid), Probe::Found(p) if p.start_us == self.start_us)
     }
 }
 
@@ -769,9 +879,11 @@ impl Ctx<'_> {
 
     /// The client says its command runs as group `pgid`. Once per connection, after it was
     /// told to go, and only if the group is what a command started by this client is: led by
-    /// a process that is its child, of the same user, that started after the go-ahead. That
-    /// leader's identity is what is measured from then on; nothing else a client names is
-    /// ever looked at.
+    /// a process that is its child, of the same user, that started after the go-ahead. The
+    /// client is the process that connected, still: a pid that has since gone to another
+    /// process is not it, and a child of that process is not its command. That leader's
+    /// identity is what is measured from then on; nothing else a client names is ever looked
+    /// at.
     fn started(&self, conn: &mut Conn, id: Id, pgid: i32) {
         if conn.started {
             return conn.refuse("a connection starts once");
@@ -785,7 +897,8 @@ impl Ctx<'_> {
                     && l.pgid == pgid
                     && l.ppid == conn.peer.pid
                     && l.uid == conn.peer.uid
-                    && l.start_us > (go_at * 1e6) as u64 =>
+                    && l.start_us > (go_at * 1e6) as u64
+                    && conn.peer.is_alive() =>
             {
                 l
             }
@@ -1507,6 +1620,98 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The client is the process that connected, and not whoever has its pid by the time it
+    /// says STARTED: the connection can outlive the process (inherited, or passed on) and the
+    /// pid can be reissued, and a child of the process that has it then is not the client's
+    /// command. A pid cannot be made to be reissued on demand, so the connection here carries
+    /// a start time that is not the one this process has: the pid has gone to another process
+    /// since. The command is a real child of this process, in a group of its own, that
+    /// started after the go-ahead, and what the same connection says with the start time the
+    /// kernel gave is accepted.
+    #[test]
+    fn started_from_a_connection_whose_pid_belongs_to_another_process_now_is_refused() {
+        let dir = scratch("peer-lifetime");
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("q.sock");
+        let listener = bind(&socket).unwrap();
+        let _client = UnixStream::connect(&socket).unwrap();
+        let accept = || loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let stream = accept();
+        let kernel_says = Peer::of(&stream).unwrap();
+        let me = std::process::id() as i32;
+        assert_eq!(kernel_says.pid, me);
+        assert!(kernel_says.is_alive());
+        assert!(kernel_says.start_us > 0);
+
+        let core = test_core();
+        let id = {
+            let mut core = lock(&core);
+            let id = core
+                .sched
+                .enqueue(1, "tests".into(), "sig".into(), signals::wall());
+            let sample = Sample {
+                time: 1.0,
+                wall: signals::wall(),
+                ram: 96 << 30,
+                level: 80,
+                tight: false,
+                frozen: false,
+            };
+            core.sched.step(&sample, &|_| None);
+            assert_eq!(core.sched.running().len(), 1, "admitted");
+            id
+        };
+        let go_at = signals::wall() - 1.0;
+        let command = Sleeping::spawn();
+        let ctx = Ctx {
+            core: &core,
+            agent: None,
+            files: None,
+            dry_run: false,
+        };
+        let conn = |start_us: u64| Conn {
+            stream: stream.try_clone().unwrap(),
+            peer: Peer {
+                pid: kernel_says.pid,
+                start_us,
+                uid: kernel_says.uid,
+            },
+            input: Vec::new(),
+            output: Vec::new(),
+            id: Some(id),
+            told: None,
+            go_at: Some(go_at),
+            started: false,
+            closing: false,
+            dead: false,
+        };
+        let measured = || lock(&core).sched.running()[0].pgid;
+
+        let mut stale = conn(kernel_says.start_us + 1);
+        ctx.started(&mut stale, id, command.pgid());
+        assert!(stale.closing && !stale.started);
+        assert!(
+            String::from_utf8_lossy(&stale.output).starts_with("ERROR\t"),
+            "{:?}",
+            String::from_utf8_lossy(&stale.output)
+        );
+        assert_eq!(measured(), None, "nothing is measured for it");
+
+        let mut real = conn(kernel_says.start_us);
+        ctx.started(&mut real, id, command.pgid());
+        assert!(real.started && !real.closing);
+        assert_eq!(measured(), Some(command.pgid()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------------------
     // The sampling thread never waits for the socket thread.
 
@@ -1606,6 +1811,84 @@ mod tests {
         let mut second = go(&mut broker, &mut time, &socket, "sig");
         second.send("DONE\t0\n");
         assert!(second.hung_up(), "and the socket thread still answers");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // A write that fails is written again.
+
+    /// Waits for the file at `path` to have `text`.
+    fn file_says(path: &Path, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read_to_string(path).ok().as_deref() != Some(text) {
+            assert!(
+                Instant::now() < deadline,
+                "{} never said it",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The disk refuses the status file and the sizes file, and then takes them again, with
+    /// nothing new offered: the latest snapshot of each, which the thread kept, is written.
+    /// The newest snapshot is the one written, not an older one that was waiting, and the
+    /// failure is said once, not at every attempt.
+    #[test]
+    fn a_snapshot_that_could_not_be_written_is_written_when_the_disk_recovers() {
+        let dir = scratch("rewrite");
+        fs::create_dir_all(&dir).unwrap();
+        let core = Arc::new(test_core());
+        let files = spawn_files(&dir, &core, Duration::ZERO).unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let mut table = Sizes::default();
+        table.record("tsc web", 3 << 30);
+        for text in ["queue\tv1\nold\n", "queue\tv1\nnewer\n"] {
+            assert!(files.offer(FileWork::Status(text.into())).is_ok());
+        }
+        assert!(
+            files
+                .offer(FileWork::Sizes(Arc::new(table.clone())))
+                .is_ok()
+        );
+        // Everything offered has been tried (and refused).
+        let (done, answered) = mpsc::channel();
+        files.try_send(FileWork::Done(done)).unwrap();
+        answered.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!dir.join(QUEUE_FILE).exists() && !dir.join(SIZES_FILE).exists());
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        file_says(&dir.join(QUEUE_FILE), "queue\tv1\nnewer\n");
+        file_says(&dir.join(SIZES_FILE), &table.render());
+        let said = lock(&core).log.clone();
+        assert_eq!(said.len(), 2, "once for each file: {said:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The broker going takes the status file with it, and a snapshot that never got written
+    /// is not written after that.
+    #[test]
+    fn a_status_snapshot_that_never_got_written_is_not_written_after_the_broker_has_gone() {
+        let dir = scratch("rewrite-removed");
+        fs::create_dir_all(&dir).unwrap();
+        let core = Arc::new(test_core());
+        let files = spawn_files(&dir, &core, Duration::ZERO).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(
+            files
+                .offer(FileWork::Status("queue\tv1\nlate\n".into()))
+                .is_ok()
+        );
+        assert!(files.offer(FileWork::Remove).is_ok());
+        let (done, answered) = mpsc::channel();
+        files.try_send(FileWork::Done(done)).unwrap();
+        answered.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        // Two idle seconds, each a chance to write it.
+        thread::sleep(Duration::from_millis(2500));
+        assert!(!dir.join(QUEUE_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

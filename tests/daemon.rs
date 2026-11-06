@@ -2245,7 +2245,15 @@ fn a_group_that_becomes_ineligible_while_its_kill_is_recorded_is_neither_stopped
 /// reads, so that whoever opens it for writing waits for ever. The brake freezes and resumes
 /// a group, one client runs a command that is measured, and when it is done another is told
 /// to go and runs: nothing waited for the file, and the daemon still stops when told to.
-fn nothing_waits_for_a_file_that_blocks(name: &str, blocked: impl Fn(&Path, &Path) -> PathBuf) {
+///
+/// `sizes_blocked`: the file that blocks is the one the first command's size is written to,
+/// which happens only if the command was measured. The status file is readable then, and
+/// says whether it was.
+fn nothing_waits_for_a_file_that_blocks(
+    name: &str,
+    sizes_blocked: bool,
+    blocked: impl Fn(&Path, &Path) -> PathBuf,
+) {
     let dir = scratch(name);
     let (state, log) = (dir.join("state"), dir.join("log"));
     fs::create_dir_all(&state).unwrap();
@@ -2274,11 +2282,20 @@ fn nothing_waits_for_a_file_that_blocks(name: &str, blocked: impl Fn(&Path, &Pat
         &["--label", "first"],
         &["sleep", "2"],
     );
+    let mut measured = false;
     wait_until("the first command to be done", 60, || {
         script.calm(1);
+        measured |= membrake::broker::read_queue(&state)
+            .ok()
+            .flatten()
+            .is_some_and(|q| q.running.iter().any(|r| r.pgid > 1 && r.peak > 0));
         first.child.try_wait().unwrap().is_some()
     });
     assert_eq!(first.code(), Some(0));
+    assert!(
+        measured || !sizes_blocked,
+        "the command was never measured, so no size was ever to be written: the blocked sizes file was not in its way"
+    );
     // A client fails open when the daemon does not answer, and then runs anyway: that the
     // commands ran is not enough, they must have been let go by the queue.
     assert!(!first.said().contains("unavailable"), "{}", first.said());
@@ -2302,15 +2319,21 @@ fn nothing_waits_for_a_file_that_blocks(name: &str, blocked: impl Fn(&Path, &Pat
 
 #[test]
 fn a_samples_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
-    nothing_waits_for_a_file_that_blocks("blocked-samples", |_, log| log.join("samples.tsv"));
+    nothing_waits_for_a_file_that_blocks("blocked-samples", false, |_, log| {
+        log.join("samples.tsv")
+    });
 }
 
 #[test]
 fn a_queue_status_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
-    nothing_waits_for_a_file_that_blocks("blocked-status", |state, _| state.join("queue.tsv.tmp"));
+    nothing_waits_for_a_file_that_blocks("blocked-status", false, |state, _| {
+        state.join("queue.tsv.tmp")
+    });
 }
 
 #[test]
 fn a_sizes_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
-    nothing_waits_for_a_file_that_blocks("blocked-sizes", |state, _| state.join("sizes.tsv.tmp"));
+    nothing_waits_for_a_file_that_blocks("blocked-sizes", true, |state, _| {
+        state.join("sizes.tsv.tmp")
+    });
 }

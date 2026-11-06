@@ -1,4 +1,4 @@
-//! membrake: a memory brake for macOS.
+//! membrake: a memory brake and queue for macOS.
 //!
 //! Module split: `signals` reads what the kernel runs out of, `jobs` finds and vets process
 //! groups, `engine` is the pure policy, `act` signals groups and keeps the crash-safety state

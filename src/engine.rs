@@ -13,7 +13,9 @@
 //! grace: the Mac has seconds left. The others mean the cliff is near, not here: they freeze
 //! every running eligible job at once, whatever settle period is running, and the kill that
 //! follows waits for it. A job frozen past the limit while memory stays tight is killed
-//! whatever else the sample did. Every arm except critical pressure
+//! whatever else the sample did, an emergency included: it is then the victim of the
+//! emergency's kill, ahead of any job that would otherwise rank first, so that jobs arriving
+//! one after another cannot keep it alive. Every arm except critical pressure
 //! counts only while memory is tight: the kernel frees empty compressor segments lazily, so
 //! occupancy can sit high for hours after a crunch with RAM free again, and a nearly full
 //! disk says nothing about a machine that is not swapping. Resume ignores the compressor for
@@ -419,8 +421,13 @@ impl Engine {
         let mut candidates = Candidates::new(jobs);
 
         if kill_arms.iter().any(|a| a.immediate()) {
-            let reason = self.reasons(&kill_arms);
-            self.kill(now, &mut candidates, None, true, reason, &mut actions);
+            let mut reason = self.reasons(&kill_arms);
+            // The kill is the emergency's, and nothing is spared a second time: if a job is
+            // overdue it is the victim, not whichever job would outrank it.
+            if expired.is_some() {
+                reason = format!("{reason}; {}", self.overdue_reason());
+            }
+            self.kill(now, &mut candidates, expired, true, reason, &mut actions);
         } else {
             let urgent = !kill_arms.is_empty();
             let reason = if urgent {
@@ -430,10 +437,7 @@ impl Engine {
             };
             let froze = urgent && self.freeze_running(now, &mut candidates, &reason, &mut actions);
             if let Some(pgid) = expired {
-                let reason = format!(
-                    "frozen for more than {} minutes while memory is still tight",
-                    (self.policy.max_freeze / 60.0).round()
-                );
+                let reason = self.overdue_reason();
                 self.kill(
                     now,
                     &mut candidates,
@@ -488,6 +492,14 @@ impl Engine {
             })
             .map(|(a, _)| *a)
             .collect()
+    }
+
+    /// Why a job frozen past the limit is killed.
+    fn overdue_reason(&self) -> String {
+        format!(
+            "frozen for more than {} minutes while memory is still tight",
+            (self.policy.max_freeze / 60.0).round()
+        )
     }
 
     fn reasons(&self, arms: &[Arm]) -> String {
@@ -946,6 +958,67 @@ mod tests {
     fn newcomers_every_two_seconds_cannot_postpone_the_expiry_of_a_frozen_job() {
         let killed = urgent_pressure_with_newcomers(2);
         assert_eq!(first_overdue(&killed), (902, 10), "{killed:?}");
+    }
+
+    /// An emergency arm that fires on every sample must not postpone the expiry of a frozen
+    /// job either. Every emergency kills the best-ranked victim, and a preferred job ranks
+    /// above a frozen one; a preferred job arrives on every sample, so the frozen job is never
+    /// the best ranked. It is killed, with no grace, on the first emergency sample after it
+    /// is overdue all the same, and that sample kills nothing else.
+    #[test]
+    fn an_emergency_kills_the_overdue_job_whatever_ranks_above_it() {
+        let mut e = Engine::new(Policy::default());
+        let mut overdue_alive = true;
+        let mut killed: Vec<(u32, i32, bool, String)> = Vec::new();
+        for t in 0..1000u32 {
+            // Two tight samples at 65% freeze the one job, 10, at t=1; then the compressor is
+            // at 93% for good: an emergency on every sample.
+            let s = if t < 2 {
+                sample(f64::from(t), 0.65, 35)
+            } else {
+                sample(f64::from(t), 0.93, 30)
+            };
+            let mut jobs = Vec::new();
+            if overdue_alive {
+                jobs.push(job(10, 100, 8));
+            }
+            if t >= 2 {
+                let mut newcomer = job(100 + i32::try_from(t).unwrap(), 1000 + u64::from(t), 4);
+                newcomer.prefer = true;
+                jobs.push(newcomer);
+            }
+            for action in e.step(&s, || jobs).actions {
+                if let Action::Kill {
+                    job,
+                    immediate,
+                    reason,
+                } = action
+                {
+                    overdue_alive &= job.pgid != 10;
+                    killed.push((t, job.pgid, immediate, reason));
+                }
+            }
+        }
+        let (at, _, immediate, reason) = killed
+            .iter()
+            .find(|k| k.1 == 10)
+            .unwrap_or_else(|| panic!("the overdue job was never killed: {} kills", killed.len()))
+            .clone();
+        // Frozen at t=1, so overdue after t=901.
+        assert_eq!(at, 902, "the first emergency sample after it was overdue");
+        assert!(immediate, "an emergency has no grace");
+        assert!(
+            reason.contains("compressor >= 92%") && reason.contains("frozen for more than 15"),
+            "{reason}"
+        );
+        assert_eq!(
+            killed.iter().filter(|k| k.0 == 902).count(),
+            1,
+            "and that sample kills nothing else"
+        );
+        // Before that, the emergency took the preferred job, every sample.
+        assert!(killed.iter().filter(|k| k.0 < 902).all(|k| k.1 != 10));
+        assert_eq!(killed.iter().filter(|k| k.0 < 902).count(), 900);
     }
 
     /// Jobs frozen together come back oldest first, so the newest, the likeliest runaway,

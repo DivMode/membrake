@@ -4,14 +4,23 @@
 //!
 //! Identity. Every signal to a group is preceded, immediately, by a look at the group, and the
 //! group must still be the one that was recorded or scanned. It is, if its leader (pid plus
-//! start time) is alive; or if a member is one the freeze was sent to (the record lists them,
-//! pid plus start time); or if a member started before the bound; or if a member is a child
-//! of a recorded process. The bound is the time the process table was scanned (or, for a
-//! frozen job, the time of its record); it is never worked out when a signal is dispatched,
-//! which may be seconds later. A pid that was reused for a new group has only members that
-//! started later and are nobody's children, so it is never signalled by mistake. A group that
-//! none of this recognises, but in which a member is stopped, is not "gone" either: stopped
-//! members may be membrake's, so the record stays and nothing is signalled (`Unknown`).
+//! start time) is alive; or if a member is one the stop was sent to (the record lists them,
+//! pid plus start time); or if a member started before the bound. The bound is the time the
+//! process table was scanned (or, for a frozen job, the time of its record); it is never
+//! worked out when a signal is dispatched, which may be seconds later. Parentage is no
+//! witness: a process that was in the group can start a new child whose pid is the old
+//! group's, in a group of its own, and that child is descended from a recorded process all the
+//! same. A pid that was reused for a new group has only members that started later and are
+//! not listed, so it is never signalled by mistake. A group that none of this recognises, but
+//! in which a member is stopped, is not "gone" either: stopped members may be membrake's, so
+//! the record stays and nothing is signalled (`Unknown`).
+//!
+//! What lets the record be complete. A stopped process cannot fork. So the record written
+//! before a SIGSTOP (the members then in the group) is followed, immediately after the
+//! SIGSTOP, by a look at the group and a second write that lists every member it has then,
+//! whatever was born in between (`record_stopped`). Freeze and kill share it. If that write
+//! fails the group stays stopped and the longer record stays in memory (`State::pending`),
+//! to be written again on every sample and used by the shutdown and panic recoveries.
 //!
 //! What is left. macOS has no pidfd, so between that look and the `killpg` there are a few
 //! microseconds in which the whole group would have to exit and the kernel hand its pgid to a
@@ -21,9 +30,10 @@
 //! so a pid that was reissued to a new process in the meantime is skipped.
 //!
 //! Records. A record is the promise to continue a group. It is written (and flushed) before
-//! every SIGSTOP, including the one that starts a kill, and kept until the group is confirmed
-//! gone or SIGCONT has been sent to it. A group that cannot be inspected, or a SIGCONT that
-//! fails, is neither: the record stays and the signal is tried again.
+//! every SIGSTOP, including the one that starts a kill, completed right after it, and kept
+//! until the group is confirmed gone or SIGCONT has been sent to it. A group that cannot be
+//! inspected, or a SIGCONT that fails, is neither: the record stays and the signal is tried
+//! again.
 
 use crate::jobs::{Inspector, Job, Look, Probe, Seen, one_line, probe};
 use crate::signals;
@@ -35,6 +45,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -259,6 +270,28 @@ pub struct State {
     /// may be a frozen job a newer or damaged writer left, and silently deleting it could
     /// leave that job frozen for good.
     unparsed: Vec<String>,
+    /// Groups that are stopped and whose complete membership is not on disk yet (see
+    /// `record_stopped`): the record in memory is the newer one, or has still to be made so.
+    pending: Vec<i32>,
+}
+
+/// Records that a `State` was dropped with while they were `pending`, by the directory they
+/// belong to: what a panic that unwinds the loop leaves for `recover_dir`, which has only the
+/// file otherwise.
+static UNSAVED: Mutex<Vec<(PathBuf, Record)>> = Mutex::new(Vec::new());
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut unsaved = UNSAVED.lock().unwrap_or_else(PoisonError::into_inner);
+        for r in &self.records {
+            if self.pending.contains(&r.pgid) {
+                unsaved.push((self.dir.clone(), r.clone()));
+            }
+        }
+    }
 }
 
 impl State {
@@ -275,14 +308,45 @@ impl State {
             dir: dir.to_path_buf(),
             records,
             unparsed,
+            pending: Vec::new(),
         })
     }
 
-    /// Re-reads the file: it, not this copy, is the truth after a crash or an outside edit.
-    /// If the file cannot be read, this copy is left as it was.
+    /// Re-reads the file: it, not this copy, is the truth after a crash or an outside edit,
+    /// except for the groups that are `pending`: their records in memory list members the
+    /// file does not, and they stay. If the file cannot be read, this copy is left as it was.
     pub fn reload(&mut self) -> io::Result<()> {
-        (self.records, self.unparsed) = read_state(&self.dir)?;
+        let (mut records, unparsed) = read_state(&self.dir)?;
+        for r in &mut records {
+            if self.pending.contains(&r.pgid)
+                && let Some(newer) = self.records.iter().find(|n| n.pgid == r.pgid)
+            {
+                *r = newer.clone();
+            }
+        }
+        (self.records, self.unparsed) = (records, unparsed);
         Ok(())
+    }
+
+    /// Takes the records an earlier `State` for this directory was dropped with while they
+    /// were `pending` (see `UNSAVED`): where the file has the group, the record from memory,
+    /// which lists more members than the file's, replaces it.
+    fn adopt_unsaved(&mut self) {
+        let mut unsaved = UNSAVED.lock().unwrap_or_else(PoisonError::into_inner);
+        unsaved.retain(|(dir, newer)| {
+            if *dir != self.dir {
+                return true;
+            }
+            if let Some(r) = self.records.iter_mut().find(|r| r.pgid == newer.pgid) {
+                *r = newer.clone();
+            }
+            false
+        });
+    }
+
+    /// Groups that are stopped and whose complete membership is only in memory so far.
+    pub fn pending(&self) -> &[i32] {
+        &self.pending
     }
 
     pub fn records(&self) -> &[Record] {
@@ -335,8 +399,59 @@ impl State {
         })
     }
 
+    /// Adds the processes of `seen`, which the stopped group `pgid` contains, to its record
+    /// and writes the file. If the write fails the record in memory keeps them all and the
+    /// group is `pending` until a write works.
+    fn add_members(&mut self, pgid: i32, seen: &[Seen]) -> io::Result<()> {
+        let Some(record) = self.records.iter_mut().find(|r| r.pgid == pgid) else {
+            return Ok(());
+        };
+        let before = record.members.len();
+        for m in seen {
+            if !record.members.contains(&(m.pid, m.start_us)) {
+                record.members.push((m.pid, m.start_us));
+            }
+        }
+        if record.members.len() == before && !self.pending.contains(&pgid) {
+            return Ok(());
+        }
+        match self.save() {
+            Ok(()) => {
+                self.pending.retain(|&p| p != pgid);
+                Ok(())
+            }
+            Err(e) => {
+                self.set_pending(pgid);
+                Err(e)
+            }
+        }
+    }
+
+    fn set_pending(&mut self, pgid: i32) {
+        if !self.pending.contains(&pgid) {
+            self.pending.push(pgid);
+        }
+    }
+
+    /// Looks again at every `pending` group, and writes the file again with everything the
+    /// stopped group now contains. Returns the groups that are no longer pending because of
+    /// it. Allocation-free when nothing is pending.
+    pub fn finish_pending(&mut self, insp: &mut Inspector) -> Vec<i32> {
+        let mut done = Vec::new();
+        for pgid in self.pending.clone() {
+            match record_stopped(self, pgid, insp) {
+                Ok(()) => done.push(pgid),
+                // Gone: the other checks of a recorded group find that out and drop it.
+                Err(ActError::Gone) => self.pending.retain(|&p| p != pgid),
+                Err(_) => {}
+            }
+        }
+        done
+    }
+
     /// Drops the record for `pgid`, if any.
     pub fn remove(&mut self, pgid: i32) -> io::Result<()> {
+        self.pending.retain(|&p| p != pgid);
         let before = self.records.len();
         self.records.retain(|r| r.pgid != pgid);
         if self.records.len() == before {
@@ -404,25 +519,16 @@ enum Claim {
 }
 
 /// Whether `members` (the live members of the pgid) are the group whose leader is
-/// (`leader.0`, `leader.1`), recorded as `recorded`, with its bound `bound_us`. The cheap
-/// checks come first, and the one that asks the kernel about a parent only if they all fail.
+/// (`leader.0`, `leader.1`), recorded as `recorded`, with its bound `bound_us`. The group is
+/// one job, so one member that is recognised is enough: the leader, a recorded member (pid and
+/// start time), or any member that started before the bound. Nothing else: not whose child a
+/// member is (see the top of this file).
 fn claim(members: &[Seen], leader: (i32, u64), recorded: &[(i32, u64)], bound_us: u64) -> Claim {
     let is = |m: &Seen, (pid, start_us): (i32, u64)| m.pid == pid && m.start_us == start_us;
-    let direct = members
+    let ours = members
         .iter()
         .any(|m| is(m, leader) || recorded.iter().any(|&r| is(m, r)) || m.start_us < bound_us);
-    // A member that is the child of a recorded process (which may have left the group): the
-    // group is one job, so one member that is recognised is enough.
-    let by_parent = || {
-        members.iter().any(|m| {
-            std::iter::once(&leader)
-                .chain(recorded)
-                .any(|&(pid, start_us)| {
-                    pid == m.ppid && matches!(probe(pid), Probe::Found(p) if p.start_us == start_us)
-                })
-        })
-    };
-    if direct || by_parent() {
+    if ours {
         Claim::Ours
     } else if members.iter().any(|m| m.stopped) {
         Claim::Unproven
@@ -551,18 +657,38 @@ fn settle(state: &mut State, pgid: i32, error: ActError) -> ActError {
     error
 }
 
-/// How many times `freeze` rewrites its record because the group gained members while the
-/// last one was being written.
+/// How many times `freeze` rewrites its record before the stop because the group gained
+/// members while the last one was being written. A group that keeps growing is stopped all the
+/// same: the record is completed right after the stop (`record_stopped`), not by chasing it.
 const RECORD_ROUNDS: usize = 4;
+
+/// Right after a SIGSTOP reached `pgid`: looks at the group, which cannot grow any more, and
+/// records every member it has now, whenever each was born. This, not the record written
+/// before the stop, is the complete one. If the group cannot be looked at, or the write fails,
+/// the group stays stopped and is `pending` in `state`: written again on every sample, and
+/// resumed from memory by the recoveries. `Gone` means the group has no live member.
+fn record_stopped(state: &mut State, pgid: i32, insp: &mut Inspector) -> Result<(), ActError> {
+    match insp.look(pgid) {
+        Look::Absent => Err(ActError::Gone),
+        Look::Unknown(why) => {
+            state.set_pending(pgid);
+            Err(ActError::Unknown(why))
+        }
+        Look::Present => state
+            .add_members(pgid, insp.members())
+            .map_err(ActError::Io),
+    }
+}
 
 /// SIGSTOP the group. The record, with the members the signal is about to reach, is written
 /// and flushed first; the group is then looked at again, and the rules asked again
 /// (`allowed` returns the reason the group may no longer be touched, if so), immediately
 /// before the signal. The write can take a while, in which time the group can gain members
-/// (they are written down too, and the group looked at again) or become something the rules
-/// forbid (it is not stopped). A crash between the write and the signal leaves a record for
-/// a running job, which recovery thaws harmlessly. `now` is the wall-clock time the process
-/// table was scanned, the bound of the group's identity.
+/// (they are written down too, and the group looked at again, up to `RECORD_ROUNDS` times) or
+/// become something the rules forbid (it is not stopped). A crash between the write and the
+/// signal leaves a record for a running job, which recovery thaws harmlessly. Immediately
+/// after the signal the record is completed (`record_stopped`). `now` is the wall-clock time
+/// the process table was scanned, the bound of the group's identity.
 pub fn freeze(
     state: &mut State,
     job: &Job,
@@ -602,6 +728,12 @@ pub fn freeze(
         // Nothing was stopped, so there is nothing to promise.
         let _ = state.remove(job.pgid);
         return Err(e);
+    }
+    // Stopped, so it cannot grow: record what it holds. If that cannot be done the group
+    // stays stopped, and is `pending` in `state` until it can.
+    if let Err(ActError::Gone) = record_stopped(state, job.pgid, &mut insp) {
+        let _ = state.remove(job.pgid);
+        return Err(ActError::Gone);
     }
     Ok(())
 }
@@ -655,14 +787,21 @@ pub fn recover(state: &mut State) -> io::Result<Vec<(Record, Recovered)>> {
         }
         report.push((r, outcome));
     }
-    state.records = kept;
+    let State {
+        records, pending, ..
+    } = &mut *state;
+    *records = kept;
+    pending.retain(|p| records.iter().any(|r| r.pgid == *p));
     state.save()?;
     Ok(report)
 }
 
-/// `recover` on whatever the state file in `dir` holds now.
+/// `recover` on whatever the state file in `dir` holds now, and on the records a `State` for
+/// it was dropped with while their membership was only in memory (a panic unwinding the loop).
 pub fn recover_dir(dir: &Path) -> io::Result<Vec<(Record, Recovered)>> {
-    recover(&mut State::open(dir)?)
+    let mut state = State::open(dir)?;
+    state.adopt_unsaved();
+    recover(&mut state)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -760,7 +899,8 @@ fn spare(
 /// Blocks: only one kill is ever in flight.
 ///
 /// The SIGSTOP of a job that is not frozen is recorded in `state` first, like a freeze, with
-/// the members it is about to reach; the record goes when the group is confirmed gone.
+/// the members it is about to reach, and completed right after it (`record_stopped`); the
+/// record goes when the group is confirmed gone.
 /// `scanned` is the wall-clock time the process table was scanned to choose the job (the
 /// bound of its identity), unless the job was frozen, when the record's time is the bound.
 /// `allowed` is asked, after the record is written, before every pass of signals: the
@@ -795,6 +935,12 @@ pub fn kill(
             let _ = state.remove(pgid);
         }
         return Err(settle(state, pgid, e));
+    }
+    if may_stop {
+        // What was born while the record was written is stopped too, and recorded now. (If
+        // the group is gone the waits below find that out.)
+        let _ = record_stopped(state, pgid, &mut insp);
+        id.remember(insp.members());
     }
     // The SIGSTOP succeeded, so we are allowed to signal this group. A later error therefore
     // means the group has already exited or been replaced (every signal looks first, and
@@ -1205,11 +1351,12 @@ mod tests {
     }
 
     /// Who is recognised as a recorded group's, member by member: its leader, a process the
-    /// freeze went to, anything older than the bound, and a child of a recorded process even
-    /// if that has left the group. Anything else is another group's, or, if everything in the
-    /// group is stopped, not to be told apart from ours.
+    /// stop went to, and anything older than the bound. Anything else is another group's, or,
+    /// if everything in the group is stopped, not to be told apart from ours. Whose child a
+    /// member is does not come into it, even the child of a process that is recorded and
+    /// alive.
     #[test]
-    fn a_member_is_recognised_by_identity_by_age_or_by_its_recorded_parent() {
+    fn a_member_is_recognised_by_identity_or_by_age_and_not_by_parentage() {
         let parent = Sleeper::spawn();
         let parent_start = jobs::bsd_info(parent.pid()).unwrap().start_us;
         let seen = |pid: i32, ppid: i32, start_us: u64, stopped: bool| Seen {
@@ -1243,8 +1390,13 @@ mod tests {
         );
         assert_eq!(
             c(&[seen(7003, parent.pid(), 2_000_000, true)]),
-            Claim::Ours,
-            "the child of a recorded process that is still that process"
+            Claim::Unproven,
+            "the child of a recorded process that is alive and the same process: not enough"
+        );
+        assert_eq!(
+            c(&[seen(7003, parent.pid(), 2_000_000, false)]),
+            Claim::Elsewhere,
+            "and a running one is somebody else's"
         );
         // The pids are the same and the processes are not: reissued.
         assert_eq!(
@@ -1256,17 +1408,6 @@ mod tests {
             c(&[seen(7001, 1, 2_000_001, false)]),
             Claim::Elsewhere,
             "a recorded member's pid, reissued to a running process"
-        );
-        let reissued = [(parent.pid(), parent_start + 1)];
-        assert_eq!(
-            claim(
-                &[seen(7003, parent.pid(), 2_000_000, true)],
-                leader,
-                &reissued,
-                bound
-            ),
-            Claim::Unproven,
-            "the child of a pid that is another process now"
         );
         assert_eq!(
             c(&[
@@ -1292,6 +1433,236 @@ mod tests {
             Claim::Ours,
             "one member that is ours is enough"
         );
+    }
+
+    /// The recycled group, for real: a recorded process that is alive and has left the group
+    /// starts a child, which leads a new group of its own that has the recorded pgid. Its only
+    /// link to the record is its parent. It is stopped, so it is what a frozen job looks like,
+    /// and it is neither signalled nor forgotten: it is `Unknown`. (This process plays the
+    /// recorded one; the sleeper is its child, in a group of its own, that started after the
+    /// record's bound.)
+    #[test]
+    fn a_recycled_group_whose_only_link_is_a_recorded_parent_is_not_recognised() {
+        let dir = scratch("recycled-by-parent");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        freeze_plain(&mut state, &job, signals::wall()).unwrap();
+        assert!(sleeper.settles(true));
+        let me = std::process::id() as i32;
+        let my_start = jobs::bsd_info(me).unwrap().start_us;
+        state.records[0].leader_start_us -= 5_000_000;
+        state.records[0].frozen_at = job.start_us as f64 / 1e6 - 100.0;
+        state.records[0].members = vec![(me, my_start)];
+        state.save().unwrap();
+        let rec = state.records[0].clone();
+        assert_eq!(
+            jobs::bsd_info(job.leader_pid).unwrap().ppid,
+            me,
+            "the premise: the leader is a child of the recorded process"
+        );
+
+        assert_eq!(
+            frozen_state(&rec, &mut Inspector::new()),
+            FrozenState::Unknown
+        );
+        assert!(matches!(
+            resume(&mut state, job.pgid),
+            Err(ActError::Unknown(_))
+        ));
+        let report = recover(&mut state).unwrap();
+        assert!(matches!(report[0].1, Recovered::Failed(_)), "{report:?}");
+        assert!(sleeper.stopped(), "nothing was signalled");
+        assert_eq!(records_on_disk(&dir), 1, "and the record stays");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A group that keeps gaining members is stopped all the same once the rewrites of the
+    /// record before the stop are used up, and the record written right after the stop lists
+    /// every member, the newest too. Here a member joins before each look at the group, one
+    /// more time than there are rewrites, so the last is born after the last record was
+    /// written and before the stop. Then everything recorded but that member dies: it is
+    /// found, stopped, through the record alone.
+    #[test]
+    fn freeze_records_every_member_of_a_group_that_grew_past_the_rewrite_limit() {
+        let dir = scratch("grew-past");
+        let mut leader = Sleeper::spawn();
+        let job = leader.job(1);
+        let mut state = State::open(&dir).unwrap();
+        let mut children: Vec<Sleeper> = Vec::new();
+        let mut asked = 0;
+        let result = freeze(&mut state, &job, signals::wall(), &mut || {
+            asked += 1;
+            if asked <= RECORD_ROUNDS + 1 {
+                children.push(Sleeper::spawn_in(leader.pid(), false));
+            }
+            None
+        });
+        result.unwrap();
+        assert_eq!(children.len(), RECORD_ROUNDS + 1, "the premise");
+        assert!(leader.settles(true) && children.iter().all(|c| c.settles(true)));
+        let everyone = RECORD_ROUNDS + 2;
+        assert_eq!(state.records()[0].members.len(), everyone);
+        assert_eq!(read_state(&dir).unwrap().0[0].members.len(), everyone);
+        assert!(state.pending().is_empty());
+
+        // All but the newest member die; the newest is stopped, and only the record knows it.
+        leader.die();
+        for child in &mut children[..RECORD_ROUNDS] {
+            child.die();
+        }
+        let newest = &children[RECORD_ROUNDS];
+        assert_eq!(
+            frozen_state(&state.records()[0].clone(), &mut Inspector::new()),
+            FrozenState::Stopped
+        );
+        let report = recover(&mut state).unwrap();
+        assert_eq!(report[0].1, Recovered::Resumed);
+        assert!(newest.settles(false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a kill: a member joins while the record of the stop is written, and is
+    /// stopped with the rest. The record on disk when the kill goes on from the stop has it.
+    /// (The kill is cut short there, by the rules, and the group continued.)
+    #[test]
+    fn a_kill_records_the_members_the_group_gains_while_its_record_is_written() {
+        let dir = scratch("kill-grows");
+        let leader = Sleeper::spawn();
+        let job = leader.job(1);
+        let mut state = State::open(&dir).unwrap();
+        let mut child = None;
+        let mut on_disk = Vec::new();
+        let mut asked = 0;
+        let result = kill(&mut state, &job, signals::wall(), false, 5.0, &mut || {
+            asked += 1;
+            match asked {
+                1 => child = Some(Sleeper::spawn_in(leader.pid(), false)),
+                // After the stop, before the SIGTERM.
+                2 => {
+                    on_disk = read_state(&dir).unwrap().0;
+                    return Some("looked".into());
+                }
+                _ => {}
+            }
+            None
+        });
+        assert_eq!(result.unwrap(), Killed::Spared("looked".into()));
+        let child = child.unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(
+            on_disk[0].members.len(),
+            2,
+            "the leader and the child born while the record was written: {on_disk:?}"
+        );
+        assert!(
+            on_disk[0]
+                .members
+                .contains(&(child.pid(), jobs::bsd_info(child.pid()).unwrap().start_us))
+        );
+        assert!(child.settles(false), "and the group was continued");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stopped group whose complete record cannot be written stays stopped and is kept in
+    /// memory: it is written again, with everything it holds, as soon as that works, and the
+    /// shutdown recovery resumes it from memory when the file never got it. Here the newest
+    /// member of a group that grew past the rewrite limit is born as the state directory
+    /// becomes read-only.
+    fn stopped_with_an_unwritable_record(dir: &Path) -> (State, Sleeper, Vec<Sleeper>) {
+        let leader = Sleeper::spawn();
+        let job = leader.job(1);
+        let mut state = State::open(dir).unwrap();
+        let mut children: Vec<Sleeper> = Vec::new();
+        let mut asked = 0;
+        freeze(&mut state, &job, signals::wall(), &mut || {
+            asked += 1;
+            if asked <= RECORD_ROUNDS + 1 {
+                children.push(Sleeper::spawn_in(leader.pid(), false));
+            }
+            if asked == RECORD_ROUNDS + 1 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            None
+        })
+        .unwrap();
+        (state, leader, children)
+    }
+
+    #[test]
+    fn a_stopped_group_whose_record_cannot_be_completed_is_kept_and_written_again() {
+        let dir = scratch("unwritable");
+        let (mut state, leader, children) = stopped_with_an_unwritable_record(&dir);
+        let pgid = leader.job(1).pgid;
+        let everyone = RECORD_ROUNDS + 2;
+        assert!(leader.settles(true) && children.iter().all(|c| c.settles(true)));
+        assert_eq!(
+            state.pending(),
+            [pgid],
+            "stopped, and tracked as unfinished"
+        );
+        assert_eq!(state.records()[0].members.len(), everyone, "in memory");
+        assert_eq!(
+            read_state(&dir).unwrap().0[0].members.len(),
+            everyone - 1,
+            "but not on disk"
+        );
+
+        // Every sample tries again; while the disk refuses, nothing changes.
+        assert!(state.finish_pending(&mut Inspector::new()).is_empty());
+        assert_eq!(state.pending(), [pgid]);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(state.finish_pending(&mut Inspector::new()), [pgid]);
+        assert!(state.pending().is_empty());
+        assert_eq!(read_state(&dir).unwrap().0[0].members.len(), everyone);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Shutdown (and the fail-safe) read the state file afresh, but not at the cost of what
+    /// only memory knows: the newest member is resumed although the file does not list it and
+    /// everything it does list is dead.
+    #[test]
+    fn the_shutdown_recovery_resumes_a_member_only_memory_knows() {
+        let dir = scratch("unwritable-shutdown");
+        let (mut state, mut leader, mut children) = stopped_with_an_unwritable_record(&dir);
+        assert!(children.iter().all(|c| c.settles(true)));
+        assert_eq!(state.pending().len(), 1);
+        leader.die();
+        for child in &mut children[..RECORD_ROUNDS] {
+            child.die();
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        state.reload().unwrap();
+        let report = recover(&mut state).unwrap();
+        assert_eq!(report[0].1, Recovered::Resumed, "{report:?}");
+        assert!(children[RECORD_ROUNDS].settles(false));
+        assert!(state.pending().is_empty() && records_on_disk(&dir) == 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And a panic, which drops the state with the loop: the recovery that follows it has the
+    /// file only, but the records that were still only in memory are kept for it.
+    #[test]
+    fn the_panic_recovery_resumes_a_member_only_memory_knew() {
+        let dir = scratch("unwritable-panic");
+        let (state, mut leader, mut children) = stopped_with_an_unwritable_record(&dir);
+        assert!(children.iter().all(|c| c.settles(true)));
+        leader.die();
+        for child in &mut children[..RECORD_ROUNDS] {
+            child.die();
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = crate::runner::guarded(Some(&dir), move || {
+            let _loop_state = state;
+            panic!("simulated bug")
+        });
+        let message = result.unwrap_err();
+        assert!(message.contains("resumed 1"), "{message}");
+        assert!(children[RECORD_ROUNDS].settles(false));
+        assert_eq!(records_on_disk(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A record from before records listed their members (an older version wrote it) is

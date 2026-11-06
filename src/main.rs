@@ -17,13 +17,14 @@ const GIB: f64 = (1u64 << 30) as f64;
 const LOG_DIR: &str = "/var/log/membrake";
 const DRY_RUN_LOG_DIR: &str = "/var/log/membrake/dry-run";
 
-/// A memory brake for macOS.
+/// A memory brake and queue for macOS.
 ///
 /// When many heavy jobs (type-checkers, test runners, builds) together outgrow physical
-/// memory, macOS does not kill them: it compresses, swaps and finally freezes. membrake
-/// watches what the kernel actually runs out of (compressor occupancy and room for swap),
-/// freezes (SIGSTOP) the newest eligible job when memory gets tight, resumes frozen jobs
-/// when it recovers, and kills the biggest eligible job only at the cliff.
+/// memory, macOS does not kill them: it compresses, swaps and finally freezes. `membrake
+/// exec` queues a heavy command until there is memory for it. The daemon watches what the
+/// kernel actually runs out of (compressor occupancy and room for swap), freezes (SIGSTOP)
+/// the newest eligible job when memory gets tight, resumes frozen jobs when it recovers, and
+/// kills the biggest eligible job only at the cliff.
 ///
 /// A job is a process group. Never touched: application, XPC and extension bundles, system
 /// processes, groups led by a uid below 500 or mixing users, the agent CLIs (claude, codex),
