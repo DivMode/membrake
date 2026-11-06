@@ -14,6 +14,7 @@ pub const MAX_SIGNATURES: usize = 1000;
 /// Weight of the newest observation.
 const ALPHA: f64 = 0.3;
 
+#[derive(Clone)]
 struct Entry {
     /// Average peak, bytes.
     peak: u64,
@@ -22,7 +23,7 @@ struct Entry {
     stamp: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Sizes {
     entries: HashMap<String, Entry>,
     clock: u64,

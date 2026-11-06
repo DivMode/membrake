@@ -84,6 +84,82 @@ impl Drop for Sleeper {
     }
 }
 
+/// A `sleep` that leads a group of its own and is nobody's child of this process: a helper
+/// that has since exited started it, so launchd is its parent. Killed when dropped.
+pub struct Orphan {
+    pub pid: i32,
+    arg: String,
+}
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        // Only the process this test started: the pid is checked against its command line.
+        if jobs::command_line(self.pid).is_some_and(|c| c == format!("sleep {}", self.arg)) {
+            // SAFETY: signalling the process the helper started for this test.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Starts `sleep ARG` as an `Orphan`, and returns once it is a group leader of its own.
+pub fn orphan_group(arg: &str) -> Orphan {
+    use std::ffi::CString;
+    let program = CString::new("sleep").unwrap();
+    let operand = CString::new(arg).unwrap();
+    let argv = [program.as_ptr(), operand.as_ptr(), std::ptr::null()];
+    let mut ends = [0; 2];
+    // SAFETY: `ends` has room for the two descriptors pipe fills in.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
+    // SAFETY: after each fork the child makes only async-signal-safe calls (fork, close,
+    // setpgid, write, execvp, _exit) on things prepared before the first.
+    let helper = unsafe { libc::fork() };
+    assert!(helper >= 0, "fork");
+    if helper == 0 {
+        // SAFETY: as above.
+        unsafe {
+            match libc::fork() {
+                0 => {
+                    libc::close(ends[0]);
+                    libc::close(ends[1]);
+                    libc::setpgid(0, 0);
+                    libc::execvp(program.as_ptr(), argv.as_ptr());
+                    libc::_exit(127)
+                }
+                started => {
+                    libc::write(ends[1], (&raw const started).cast(), size_of::<i32>());
+                    libc::_exit(0)
+                }
+            }
+        }
+    }
+    let mut pid = 0i32;
+    // SAFETY: reading four bytes into an i32; the helper, and so the write end, is ours.
+    let got = unsafe {
+        libc::close(ends[1]);
+        let got = libc::read(ends[0], (&raw mut pid).cast(), size_of::<i32>());
+        libc::close(ends[0]);
+        libc::waitpid(helper, std::ptr::null_mut(), 0);
+        got
+    };
+    assert_eq!(
+        got as usize,
+        size_of::<i32>(),
+        "the helper said who it started"
+    );
+    let orphan = Orphan {
+        pid,
+        arg: arg.to_string(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !jobs::bsd_info(pid).is_some_and(|p| p.pgid == pid && p.ppid == 1)
+        || jobs::command_line(pid).as_deref() != Some(&format!("sleep {arg}"))
+    {
+        assert!(Instant::now() < deadline, "the orphan never settled");
+        thread::sleep(Duration::from_millis(10));
+    }
+    orphan
+}
+
 /// A named pipe at `path`. A writer that opens it waits for a reader, which lets a test hold a
 /// write (a state file, a log) at a known point and release it when it chooses.
 pub fn mkfifo(path: &Path) {
@@ -105,7 +181,7 @@ pub fn scratch(name: &str) -> PathBuf {
 }
 
 /// Failures to inject into the operating-system calls that cannot be made to fail on demand
-/// (a signal refused, a process group the kernel will not list). Per thread, so tests do not
+/// (a signal refused, a member that survives a SIGKILL, a process group the kernel will not list). Per thread, so tests do not
 /// disturb each other, and compiled in only for tests.
 pub mod fault {
     use std::cell::Cell;
@@ -118,6 +194,8 @@ pub mod fault {
         pub static SIGNAL: Cell<u32> = const { Cell::new(0) };
         /// How many of the next executable-path reads fail.
         pub static READ: Cell<u32> = const { Cell::new(0) };
+        /// How many of the next SIGKILLs to a single member are not sent.
+        pub static KILL: Cell<u32> = const { Cell::new(0) };
     }
 
     pub fn arm(counter: &'static LocalKey<Cell<u32>>, times: u32) {

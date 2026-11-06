@@ -1,10 +1,11 @@
 use clap::{Args, Parser, Subcommand};
+use membrake::act;
 use membrake::engine::Policy;
 use membrake::exec;
 use membrake::jobs::{self, Rules};
 use membrake::recorder;
 use membrake::runner::{self, Location, RunOptions};
-use membrake::source::{Live, Scripted};
+use membrake::source::{Live, Scripted, refuse_root};
 use membrake::wire::DEFAULT_SOCKET;
 use std::ffi::OsString;
 use std::fs::File;
@@ -143,7 +144,8 @@ struct RunArgs {
     /// format, one row per tick; see `source::Scripted`) instead of the kernel. The process
     /// table is still scanned and real groups are still signalled, so it also needs
     /// `--simulate-only`, explicit `--state-dir` and `--log-dir` (never the live daemon's
-    /// defaults), and refuses to run as root.
+    /// defaults), and refuses to run as root, before it does anything else. It signals
+    /// only groups whose leader is a child of the process that started it.
     #[arg(
         long,
         value_name = "FILE",
@@ -152,9 +154,9 @@ struct RunArgs {
         requires_all = ["simulate_only", "state_dir", "log_dir"]
     )]
     simulate: Option<PathBuf>,
-    /// TEST ONLY, hidden. With `--simulate`: only groups whose leader's command line matches
-    /// this regex are eligible, so simulated readings reach the processes a test spawned
-    /// and no others.
+    /// TEST ONLY, hidden. With `--simulate`: of the groups led by a child of the process that
+    /// started the daemon, only those whose leader's command line matches this regex are
+    /// eligible, so simulated readings reach the processes a test spawned and no others.
     #[arg(long, value_name = "REGEX", hide = true, requires = "simulate")]
     simulate_only: Option<String>,
 }
@@ -226,57 +228,84 @@ fn rules(args: &RuleArgs) -> Result<Rules, String> {
     )
 }
 
-fn execute(cli: Cli) -> Result<ExitCode, String> {
-    let done: Result<(), String> = match cli.command {
-        Command::Run(a) => {
-            let RunArgs {
-                policy: policy_args,
-                rules: rule_args,
-                dry_run,
-                term_seconds,
-                state_dir,
-                log_dir,
-                on_event,
-                socket,
-                simulate,
-                simulate_only,
-            } = a;
-            // Only where the files are is needed to recover the jobs a previous run froze, so
-            // that comes first. The rest is checked after the recovery: a flag that no longer
-            // parses, or an account that has been deleted since the daemon was configured,
-            // must not leave work frozen.
-            let location = Location {
-                state_dir,
-                log_dir: log_dir.unwrap_or_else(|| {
-                    PathBuf::from(if dry_run { DRY_RUN_LOG_DIR } else { LOG_DIR })
-                }),
-                dry_run,
-                // A simulated run never reaches for the live daemon's socket.
-                socket: socket
-                    .or_else(|| simulate.is_none().then(|| PathBuf::from(DEFAULT_SOCKET))),
-            };
-            let configure = move || -> Result<RunOptions, String> {
-                if !term_seconds.is_finite() || term_seconds < 0.0 {
-                    return Err("--term-seconds must be a non-negative number".into());
-                }
-                let mut rules = rules(&rule_args)?;
-                if let Some(only) = &simulate_only {
-                    rules = rules.only_matching(only)?;
-                }
-                Ok(RunOptions {
-                    policy: policy(&policy_args)?,
-                    rules,
-                    term_seconds,
-                    on_event,
-                })
-            };
-            match simulate {
-                Some(script) => runner::run(location, move || {
-                    Ok((configure()?, Scripted::open(&script)?))
-                }),
-                None => runner::run(location, move || Ok((configure()?, Live::new()))),
+/// `membrake run`. A simulated run (test only) is refused to root before anything else:
+/// before the state directory is opened, a lock taken or a recorded job continued, all of
+/// which `runner::run` does first.
+fn run(a: RunArgs, uid: u32, euid: u32) -> Result<(), String> {
+    let RunArgs {
+        policy: policy_args,
+        rules: rule_args,
+        dry_run,
+        term_seconds,
+        state_dir,
+        log_dir,
+        on_event,
+        socket,
+        simulate,
+        simulate_only,
+    } = a;
+    // A simulated run signals real groups on scripted readings. It may reach only the
+    // children of the process that started it, the test that spawned both them and it; this
+    // is read from the kernel here, once, and applies to everything signalled, recovery of
+    // the jobs a previous run froze included. A parent that is launchd means the test has
+    // gone: whatever is orphaned would be fair game.
+    let parent = match &simulate {
+        Some(_) => {
+            refuse_root(uid, euid)?;
+            let parent = i32::try_from(std::os::unix::process::parent_id()).unwrap_or(0);
+            if parent <= 1 {
+                return Err("--simulate needs the test that started it as its parent".into());
             }
+            act::confine_to_children_of(parent);
+            parent
         }
+        None => 0,
+    };
+    // Only where the files are is needed to recover the jobs a previous run froze, so
+    // that comes first. The rest is checked after the recovery: a flag that no longer
+    // parses, or an account that has been deleted since the daemon was configured,
+    // must not leave work frozen.
+    let location = Location {
+        state_dir,
+        log_dir: log_dir
+            .unwrap_or_else(|| PathBuf::from(if dry_run { DRY_RUN_LOG_DIR } else { LOG_DIR })),
+        dry_run,
+        // A simulated run never reaches for the live daemon's socket.
+        socket: socket.or_else(|| simulate.is_none().then(|| PathBuf::from(DEFAULT_SOCKET))),
+    };
+    let configure = move || -> Result<RunOptions, String> {
+        if !term_seconds.is_finite() || term_seconds < 0.0 {
+            return Err("--term-seconds must be a non-negative number".into());
+        }
+        let mut rules = rules(&rule_args)?;
+        if let Some(only) = &simulate_only {
+            rules = rules.only_matching(only, parent)?;
+        }
+        Ok(RunOptions {
+            policy: policy(&policy_args)?,
+            rules,
+            term_seconds,
+            on_event,
+        })
+    };
+    match simulate {
+        Some(script) => runner::run(location, move || {
+            Ok((configure()?, Scripted::open(&script)?))
+        }),
+        None => runner::run(location, move || Ok((configure()?, Live::new()))),
+    }
+}
+
+fn execute(cli: Cli) -> Result<ExitCode, String> {
+    // SAFETY: getuid and geteuid have no preconditions.
+    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    execute_as(cli, uid, euid)
+}
+
+/// `execute` for a process with these real and effective user ids.
+fn execute_as(cli: Cli, uid: u32, euid: u32) -> Result<ExitCode, String> {
+    let done: Result<(), String> = match cli.command {
+        Command::Run(a) => run(a, uid, euid),
         Command::Status(a) => runner::status(&policy(&a.policy)?, &rules(&a.rules)?, &a.state_dir),
         Command::Replay(a) => {
             let file = File::open(&a.file).map_err(|e| format!("{}: {e}", a.file.display()))?;
@@ -310,5 +339,113 @@ fn main() -> ExitCode {
             let _ = writeln!(std::io::stderr(), "membrake: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use membrake::act::{self, State};
+    use std::os::unix::process::CommandExt;
+    use std::process::Command as Process;
+    use std::time::{Duration, Instant};
+
+    /// A simulated run is refused to root before anything else happens. `runner::run` opens
+    /// the state directory, takes the lock and continues the jobs a previous run froze,
+    /// all of which the refusal in `Scripted::open` comes too late to stop: a `--simulate`
+    /// run as root would have sent SIGCONT to whatever was recorded, and only then said no.
+    /// Here the ids are root's by argument (a test never runs as root) and the state
+    /// directory holds a stopped, recorded job: after the refusal it is still stopped and
+    /// still recorded, and no file or directory the run would have made exists.
+    #[test]
+    fn a_simulated_run_as_root_is_refused_before_the_state_directory_is_touched() {
+        let dir =
+            std::env::temp_dir().join(format!("membrake-test-{}-main-root", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (state, log, socket) = (dir.join("state"), dir.join("log"), dir.join("q.sock"));
+
+        let mut sleeper = Process::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id() as i32;
+        let leader = membrake::jobs::bsd_info(pid).unwrap();
+        let job = membrake::jobs::Job {
+            pgid: pid,
+            leader_pid: pid,
+            start_us: leader.start_us,
+            uid: leader.uid,
+            bytes: 1 << 30,
+            procs: 1,
+            prefer: false,
+            protected: false,
+            stopped: false,
+            command: "sleep 300".into(),
+        };
+        let mut recorded = State::open(&state).unwrap();
+        act::freeze(&mut recorded, &job, membrake::signals::wall(), &mut || None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !membrake::jobs::bsd_info(pid).is_some_and(|p| p.stopped) {
+            assert!(Instant::now() < deadline, "the job was never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let held = std::fs::read_to_string(state.join("frozen.tsv")).unwrap();
+
+        let cli = Cli::try_parse_from([
+            OsString::from("membrake"),
+            "run".into(),
+            "--min-job-gb".into(),
+            "0".into(),
+            "--simulate".into(),
+            "/nonexistent/script.tsv".into(),
+            "--simulate-only".into(),
+            "^sleep 300$".into(),
+            "--state-dir".into(),
+            state.clone().into(),
+            "--log-dir".into(),
+            log.clone().into(),
+            "--socket".into(),
+            socket.clone().into(),
+        ])
+        .unwrap();
+        let refused = match execute_as(cli, 0, 0) {
+            Err(e) => e,
+            Ok(code) => panic!("a simulated run as root went ahead: {code:?}"),
+        };
+        assert!(refused.contains("refuses to run as root"), "{refused}");
+        // The effective id alone is enough, as for a set-uid copy.
+        let again = Cli::try_parse_from([
+            OsString::from("membrake"),
+            "run".into(),
+            "--simulate".into(),
+            "/nonexistent/script.tsv".into(),
+            "--simulate-only".into(),
+            "x".into(),
+            "--state-dir".into(),
+            state.clone().into(),
+            "--log-dir".into(),
+            log.clone().into(),
+        ])
+        .unwrap();
+        assert!(execute_as(again, 501, 0).is_err());
+
+        assert!(
+            membrake::jobs::bsd_info(pid).is_some_and(|p| p.stopped),
+            "the recorded job was not continued"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("frozen.tsv")).unwrap(),
+            held,
+            "and its record was not touched"
+        );
+        assert!(!state.join("membrake.lock").exists(), "no lock was taken");
+        assert!(
+            !log.exists() && !socket.exists(),
+            "and nothing else was made"
+        );
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

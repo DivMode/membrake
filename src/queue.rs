@@ -139,8 +139,11 @@ pub struct Running {
     pub waited: f64,
     /// What it was expected to need when it was admitted.
     pub need: u64,
-    /// Its process group, once the client has said.
+    /// Its process group, once the client has said and the daemon has checked.
     pub pgid: Option<i32>,
+    /// When the leader of that group started (microseconds since the epoch): with the pgid,
+    /// the group's identity for as long as it is measured.
+    pub leader_start_us: u64,
     /// The most memory its group has been seen to use.
     pub peak: u64,
 }
@@ -152,15 +155,58 @@ pub enum Released {
     Running(Running),
 }
 
-/// Where a request stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Standing {
-    /// `position` counts from 1, in the order the requests will be admitted if nothing changes.
-    Waiting {
-        position: usize,
-        need: u64,
-    },
-    Admitted,
+/// A request waiting for its turn, as it is shown to the world.
+#[derive(Default)]
+pub struct Place {
+    pub id: Id,
+    /// Counts from 1, in the order the requests will be admitted if nothing changes.
+    pub position: usize,
+    pub need: u64,
+    pub session: i32,
+    pub since: f64,
+    pub label: String,
+}
+
+/// A command that has been told to start, as it is shown to the world.
+#[derive(Default)]
+pub struct Admitted {
+    pub id: Id,
+    pub session: i32,
+    pub since: f64,
+    /// 0 until the client has said which group it runs as.
+    pub pgid: i32,
+    pub peak: u64,
+    /// How long it waited, seconds, and what it was expected to need when it was admitted.
+    pub waited: f64,
+    pub need: u64,
+    pub label: String,
+}
+
+/// Where the queue stands, copied out of the scheduler so that it can be read, shown and
+/// worked out from without holding whatever the scheduler is shared behind. Its buffers are
+/// reused: refilling it allocates only when the queue has grown.
+#[derive(Default)]
+pub struct Snapshot {
+    pub ram: u64,
+    /// 0 before the first reading.
+    pub cap: u64,
+    pub used: u64,
+    /// In the order they will be admitted if nothing changes.
+    pub waiting: Vec<Place>,
+    pub running: Vec<Admitted>,
+    /// Scratch for working out the order: each session with a request waiting, and how many
+    /// of its commands count as running by the time its turn comes; and the requests not
+    /// yet placed (indices into the scheduler's waiting list).
+    turns: Vec<(i32, usize)>,
+    left: Vec<usize>,
+}
+
+/// Makes `rows` exactly `len` long, keeping the rows (and what they own) it already has.
+fn refit<T: Default>(rows: &mut Vec<T>, len: usize) {
+    rows.truncate(len);
+    while rows.len() < len {
+        rows.push(T::default());
+    }
 }
 
 pub struct Scheduler {
@@ -243,12 +289,14 @@ impl Scheduler {
         Some(Released::Running(self.running.remove(at)))
     }
 
-    /// The admitted command runs as this process group. False if `id` is not admitted.
-    pub fn started(&mut self, id: Id, pgid: i32) -> bool {
+    /// The admitted command runs as this process group, whose leader started at
+    /// `leader_start_us`. False if `id` is not admitted.
+    pub fn started(&mut self, id: Id, pgid: i32, leader_start_us: u64) -> bool {
         let Some(job) = self.running.iter_mut().find(|r| r.id == id) else {
             return false;
         };
         job.pgid = Some(pgid);
+        job.leader_start_us = leader_start_us;
         true
     }
 
@@ -284,39 +332,59 @@ impl Scheduler {
         self.used.saturating_add(need) < self.cap.unwrap_or(0)
     }
 
-    /// Where every request stands: the waiting ones in the order they will be admitted if
-    /// nothing changes (each session's turn comes round in turn, as `next` picks them), then
-    /// the admitted ones.
-    pub fn standings(&self, learned: &dyn Fn(&str) -> Option<u64>) -> Vec<(Id, Standing)> {
-        // Each session with a request waiting, and how many of its commands count as running
-        // by the time its turn comes.
-        let mut turns: Vec<(i32, usize)> = Vec::new();
+    /// Copies out where every request stands: the waiting ones in the order they will be
+    /// admitted if nothing changes (each session's turn comes round in turn, as `next` picks
+    /// them), then the admitted ones.
+    pub fn snapshot(&self, learned: &dyn Fn(&str) -> Option<u64>, out: &mut Snapshot) {
+        out.ram = self.ram;
+        out.cap = self.cap.unwrap_or(0);
+        out.used = self.used;
+
+        out.turns.clear();
         for w in &self.waiting {
-            if !turns.iter().any(|&(session, _)| session == w.session) {
-                turns.push((w.session, self.running_of(w.session)));
+            if !out.turns.iter().any(|&(session, _)| session == w.session) {
+                out.turns.push((w.session, self.running_of(w.session)));
             }
         }
+        out.left.clear();
+        out.left.extend(0..self.waiting.len());
+        refit(&mut out.waiting, self.waiting.len());
         let turn = |turns: &[(i32, usize)], session: i32| {
             turns
                 .iter()
                 .find(|&&(s, _)| s == session)
                 .map_or(0, |&(_, running)| running)
         };
-        let mut left: Vec<&Waiting> = self.waiting.iter().collect();
-        let mut out = Vec::with_capacity(self.waiting.len() + self.running.len());
-        while let Some(at) =
-            (0..left.len()).min_by_key(|&at| (turn(&turns, left[at].session), left[at].id))
-        {
-            let w = left.remove(at);
-            if let Some(entry) = turns.iter_mut().find(|t| t.0 == w.session) {
+        let mut position = 0;
+        while let Some(at) = (0..out.left.len()).min_by_key(|&at| {
+            let w = &self.waiting[out.left[at]];
+            (turn(&out.turns, w.session), w.id)
+        }) {
+            let w = &self.waiting[out.left.remove(at)];
+            if let Some(entry) = out.turns.iter_mut().find(|t| t.0 == w.session) {
                 entry.1 += 1;
             }
-            let position = out.len() + 1;
-            let need = self.need(&w.signature, learned);
-            out.push((w.id, Standing::Waiting { position, need }));
+            position += 1;
+            let place = &mut out.waiting[position - 1];
+            place.id = w.id;
+            place.position = position;
+            place.need = self.need(&w.signature, learned);
+            place.session = w.session;
+            place.since = w.since;
+            place.label.clone_from(&w.label);
         }
-        out.extend(self.running.iter().map(|r| (r.id, Standing::Admitted)));
-        out
+
+        refit(&mut out.running, self.running.len());
+        for (row, r) in out.running.iter_mut().zip(&self.running) {
+            row.id = r.id;
+            row.session = r.session;
+            row.since = r.since;
+            row.pgid = r.pgid.unwrap_or(0);
+            row.peak = r.peak;
+            row.waited = r.waited;
+            row.need = r.need;
+            row.label.clone_from(&r.label);
+        }
     }
 
     /// Takes one reading and decides whether the next request starts now. At most one starts
@@ -372,6 +440,7 @@ impl Scheduler {
             waited: s.wall - w.since,
             need,
             pgid: None,
+            leader_start_us: 0,
             peak: 0,
         });
         Some(w.id)
@@ -641,12 +710,10 @@ mod tests {
         assert!(q.step(&calm(0.0), &unknown).is_some());
         run(&mut q, 1, 10, 55, &unknown); // 45 GiB in use, the 5 s average settled
         ask(&mut q, 2, "bun run test");
-        let need = |q: &Scheduler, learned: &dyn Fn(&str) -> Option<u64>| match q.standings(learned)
-            [0]
-        .1
-        {
-            Standing::Waiting { need, .. } => need,
-            Standing::Admitted => panic!("still waiting"),
+        let need = |q: &Scheduler, learned: &dyn Fn(&str) -> Option<u64>| {
+            let mut view = Snapshot::default();
+            q.snapshot(learned, &mut view);
+            view.waiting[0].need
         };
         assert_eq!(need(&q, &unknown), GIB);
         let learned = |s: &str| (s == "bun run test").then_some(30 * GIB);
@@ -678,13 +745,11 @@ mod tests {
         let cap = q.cap().unwrap();
         assert_eq!(cap, 4 * GIB * 70 / 100);
         ask(&mut q, 2, "b");
-        let (_, standing) = q.standings(&unknown)[0];
+        let mut view = Snapshot::default();
+        q.snapshot(&unknown, &mut view);
         assert_eq!(
-            standing,
-            Standing::Waiting {
-                position: 1,
-                need: cap / 5
-            }
+            (view.waiting[0].position, view.waiting[0].need),
+            (1, cap / 5)
         );
         assert!(cap / 5 < GIB);
     }
@@ -699,11 +764,9 @@ mod tests {
         }
         ask(&mut q, 2, "b1");
         let order = |q: &Scheduler| -> Vec<String> {
-            q.standings(&unknown)
-                .into_iter()
-                .filter_map(|(id, _)| q.waiting().iter().find(|w| w.id == id))
-                .map(|w| w.label.clone())
-                .collect()
+            let mut view = Snapshot::default();
+            q.snapshot(&unknown, &mut view);
+            view.waiting.iter().map(|w| w.label.clone()).collect()
         };
         assert_eq!(order(&q), ["a1", "b1", "a2", "a3"]);
         for (t, expect) in [(0.0, "a1"), (3.0, "b1"), (6.0, "a2"), (9.0, "a3")] {
@@ -749,12 +812,11 @@ mod tests {
             .map(|n| ask(&mut q, 7, n))
             .collect();
         let positions = |q: &Scheduler| {
-            q.standings(&unknown)
-                .into_iter()
-                .map(|(id, st)| match st {
-                    Standing::Waiting { position, .. } => (id, position),
-                    Standing::Admitted => (id, 0),
-                })
+            let mut view = Snapshot::default();
+            q.snapshot(&unknown, &mut view);
+            view.waiting
+                .iter()
+                .map(|w| (w.id, w.position))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -774,15 +836,18 @@ mod tests {
     fn a_running_command_is_measured_and_released() {
         let mut q = Scheduler::new();
         let a = ask(&mut q, 1, "a");
-        assert!(!q.started(a, 4242), "not admitted yet");
+        assert!(!q.started(a, 4242, 7), "not admitted yet");
         assert_eq!(q.step(&calm(0.0), &unknown), Some(a));
-        assert!(q.started(a, 4242));
+        assert!(q.started(a, 4242, 7));
         q.observe(a, 3 * GIB);
         q.observe(a, 2 * GIB);
         let Some(Released::Running(job)) = q.release(a) else {
             panic!("it was running");
         };
-        assert_eq!((job.pgid, job.peak), (Some(4242), 3 * GIB));
+        assert_eq!(
+            (job.pgid, job.leader_start_us, job.peak),
+            (Some(4242), 7, 3 * GIB)
+        );
         assert!(q.release(a).is_none(), "released once");
         assert!(q.running().is_empty());
     }

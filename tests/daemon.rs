@@ -9,7 +9,10 @@
 //!   test appends to a file, with `--min-job-gb 0` so that tiny groups qualify. They are
 //!   confined by `--simulate-only` to groups whose command line is `sleep` plus a number
 //!   made of this test process's id and a per-test counter, which only that test's groups
-//!   carry. The tests also spawn a decoy group outside that filter and check it is left alone.
+//!   carry, and, whatever the pattern, to groups whose leader is a child of this test process
+//!   (the daemon takes that from the kernel). The tests also spawn a decoy group outside that
+//!   filter, and another that matches it but was not started by this process, and check that
+//!   both are left alone.
 
 use membrake::act::{self, State};
 use membrake::engine::Step;
@@ -83,7 +86,13 @@ impl Sleeper {
 
     fn freeze_into(&self, state_dir: &Path) {
         let mut state = State::open(state_dir).unwrap();
-        act::freeze(&mut state, &self.job(), membrake::signals::wall()).unwrap();
+        act::freeze(
+            &mut state,
+            &self.job(),
+            membrake::signals::wall(),
+            &mut || None,
+        )
+        .unwrap();
         assert!(self.settles(true), "the group is stopped");
     }
 }
@@ -1087,9 +1096,12 @@ fn a_frozen_job_that_became_ineligible_is_not_killed() {
     let wait = dir.join("wait.sh");
     fs::write(&wait, "#!/bin/sh\nread line < \"$1\"\nexec sleep \"$2\"\n").unwrap();
     let mut newer = ShellGroup::spawn(&wait, &[go.to_str().unwrap(), &later]);
+    // Only this test's own scripts: tests run side by side in one process, and a pattern
+    // that named every `wait.sh` would be a licence to touch the others' groups.
     let only = format!(
-        "^(sleep {}|/bin/sh [^ ]*/wait\\.sh .*)$",
-        mine.replace('.', "\\.")
+        "^(sleep {}|/bin/sh {}/wait\\.sh .*)$",
+        mine.replace('.', "\\."),
+        escape(dir.to_str().unwrap())
     );
     let mut script = Script::new(&dir);
     let daemon = Daemon::simulate(&script.path, &only, &state, &log);
@@ -1437,6 +1449,19 @@ impl Client {
         self.child.id() as i32
     }
 
+    /// The exit code, once it has ended, with a calm reading appended at every look: the
+    /// daemon decides only on the readings it is given, and a client that has to wait for a
+    /// turn waits for ever on a script that has run out.
+    fn code_while_calm(&mut self, script: &mut Script) -> Option<i32> {
+        let mut status = None;
+        wait_until("the client to end", 30, || {
+            script.calm(1);
+            status = self.child.try_wait().unwrap();
+            status.is_some()
+        });
+        status.and_then(|s| s.code())
+    }
+
     /// The exit code, once it has ended.
     fn code(&mut self) -> Option<i32> {
         let mut status = None;
@@ -1504,11 +1529,13 @@ fn queue_the_exit_code_is_passed_through() {
     script.calm(10);
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
 
+    // Three clients one after the other, each let go at least 3 s of the script's time after
+    // the last: the ten readings of the start are not enough, however slowly they are asked.
     let mut three = Client::spawn(&dir, "three", &socket, &[], &["sh", "-c", "exit 3"]);
-    assert_eq!(three.code(), Some(3));
+    assert_eq!(three.code_while_calm(&mut script), Some(3));
 
     let mut missing = Client::spawn(&dir, "missing", &socket, &[], &["membrake-no-such-command"]);
-    assert_eq!(missing.code(), Some(127));
+    assert_eq!(missing.code_while_calm(&mut script), Some(127));
     assert!(
         missing.said().contains("command not found"),
         "{}",
@@ -1525,7 +1552,10 @@ fn queue_the_exit_code_is_passed_through() {
         &[],
         &["sh", "-c", &format!("touch {started}; exec sleep 300")],
     );
-    wait_until("the command to start", 20, || Path::new(&started).exists());
+    wait_until("the command to start", 20, || {
+        script.calm(1);
+        Path::new(&started).exists()
+    });
     // SAFETY: signalling the client this test spawned.
     unsafe { libc::kill(slow.pid(), libc::SIGTERM) };
     assert_eq!(slow.code(), Some(128 + 15));
@@ -1880,4 +1910,407 @@ fn queue_a_dry_run_never_holds_a_client() {
         "a dry run leaves the state directory alone"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------
+// A simulated daemon reaches only what the test spawned, and never at a stale moment.
+
+/// A `sleep` that leads a group of its own and is not a child of this process: a helper that
+/// has since exited started it, so launchd is its parent. Killed when dropped.
+struct Orphan {
+    pid: i32,
+    arg: String,
+}
+
+impl Orphan {
+    fn spawn(arg: &str) -> Orphan {
+        use std::ffi::CString;
+        let program = CString::new("sleep").unwrap();
+        let operand = CString::new(arg).unwrap();
+        let argv = [program.as_ptr(), operand.as_ptr(), std::ptr::null()];
+        let mut ends = [0; 2];
+        // SAFETY: `ends` has room for the two descriptors pipe fills in.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: after each fork the child makes only async-signal-safe calls (fork, close,
+        // setpgid, write, execvp, _exit) on things prepared before the first.
+        let helper = unsafe { libc::fork() };
+        assert!(helper >= 0, "fork");
+        if helper == 0 {
+            // SAFETY: as above.
+            unsafe {
+                match libc::fork() {
+                    0 => {
+                        libc::close(ends[0]);
+                        libc::close(ends[1]);
+                        libc::setpgid(0, 0);
+                        libc::execvp(program.as_ptr(), argv.as_ptr());
+                        libc::_exit(127)
+                    }
+                    started => {
+                        libc::write(ends[1], (&raw const started).cast(), size_of::<i32>());
+                        libc::_exit(0)
+                    }
+                }
+            }
+        }
+        let mut pid = 0i32;
+        // SAFETY: reading four bytes into an i32; the helper, and so the write end, is ours.
+        let got = unsafe {
+            libc::close(ends[1]);
+            let got = libc::read(ends[0], (&raw mut pid).cast(), size_of::<i32>());
+            libc::close(ends[0]);
+            libc::waitpid(helper, std::ptr::null_mut(), 0);
+            got
+        };
+        assert_eq!(
+            got as usize,
+            size_of::<i32>(),
+            "the helper said who it started"
+        );
+        let orphan = Orphan {
+            pid,
+            arg: arg.to_string(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !jobs::bsd_info(pid).is_some_and(|p| p.pgid == pid && p.ppid == 1)
+            || jobs::command_line(pid) != Some(format!("sleep {arg}"))
+        {
+            assert!(Instant::now() < deadline, "the orphan never settled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        orphan
+    }
+
+    fn job(&self) -> Job {
+        let p = jobs::bsd_info(self.pid).expect("the orphan is visible");
+        Job {
+            pgid: self.pid,
+            leader_pid: self.pid,
+            start_us: p.start_us,
+            uid: p.uid,
+            bytes: 1 << 30,
+            procs: 1,
+            prefer: false,
+            protected: false,
+            stopped: false,
+            command: format!("sleep {}", self.arg),
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        jobs::bsd_info(self.pid)
+            .expect("the orphan is visible")
+            .stopped
+    }
+
+    fn settles(&self, stopped: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.stopped() != stopped && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.stopped() == stopped
+    }
+}
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        // Only the process this test started: the pid is checked against its command line.
+        if jobs::command_line(self.pid) == Some(format!("sleep {}", self.arg)) {
+            // SAFETY: signalling the process the helper started for this test.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `--simulate-only` is a regular expression, and a pattern that matches everything is
+/// accepted. The confinement is not the pattern: a group is eligible only if its leader is a
+/// child of the test that started the daemon. The decoy here matches the pattern, is newer
+/// than the group that is meant, and is not a child of this process: it is never frozen, and
+/// at the cliff never killed.
+#[test]
+fn a_simulated_daemon_never_touches_a_group_that_matches_but_the_test_did_not_spawn() {
+    let dir = scratch("decoy");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let mut target = Group::spawn(&mine, 1);
+    let decoy = Orphan::spawn(&mine); // newer, so it is the first choice if it is eligible
+    assert!(target.start_us() < jobs::bsd_info(decoy.pid).unwrap().start_us);
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
+    daemon.wait_started(&log);
+
+    script.tight(2);
+    daemon.wait_samples(&log, 2);
+    assert!(
+        target.settles(true),
+        "the group this test spawned is frozen"
+    );
+    assert!(!decoy.stopped(), "and the look-alike is not");
+
+    script.cliff(1);
+    daemon.wait_samples(&log, 3);
+    assert!(target.exited(), "it is the one killed");
+    assert!(!decoy.stopped(), "the look-alike is still running");
+    assert!(jobs::bsd_info(decoy.pid).is_some(), "and alive");
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The jobs a previous run froze are recovered when a simulated daemon starts, and that too
+/// is confined: the group this test spawned is continued, and another that was recorded the
+/// same way but was not started by this process is not signalled and stays recorded.
+#[test]
+fn simulated_recovery_continues_only_the_groups_the_test_spawned() {
+    let dir = scratch("decoy-recovery");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let target = Group::spawn(&mine, 1);
+    let decoy = Orphan::spawn(&mine);
+    target.0[0].freeze_into(&state);
+    {
+        let mut recorded = State::open(&state).unwrap();
+        act::freeze(
+            &mut recorded,
+            &decoy.job(),
+            membrake::signals::wall(),
+            &mut || None,
+        )
+        .unwrap();
+    }
+    assert!(decoy.settles(true));
+    assert_eq!(records(&state), 2);
+
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
+    daemon.wait_started(&log);
+    assert!(
+        target.settles(false),
+        "the group this test spawned is continued"
+    );
+    // Several samples later (each one retries every record it still holds) it is the same.
+    script.calm(5);
+    daemon.wait_samples(&log, 5);
+    assert!(decoy.stopped(), "the other is not signalled");
+    assert_eq!(records(&state), 1, "and its record stays");
+    assert!(daemon.terminate().success());
+    assert!(decoy.stopped(), "not even at shutdown");
+    assert_eq!(records(&state), 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------
+// The rules are asked again after the record is on disk, and before the signal.
+
+/// Everything a writer put into the named pipe `path`, waiting at most 15 s for it to have put
+/// anything: the pipe is opened without waiting, so a writer that never comes is an empty
+/// string and not a test that never ends.
+fn read_fifo(path: &Path) -> String {
+    let mut pipe = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .unwrap();
+    let (mut text, deadline) = (Vec::new(), Instant::now() + Duration::from_secs(15));
+    let mut chunk = [0u8; 4096];
+    while Instant::now() < deadline {
+        match pipe.read(&mut chunk) {
+            // No writer is there (yet), or it has written everything and closed.
+            Ok(0) if !text.is_empty() => break,
+            Ok(0) => {}
+            Ok(n) => text.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("{e}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    String::from_utf8_lossy(&text).into_owned()
+}
+
+/// A group in which a script waits on a named pipe and then becomes another program, which the
+/// simulated filter does not name: eligible until it is told to go.
+struct Changeling {
+    group: ShellGroup,
+    go: PathBuf,
+    later: String,
+}
+
+impl Changeling {
+    fn spawn(dir: &Path) -> (Changeling, String) {
+        let later = marker();
+        let go = dir.join("go");
+        mkfifo(&go);
+        let wait = dir.join("wait.sh");
+        fs::write(&wait, "#!/bin/sh\nread line < \"$1\"\nexec sleep \"$2\"\n").unwrap();
+        let group = ShellGroup::spawn(&wait, &[go.to_str().unwrap(), &later]);
+        let only = format!("^/bin/sh {}/wait\\.sh .*$", escape(dir.to_str().unwrap()));
+        (Changeling { group, go, later }, only)
+    }
+
+    /// It becomes `sleep LATER`, which no longer matches.
+    fn change(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let opened = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.go);
+            if let Ok(mut file) = opened {
+                file.write_all(b"go\n").unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "the script never waited for go");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while jobs::command_line(self.group.pgid()) != Some(format!("sleep {}", self.later)) {
+            assert!(Instant::now() < deadline, "it never became another program");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Holds the write of the state file on a named pipe, runs `stage` to make the daemon act
+/// on the changeling, changes it while the write waits, lets the write through, and returns
+/// when the daemon has said `said`.
+///
+/// A daemon blocked in a write cannot be seen to be, so it is given time to get there: the
+/// samples it records are how far it has read, and `recorded` is how many it records before
+/// the row that makes it act. (Late, it would find the group changed already and write
+/// nothing; the record is read with a deadline, so that is a failure and not a hang.)
+fn change_while_the_record_is_written(
+    name: &str,
+    stage: impl Fn(&mut Script),
+    recorded: usize,
+    said: &str,
+) {
+    let dir = scratch(name);
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let (mut changeling, only) = Changeling::spawn(&dir);
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only, &state, &log);
+    daemon.wait_started(&log);
+    let tmp = state.join("frozen.tsv.tmp");
+    mkfifo(&tmp);
+
+    script.calm(1);
+    daemon.wait_samples(&log, 1);
+    stage(&mut script);
+    daemon.wait_samples(&log, recorded);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        changeling.group.alive() && !changeling.group.stopped(),
+        "the record is waiting to be written, and nothing has been done to the group"
+    );
+    changeling.change();
+    let written = read_fifo(&tmp);
+    assert!(
+        written.starts_with(&format!("{}\t", changeling.group.pgid())),
+        "{written:?}: the daemon was not waiting to write the record\n{}",
+        events(&log)
+    );
+
+    daemon.wait_logged(&log, said);
+    assert!(
+        changeling.group.alive() && !changeling.group.stopped(),
+        "left running: it is not what the rules allow any more"
+    );
+    assert_eq!(records(&state), 0, "and nothing is promised");
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_group_that_becomes_ineligible_while_its_freeze_is_recorded_is_not_stopped() {
+    change_while_the_record_is_written(
+        "freeze-window",
+        |script| script.tight(2),
+        2, // the calm row, and the first tight one; the second is the freeze
+        "no longer eligible",
+    );
+}
+
+#[test]
+fn a_group_that_becomes_ineligible_while_its_kill_is_recorded_is_neither_stopped_nor_killed() {
+    change_while_the_record_is_written(
+        "kill-window",
+        |script| script.cliff(1),
+        1, // the calm row; the cliff is the kill
+        "not killing group",
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Files that block: the brake still brakes, clients are still told to go.
+
+/// A simulated daemon with the brake and the queue, in which `blocked` is a named pipe nobody
+/// reads, so that whoever opens it for writing waits for ever. The brake freezes and resumes
+/// a group, one client runs a command that is measured, and when it is done another is told
+/// to go and runs: nothing waited for the file, and the daemon still stops when told to.
+fn nothing_waits_for_a_file_that_blocks(name: &str, blocked: impl Fn(&Path, &Path) -> PathBuf) {
+    let dir = scratch(name);
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&log).unwrap();
+    mkfifo(&blocked(&state, &log));
+    let socket = queue_socket(name);
+    let mine = marker();
+    let group = Group::spawn(&mine, 1);
+    let mut script = Script::new(&dir);
+    let daemon = queue_daemon(&script, &dir, &socket, &only(&mine));
+
+    // The brake: tight memory freezes the group, calm memory resumes it.
+    script.tight(2);
+    daemon.wait_actions(&log, 1);
+    assert!(group.settles(true), "frozen");
+    script.calm(30);
+    daemon.wait_actions(&log, 2);
+    assert!(group.settles(false), "and resumed");
+
+    // The queue: the first command runs long enough to be measured, so that when it is done
+    // its size is to be written; the second is told to go after that.
+    let mut first = Client::spawn(
+        &dir,
+        "first",
+        &socket,
+        &["--label", "first"],
+        &["sleep", "2"],
+    );
+    wait_until("the first command to be done", 60, || {
+        script.calm(1);
+        first.child.try_wait().unwrap().is_some()
+    });
+    assert_eq!(first.code(), Some(0));
+    // A client fails open when the daemon does not answer, and then runs anyway: that the
+    // commands ran is not enough, they must have been let go by the queue.
+    assert!(!first.said().contains("unavailable"), "{}", first.said());
+    let ran = marker_file(&dir, "second");
+    let mut second = Client::spawn(
+        &dir,
+        "second",
+        &socket,
+        &["--label", "second"],
+        &["touch", &ran],
+    );
+    wait_until("the second command to run", 60, || {
+        script.calm(1);
+        Path::new(&ran).exists()
+    });
+    assert_eq!(second.code(), Some(0));
+    assert!(!second.said().contains("unavailable"), "{}", second.said());
+    assert!(daemon.terminate().success(), "and the daemon stops");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_samples_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
+    nothing_waits_for_a_file_that_blocks("blocked-samples", |_, log| log.join("samples.tsv"));
+}
+
+#[test]
+fn a_queue_status_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
+    nothing_waits_for_a_file_that_blocks("blocked-status", |state, _| state.join("queue.tsv.tmp"));
+}
+
+#[test]
+fn a_sizes_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
+    nothing_waits_for_a_file_that_blocks("blocked-sizes", |state, _| state.join("sizes.tsv.tmp"));
 }

@@ -11,6 +11,8 @@
 //! ```
 //!
 //! Nothing a client sends is trusted: the daemon sanitizes every string and bounds every line.
+//! `STARTED` is accepted once, after `GO`, and only for the group of a command that this client
+//! started after it was told to go; anything else is an `ERROR` and the end of the connection.
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;

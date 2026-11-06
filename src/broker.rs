@@ -1,27 +1,36 @@
 //! The daemon's side of the queue: the Unix socket, the clients on it, and the two files that
 //! tell the world what the queue is doing and has learned.
 //!
-//! Two threads share one `Core` behind a mutex that is only ever held for in-memory work,
-//! never for I/O. The socket thread owns every connection: it accepts, reads what clients say,
-//! queues their requests, and tells each client where it stands. The sampling thread (the
+//! Two threads share one `Core` behind a mutex that is held only for in-memory work, never
+//! for I/O and never for formatting: whoever needs more than a moment's look at it copies what
+//! it needs out first. The socket thread owns every connection: it accepts, reads what clients
+//! say, queues their requests, and tells each client where it stands. The sampling thread (the
 //! runner's tick) owns the clock: once a sample it asks the scheduler whether the next request
-//! may start, measures the groups of the admitted commands, and rewrites `queue.tsv`. A
-//! client waiting for its turn therefore never delays a sample, and a sample never waits for a
-//! client.
+//! may start, and measures the groups of the admitted commands. A client waiting for its turn
+//! therefore never delays a sample, and a sample never waits for a client: the tick only tries
+//! the mutex, and leaves the queue's work for the next sample if the socket thread has it.
+//!
+//! Neither thread touches a file. `queue.tsv` and `sizes.tsv` are written by a thread of their
+//! own (`spool`), fed through a bounded queue that drops what it cannot take. (The exceptions
+//! are start-up, which reads `sizes.tsv`, and shutdown, which removes the socket.)
 //!
 //! Clients are identified by the kernel, never by what they claim: the peer pid and uid come
-//! from the socket itself, and the session is worked out here from the peer pid.
+//! from the socket itself, and the session is worked out here from the peer pid. The group a
+//! client says its command runs as is checked against the kernel too, and only that group is
+//! ever measured.
 //!
 //! Trust model: the socket is writable by every local user, so any of them may ask for a turn.
 //! That is meant for a Mac with one user. Nothing a client sends can do more than take a place
-//! in the line (its strings are sanitized and bounded, and there are at most 64 clients at
-//! once); admitted groups are only ever measured, never signalled.
+//! in the line (its strings are sanitized and bounded, there are at most 64 clients at once,
+//! and a connection beyond that is turned away); admitted groups are only ever measured, never
+//! signalled.
 
-use crate::jobs::{self, AGENT_CLI, Inspector, Regex};
-use crate::queue::{Id, Released, Sample, Scheduler, Standing};
+use crate::jobs::{self, AGENT_CLI, Inspector, Probe, Regex};
+use crate::queue::{Id, Released, Sample, Scheduler, Snapshot};
 use crate::runner::{age, gb};
 use crate::signals::{self, Signals};
 use crate::sizes::Sizes;
+use crate::spool::Spool;
 use crate::wire::{self, Message, Reply};
 use std::fmt::Write as _;
 use std::fs;
@@ -31,7 +40,8 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::Duration;
 
@@ -41,6 +51,16 @@ pub const SIZES_FILE: &str = "sizes.tsv";
 pub const QUEUE_FILE: &str = "queue.tsv";
 /// Clients at once. The daemon has few descriptors to spare and braking needs them more.
 const MAX_CONNECTIONS: usize = 64;
+/// Connections taken in one pass of the socket loop, so that a flood of them cannot keep the
+/// loop from the clients it already has.
+const ACCEPTS_PER_PASS: usize = 16;
+/// Notes from the socket thread that wait for the next tick. Past this they are dropped and
+/// counted.
+const MAX_NOTES: usize = 256;
+/// File writes that may wait for the thread that does them. Past this they are dropped.
+const FILE_QUEUE: usize = 8;
+/// How long dropping the broker waits for its files to be tidied.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 /// How long the socket thread sleeps with no clients, and with some.
 const IDLE_POLL_MS: i32 = 1000;
 const BUSY_POLL_MS: i32 = 100;
@@ -60,9 +80,13 @@ pub type Note = (&'static str, String);
 /// What both threads work on.
 struct Core {
     sched: Scheduler,
-    sizes: Sizes,
+    /// Shared with the thread that writes the file, which holds the last table it was given
+    /// until it has written it; the next change copies the table only if it still does.
+    sizes: Arc<Sizes>,
     /// Notes from the socket thread, passed on to the event log by the next tick.
     log: Vec<Note>,
+    /// Notes that did not fit in `log`.
+    lost_notes: u64,
     dry_run: bool,
 }
 
@@ -73,41 +97,146 @@ fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
 
 impl Core {
     fn note(&mut self, kind: &'static str, text: String) {
-        self.log.push((kind, text));
-    }
-
-    /// A request ends, because its command is done (`exit` is its code) or its client went
-    /// away. A finished command's peak joins what is known about its signature. Returns the
-    /// text of the sizes file if that changed and is to be written.
-    fn release(&mut self, id: Id, exit: Option<i32>) -> Option<String> {
-        let wall = signals::wall();
-        match self.sched.release(id)? {
-            Released::Waiting(w) => {
-                let text = format!(
-                    "{} left the queue after {} without running (session {})",
-                    w.label,
-                    age(wall - w.since),
-                    w.session
-                );
-                self.note("queue", text);
-                None
-            }
-            Released::Running(r) => {
-                let ending = exit.map_or("its client went away".to_string(), |code| {
-                    format!("exit {code}")
-                });
-                let text = format!(
-                    "{} finished after {} ({ending}), peak {}",
-                    r.label,
-                    age(wall - r.since),
-                    gb(r.peak)
-                );
-                self.note("queue", text);
-                self.sizes.record(&r.signature, r.peak);
-                (!self.dry_run && r.peak > 0).then(|| self.sizes.render())
-            }
+        if self.log.len() < MAX_NOTES {
+            self.log.push((kind, text));
+        } else {
+            self.lost_notes += 1;
         }
     }
+
+    /// Moves the notes so far into `out`, and returns how many were dropped (see
+    /// `lost_note`).
+    fn take_notes(&mut self, out: &mut Vec<Note>) -> u64 {
+        out.append(&mut self.log);
+        std::mem::take(&mut self.lost_notes)
+    }
+
+    /// A request ends, because its command is done or its client went away. A finished
+    /// command's peak joins what is known about its signature. Returns what ended, and the
+    /// table of sizes if that changed and is to be written. (What to say about it is left to
+    /// the caller, who has let go of the core by then.)
+    fn release(&mut self, id: Id) -> Option<(Released, Option<Arc<Sizes>>)> {
+        let released = self.sched.release(id)?;
+        let table = match &released {
+            Released::Running(r) if r.peak > 0 => {
+                Arc::make_mut(&mut self.sizes).record(&r.signature, r.peak);
+                (!self.dry_run).then(|| Arc::clone(&self.sizes))
+            }
+            Released::Running(_) | Released::Waiting(_) => None,
+        };
+        Some((released, table))
+    }
+}
+
+/// What the event log says about the notes that did not fit.
+fn lost_note(count: u64) -> Note {
+    (
+        "warn",
+        format!("{count} queue note(s) were dropped while the log was not being read"),
+    )
+}
+
+/// What the event log says about a request that ended: its command is done (`exit` is its
+/// code) or its client went away.
+fn released_note(released: &Released, exit: Option<i32>) -> String {
+    let wall = signals::wall();
+    match released {
+        Released::Waiting(w) => format!(
+            "{} left the queue after {} without running (session {})",
+            w.label,
+            age(wall - w.since),
+            w.session
+        ),
+        Released::Running(r) => {
+            let ending = exit.map_or("its client went away".to_string(), |code| {
+                format!("exit {code}")
+            });
+            format!(
+                "{} finished after {} ({ending}), peak {}",
+                r.label,
+                age(wall - r.since),
+                gb(r.peak)
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The files
+
+/// What the broker asks the thread that writes its files to do.
+enum FileWork {
+    /// The new text of the status file.
+    Status(String),
+    /// The sizes learned so far, to be written as they are.
+    Sizes(Arc<Sizes>),
+    /// Remove the status file: the broker is going.
+    Remove,
+    /// Answer once everything before this is done.
+    Done(mpsc::Sender<()>),
+}
+
+/// Starts the thread that writes `queue.tsv` and `sizes.tsv` in `state_dir`. What it cannot
+/// write, and what it is too far behind to be given, is said in the next tick's notes.
+fn spawn_files(state_dir: &Path, core: &Arc<Mutex<Core>>) -> Result<Spool<FileWork>, String> {
+    let status = state_dir.join(QUEUE_FILE);
+    let status_tmp = state_dir.join(format!("{QUEUE_FILE}.tmp"));
+    let sizes = state_dir.join(SIZES_FILE);
+    let sizes_tmp = state_dir.join(format!("{SIZES_FILE}.tmp"));
+    let (on_failure, on_loss) = (Arc::clone(core), Arc::clone(core));
+    let mut failing = false;
+    Spool::spawn(
+        "membrake-queue-files",
+        FILE_QUEUE,
+        move |work| {
+            let (result, path) = match work {
+                FileWork::Status(text) => {
+                    (write_atomic(&status, &status_tmp, text.as_bytes()), &status)
+                }
+                FileWork::Sizes(table) => (
+                    write_atomic(&sizes, &sizes_tmp, table.render().as_bytes()),
+                    &sizes,
+                ),
+                FileWork::Remove => {
+                    let _ = fs::remove_file(&status);
+                    return;
+                }
+                FileWork::Done(done) => {
+                    let _ = done.send(());
+                    return;
+                }
+            };
+            match result {
+                Ok(()) => failing = false,
+                // Said once, not on every attempt.
+                Err(e) if !std::mem::replace(&mut failing, true) => {
+                    lock(&on_failure).note("warn", format!("cannot write {}: {e}", path.display()));
+                }
+                Err(_) => {}
+            }
+        },
+        move |lost| {
+            let text = format!(
+                "{lost} queue file write(s) were dropped while the disk was not keeping up"
+            );
+            lock(&on_loss).note("warn", text);
+        },
+    )
+    .map_err(|e| format!("cannot start the thread that writes the queue's files: {e}"))
+}
+
+/// Writes `bytes` to `path` through `tmp`, so a reader sees the old file or the new one and
+/// never half of either. World-readable: `membrake status` is for every user.
+fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(tmp)?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    file.write_all(bytes)?;
+    fs::rename(tmp, path)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -117,21 +246,27 @@ pub struct Broker {
     core: Arc<Mutex<Core>>,
     stop: Arc<AtomicBool>,
     socket: PathBuf,
-    status_path: PathBuf,
-    status_tmp: PathBuf,
+    /// None in a dry run, which writes no file.
+    files: Option<Spool<FileWork>>,
     dry_run: bool,
-    /// The status file as it will be, and as it was last written. Reused, so a tick that has
-    /// nothing to say allocates nothing.
+    /// The status file as it will be, and as it was last handed to the thread that writes it.
+    /// Reused, so a tick that has nothing to say allocates nothing.
     text: String,
     written: String,
-    /// The admitted groups to measure this tick.
-    groups: Vec<(Id, i32)>,
+    /// The admitted groups to measure this tick: the request, the group, and when its leader
+    /// started.
+    groups: Vec<(Id, i32, u64)>,
+    /// What this tick measured of them.
+    seen: Vec<(Id, u64)>,
     inspector: Inspector,
+    /// Where the queue stood at the last tick, copied out of the core.
+    view: Snapshot,
 }
 
 impl Broker {
-    /// Loads what was learned, binds the socket and starts the thread that serves it. A
-    /// failure means no queue: the daemon goes on braking, and clients run at once.
+    /// Loads what was learned, binds the socket and starts the threads that serve it and write
+    /// its files. A failure means no queue: the daemon goes on braking, and clients run at
+    /// once.
     pub fn start(opts: Options) -> Result<Broker, String> {
         let mut log = Vec::new();
         let sizes_path = opts.state_dir.join(SIZES_FILE);
@@ -177,35 +312,51 @@ impl Broker {
         let listener = bind(&opts.socket)?;
         let core = Arc::new(Mutex::new(Core {
             sched: Scheduler::new(),
-            sizes,
+            sizes: Arc::new(sizes),
             log,
+            lost_notes: 0,
             dry_run: opts.dry_run,
         }));
+        let files = (!opts.dry_run)
+            .then(|| spawn_files(&opts.state_dir, &core))
+            .transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (thread_core, thread_stop) = (Arc::clone(&core), Arc::clone(&stop));
-        let sizes_file = (!opts.dry_run).then_some(sizes_path);
+        let (thread_core, thread_stop, thread_files) =
+            (Arc::clone(&core), Arc::clone(&stop), files.clone());
         thread::Builder::new()
             .name("membrake-queue".into())
-            .spawn(move || serve(&listener, &thread_core, &thread_stop, sizes_file.as_deref()))
+            .spawn(move || serve(&listener, &thread_core, &thread_stop, thread_files))
             .map_err(|e| format!("cannot start the queue thread: {e}"))?;
         Ok(Broker {
             core,
             stop,
             socket: opts.socket,
-            status_path: opts.state_dir.join(QUEUE_FILE),
-            status_tmp: opts.state_dir.join(format!("{QUEUE_FILE}.tmp")),
+            files,
             dry_run: opts.dry_run,
             text: String::with_capacity(1024),
             written: String::with_capacity(1024),
             groups: Vec::with_capacity(16),
+            seen: Vec::with_capacity(16),
             inspector: Inspector::new(),
+            view: Snapshot::default(),
         })
     }
 
-    /// One sample: decides whether the next request starts, measures the admitted groups, and
-    /// rewrites the status file if it changed. Returns what the event log should say.
-    /// Allocation-free when no client is connected and nothing has changed.
+    /// One sample: measures the admitted groups, decides whether the next request starts, and
+    /// hands the status file to the thread that writes it if it changed. Returns what the
+    /// event log should say. Never waits for the socket thread: if it has the queue, this
+    /// sample's share of the queue's work is left for the next. Allocation-free when nothing
+    /// has changed, whoever is connected.
     pub fn tick(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
+        let mut notes = Vec::new();
+        // Measured with no lock held: it reads the process table. Only the groups the
+        // clients named and the daemon checked, as the groups they were then.
+        self.seen.clear();
+        for &(id, pgid, leader_start_us) in &self.groups {
+            if let Some(bytes) = jobs::group_footprint(&mut self.inspector, pgid, leader_start_us) {
+                self.seen.push((id, bytes));
+            }
+        }
         let sample = Sample {
             time: s.time,
             // The real clock, whatever drives the samples: it dates what people are shown.
@@ -215,59 +366,59 @@ impl Broker {
             tight,
             frozen,
         };
-        let mut notes = Vec::new();
-        {
-            let mut guard = lock(&self.core);
+        let (admitted, lost) = {
+            let mut guard = match self.core.try_lock() {
+                Ok(guard) => guard,
+                // A panic on the socket thread must not stop the sampling thread.
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return notes,
+            };
             let core = &mut *guard;
-            notes.append(&mut core.log);
-            let sizes = &core.sizes;
-            if let Some(id) = core.sched.step(&sample, &|signature| sizes.get(signature))
-                && let Some(job) = core.sched.running().iter().find(|r| r.id == id)
-            {
-                notes.push((
-                    "queue",
-                    format!(
-                        "{}admit {} (session {}) after {}: expects {}, {} in use of a {} cap",
-                        if self.dry_run { "dry run, would " } else { "" },
-                        job.label,
-                        job.session,
-                        age(job.waited),
-                        gb(job.need),
-                        gb(core.sched.used()),
-                        gb(core.sched.cap().unwrap_or(0)),
-                    ),
-                ));
+            let lost = core.take_notes(&mut notes);
+            for &(id, bytes) in &self.seen {
+                core.sched.observe(id, bytes);
             }
+            let sizes = &core.sizes;
+            let learned = |signature: &str| sizes.get(signature);
+            let admitted = core.sched.step(&sample, &learned);
             self.groups.clear();
             self.groups.extend(
                 core.sched
                     .running()
                     .iter()
-                    .filter_map(|r| r.pgid.map(|pgid| (r.id, pgid))),
+                    .filter_map(|r| r.pgid.map(|pgid| (r.id, pgid, r.leader_start_us))),
             );
+            core.sched.snapshot(&learned, &mut self.view);
+            (admitted, lost)
+        };
+        // From here on the socket thread has the core again.
+        if lost > 0 {
+            notes.push(lost_note(lost));
+        }
+        if let Some(id) = admitted
+            && let Some(job) = self.view.running.iter().find(|r| r.id == id)
+        {
+            notes.push((
+                "queue",
+                format!(
+                    "{}admit {} (session {}) after {}: expects {}, {} in use of a {} cap",
+                    if self.dry_run { "dry run, would " } else { "" },
+                    job.label,
+                    job.session,
+                    age(job.waited),
+                    gb(job.need),
+                    gb(self.view.used),
+                    gb(self.view.cap),
+                ),
+            ));
+        }
+        if let Some(files) = &self.files {
             self.text.clear();
-            render(&core.sched, &core.sizes, &mut self.text);
-        }
-        if !self.groups.is_empty() {
-            // Measured with the lock released: it reads the process table.
-            let mut seen = Vec::with_capacity(self.groups.len());
-            for &(id, pgid) in &self.groups {
-                if let Some(bytes) = jobs::group_footprint(&mut self.inspector, pgid) {
-                    seen.push((id, bytes));
-                }
-            }
-            let mut core = lock(&self.core);
-            for (id, bytes) in seen {
-                core.sched.observe(id, bytes);
-            }
-        }
-        if !self.dry_run && self.text != self.written {
-            match write_atomic(&self.status_path, &self.status_tmp, self.text.as_bytes()) {
-                Ok(()) => std::mem::swap(&mut self.text, &mut self.written),
-                Err(e) => notes.push((
-                    "warn",
-                    format!("cannot write {}: {e}", self.status_path.display()),
-                )),
+            render(&self.view, &mut self.text);
+            // Kept to be offered again at the next sample if the thread could not take it.
+            if self.text != self.written && files.offer(FileWork::Status(self.text.clone())).is_ok()
+            {
+                std::mem::swap(&mut self.text, &mut self.written);
             }
         }
         notes
@@ -278,24 +429,17 @@ impl Drop for Broker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = fs::remove_file(&self.socket);
-        if !self.dry_run {
-            let _ = fs::remove_file(&self.status_path);
+        // The status file goes after whatever is still waiting to be written, and the wait
+        // for that is short: a disk that is stuck is not worth holding the daemon's exit for.
+        if let Some(files) = &self.files {
+            let (done, answer) = mpsc::channel();
+            if files.try_send(FileWork::Remove).is_ok()
+                && files.try_send(FileWork::Done(done)).is_ok()
+            {
+                let _ = answer.recv_timeout(SHUTDOWN_WAIT);
+            }
         }
     }
-}
-
-/// Writes `bytes` to `path` through `tmp`, so a reader sees the old file or the new one and
-/// never half of either. World-readable: `membrake status` is for every user.
-fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .open(tmp)?;
-    file.set_permissions(fs::Permissions::from_mode(0o644))?;
-    file.write_all(bytes)?;
-    fs::rename(tmp, path)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -305,38 +449,27 @@ fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
 /// `daemon`, `ram`, `cap` and `used` (bytes), `wait` rows in the order the requests will be
 /// admitted (position, session, wall-clock seconds when it asked, need, label) and `run` rows
 /// (session, wall-clock seconds when it was admitted, process group or 0, peak, label).
-fn render(sched: &Scheduler, sizes: &Sizes, out: &mut String) {
+fn render(view: &Snapshot, out: &mut String) {
     let _ = writeln!(
         out,
         "queue\tv1\ndaemon\t{}\nram\t{}\ncap\t{}\nused\t{}",
         std::process::id(),
-        sched.ram(),
-        sched.cap().unwrap_or(0),
-        sched.used() >> 20 << 20
+        view.ram,
+        view.cap,
+        view.used >> 20 << 20
     );
-    if !sched.waiting().is_empty() {
-        let standings = sched.standings(&|signature| sizes.get(signature));
-        for (id, standing) in standings {
-            if let (Standing::Waiting { position, need }, Some(w)) =
-                (standing, sched.waiting().iter().find(|w| w.id == id))
-            {
-                let _ = writeln!(
-                    out,
-                    "wait\t{position}\t{}\t{}\t{need}\t{}",
-                    w.session, w.since as u64, w.label
-                );
-            }
-        }
+    for w in &view.waiting {
+        let _ = writeln!(
+            out,
+            "wait\t{}\t{}\t{}\t{}\t{}",
+            w.position, w.session, w.since as u64, w.need, w.label
+        );
     }
-    for r in sched.running() {
+    for r in &view.running {
         let _ = writeln!(
             out,
             "run\t{}\t{}\t{}\t{}\t{}",
-            r.session,
-            r.since as u64,
-            r.pgid.unwrap_or(0),
-            r.peak,
-            r.label
+            r.session, r.since as u64, r.pgid, r.peak, r.label
         );
     }
 }
@@ -500,7 +633,11 @@ struct Conn {
     id: Option<Id>,
     /// The last position and need it was told.
     told: Option<(usize, u64)>,
-    sent_go: bool,
+    /// When it was told to go (wall-clock seconds), if it has been: the command it starts
+    /// cannot have started before.
+    go_at: Option<f64>,
+    /// It has said which group its command runs as.
+    started: bool,
     /// Close once everything queued for it is sent.
     closing: bool,
     /// Gone, or to be dropped now.
@@ -510,6 +647,11 @@ struct Conn {
 impl Conn {
     fn say(&mut self, reply: &Reply) {
         self.output.extend_from_slice(reply.line().as_bytes());
+    }
+
+    fn go(&mut self) {
+        self.go_at = Some(signals::wall());
+        self.say(&Reply::Go);
     }
 
     /// Tells the client what is wrong and hangs up after it.
@@ -570,7 +712,8 @@ impl Conn {
 struct Ctx<'a> {
     core: &'a Mutex<Core>,
     agent: Option<Regex>,
-    sizes_file: Option<&'a Path>,
+    /// None in a dry run, which writes no file.
+    files: Option<Spool<FileWork>>,
     dry_run: bool,
 }
 
@@ -595,11 +738,11 @@ impl Ctx<'_> {
                 } else {
                     label
                 };
-                let mut core = lock(self.core);
                 let text = format!(
                     "{label} asks for a turn (pid {}, uid {}, session {session})",
                     conn.peer.pid, conn.peer.uid
                 );
+                let mut core = lock(self.core);
                 core.note("queue", text);
                 conn.id = Some(
                     core.sched
@@ -609,15 +752,12 @@ impl Ctx<'_> {
                 if self.dry_run {
                     // A dry run holds nobody: the queue still decides, to be logged, but the
                     // client goes now.
-                    conn.sent_go = true;
-                    conn.say(&Reply::Go);
+                    conn.go();
                 }
             }
             (Message::Request { .. }, Some(_)) => conn.refuse("a connection asks once"),
-            (Message::Started(pgid), Some(id)) if pgid > 1 => {
-                lock(self.core).sched.started(id, pgid);
-            }
-            (Message::Started(_), _) => {}
+            (Message::Started(pgid), Some(id)) => self.started(conn, id, pgid),
+            (Message::Started(_), None) => conn.refuse("started before a request"),
             (Message::Done(code), Some(id)) => {
                 conn.id = None;
                 self.release(id, Some(code));
@@ -627,58 +767,80 @@ impl Ctx<'_> {
         }
     }
 
-    /// The request ends; writes the sizes if they changed.
-    fn release(&self, id: Id, exit: Option<i32>) {
-        let text = lock(self.core).release(id, exit);
-        if let (Some(text), Some(path)) = (text, self.sizes_file) {
-            let tmp = path.with_extension("tsv.tmp");
-            if let Err(e) = write_atomic(path, &tmp, text.as_bytes()) {
-                lock(self.core).note("warn", format!("cannot write {}: {e}", path.display()));
+    /// The client says its command runs as group `pgid`. Once per connection, after it was
+    /// told to go, and only if the group is what a command started by this client is: led by
+    /// a process that is its child, of the same user, that started after the go-ahead. That
+    /// leader's identity is what is measured from then on; nothing else a client names is
+    /// ever looked at.
+    fn started(&self, conn: &mut Conn, id: Id, pgid: i32) {
+        if conn.started {
+            return conn.refuse("a connection starts once");
+        }
+        let Some(go_at) = conn.go_at else {
+            return conn.refuse("started before the go-ahead");
+        };
+        let leader = match jobs::probe(pgid) {
+            Probe::Found(l)
+                if pgid > 1
+                    && l.pgid == pgid
+                    && l.ppid == conn.peer.pid
+                    && l.uid == conn.peer.uid
+                    && l.start_us > (go_at * 1e6) as u64 =>
+            {
+                l
             }
+            _ => return conn.refuse("that is not the group of the command you were let go"),
+        };
+        conn.started = true;
+        lock(self.core).sched.started(id, pgid, leader.start_us);
+    }
+
+    /// The request ends; hands the sizes to the thread that writes them if they changed.
+    fn release(&self, id: Id, exit: Option<i32>) {
+        let ended = lock(self.core).release(id);
+        let Some((released, table)) = ended else {
+            return;
+        };
+        let text = released_note(&released, exit);
+        lock(self.core).note("queue", text);
+        if let (Some(table), Some(files)) = (table, &self.files) {
+            // If the thread cannot take it, it is counted and said at the next tick; the
+            // next command to finish writes the whole table again.
+            let _ = files.offer(FileWork::Sizes(table));
         }
     }
 
     /// Tells every waiting client where it stands, and every admitted one to go.
-    fn deliver(&self, conns: &mut [Conn]) {
+    fn deliver(&self, conns: &mut [Conn], view: &mut Snapshot) {
         if conns.iter().all(|c| c.id.is_none()) {
             return;
         }
-        let standings = {
+        {
             let core = lock(self.core);
-            core.sched.standings(&|signature| core.sizes.get(signature))
-        };
+            core.sched
+                .snapshot(&|signature| core.sizes.get(signature), view);
+        }
         for conn in conns.iter_mut() {
             let Some(id) = conn.id.filter(|_| !conn.closing && !conn.dead) else {
                 continue;
             };
-            match standings.iter().find(|(i, _)| *i == id).map(|(_, s)| *s) {
-                Some(Standing::Waiting { position, need }) => {
-                    if !self.dry_run && conn.told != Some((position, need)) {
-                        conn.told = Some((position, need));
-                        conn.say(&Reply::Queued { position, need });
-                    }
+            if let Some(w) = view.waiting.iter().find(|w| w.id == id) {
+                let standing = (w.position, w.need);
+                if !self.dry_run && conn.told != Some(standing) {
+                    conn.told = Some(standing);
+                    conn.say(&Reply::Queued {
+                        position: w.position,
+                        need: w.need,
+                    });
                 }
-                Some(Standing::Admitted) => {
-                    if !conn.sent_go {
-                        conn.sent_go = true;
-                        conn.say(&Reply::Go);
-                    }
+            } else if view.running.iter().any(|r| r.id == id) {
+                if conn.go_at.is_none() {
+                    conn.go();
                 }
-                None => conn.dead = true,
+            } else {
+                conn.dead = true;
             }
         }
-    }
-}
-
-fn block_shutdown_signals() {
-    // SAFETY: a zeroed sigset_t is emptied before use; the mask change is for this thread only.
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::sigaddset(&mut set, sig);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
 }
 
@@ -687,19 +849,19 @@ fn serve(
     listener: &UnixListener,
     core: &Mutex<Core>,
     stop: &AtomicBool,
-    sizes_file: Option<&Path>,
+    files: Option<Spool<FileWork>>,
 ) {
-    // The shutdown signals belong to the sampling thread, which wakes at once for them.
-    block_shutdown_signals();
+    crate::act::block_shutdown_signals();
     let dry_run = lock(core).dry_run;
     let ctx = Ctx {
         core,
         // Without the regex every session is the client's own pid: no turns, but it works.
         agent: Regex::new(AGENT_CLI).ok(),
-        sizes_file,
+        files,
         dry_run,
     };
     let mut conns: Vec<Conn> = Vec::new();
+    let mut view = Snapshot::default();
     let mut accept_failed = false;
     while !stop.load(Ordering::SeqCst) && !crate::act::shutdown_requested() {
         let mut fds = Vec::with_capacity(conns.len() + 1);
@@ -737,7 +899,7 @@ fn serve(
             }
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            accept_all(listener, &mut conns, core, &mut accept_failed);
+            accept_some(listener, &mut conns, core, &mut accept_failed);
         }
         for conn in &mut conns {
             while !conn.closing
@@ -753,7 +915,7 @@ fn serve(
                 conn.input.clear();
             }
         }
-        ctx.deliver(&mut conns);
+        ctx.deliver(&mut conns, &mut view);
         for conn in &mut conns {
             conn.flush();
         }
@@ -768,17 +930,30 @@ fn serve(
     }
 }
 
-fn accept_all(
+/// Says the queue is full, once, and hangs up. Never waits: the line fits in the empty socket
+/// buffer of a connection that has only just been made.
+fn turn_away(stream: UnixStream) {
+    if stream.set_nonblocking(true).is_ok() {
+        let _ = (&stream).write(Reply::Error("too many clients".into()).line().as_bytes());
+    }
+}
+
+/// Takes the connections that are waiting, at most `ACCEPTS_PER_PASS` of them: the clients
+/// already here are served between passes, however many more arrive. Past `MAX_CONNECTIONS`
+/// a connection is turned away with an error, which a client takes as the queue being
+/// unavailable and runs its command at once.
+fn accept_some(
     listener: &UnixListener,
     conns: &mut Vec<Conn>,
     core: &Mutex<Core>,
     failed: &mut bool,
 ) {
-    loop {
+    for _ in 0..ACCEPTS_PER_PASS {
         match listener.accept() {
             Ok((stream, _)) => {
                 if conns.len() >= MAX_CONNECTIONS {
-                    continue; // dropped: the client runs at once
+                    turn_away(stream);
+                    continue;
                 }
                 // A client the kernel cannot identify is not served.
                 let Ok(peer) = Peer::of(&stream) else {
@@ -794,7 +969,8 @@ fn accept_all(
                     output: Vec::new(),
                     id: None,
                     told: None,
-                    sent_go: false,
+                    go_at: None,
+                    started: false,
                     closing: false,
                     dead: false,
                 });
@@ -817,8 +993,10 @@ fn accept_all(
 mod tests {
     use super::*;
     use crate::signals::Pressure;
-    use crate::testutil::scratch;
+    use crate::testutil::{mkfifo, orphan_group, scratch};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
     use std::time::Instant;
 
     fn reading(time: f64, level: i32) -> Signals {
@@ -938,6 +1116,32 @@ mod tests {
         notes
     }
 
+    /// A `sleep` in a group of its own, killed when dropped: a command that a client started.
+    struct Sleeping(Child);
+
+    impl Sleeping {
+        fn spawn() -> Sleeping {
+            Sleeping(
+                Command::new("sleep")
+                    .arg("300")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn pgid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    impl Drop for Sleeping {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// The client is told where it stands, and then to go, and only when memory allows. The
     /// daemon knows who it is from the kernel: the log names this process, however the client
     /// words its request.
@@ -1007,6 +1211,7 @@ mod tests {
             ("REQUEST\tv2\tl\ts\n", "ERROR\tunsupported protocol version"),
             ("HELLO\n", "ERROR\tunknown message"),
             ("DONE\t0\n", "ERROR\tdone before a request"),
+            ("STARTED\t4242\n", "ERROR\tstarted before a request"),
             ("REQUEST\tv1\tl\n", "ERROR\tmalformed message"),
             (long.as_str(), "ERROR\tline too long"),
         ] {
@@ -1026,6 +1231,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Waits for the status file to say something `done` is satisfied with. The file is
+    /// written by a thread of its own, so it trails the tick that decided it.
+    fn status_until(
+        broker: &mut Broker,
+        time: &mut f64,
+        dir: &Path,
+        level: i32,
+        done: impl Fn(&QueueFile) -> bool,
+    ) -> QueueFile {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            *time += 1.0;
+            broker.tick(&reading(*time, level), level <= 40, false);
+            if let Ok(Some(file)) = read_queue(dir)
+                && done(&file)
+            {
+                return file;
+            }
+            assert!(Instant::now() < deadline, "the status file never said it");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The status file shows who waits and who runs, with strings made safe, to everybody; and
     /// it is gone when the broker is.
     #[test]
@@ -1035,9 +1263,7 @@ mod tests {
         client.send("REQUEST\tv1\tbuild \x1b[31mred\tcargo build\n");
         client.next();
         let mut time = 300.0;
-        tick_n(&mut broker, &mut time, 35, 1);
-
-        let file = read_queue(&dir).unwrap().expect("a status file");
+        let file = status_until(&mut broker, &mut time, &dir, 35, |f| f.waiting.len() == 1);
         assert_eq!(file.daemon as u32, std::process::id());
         assert_eq!((file.waiting.len(), file.running.len()), (1, 0));
         assert_eq!(file.waiting[0].label, "build ?[31mred");
@@ -1061,18 +1287,11 @@ mod tests {
         tick_until(&mut broker, &mut time, 80, || {
             client.line(Duration::from_millis(20)).as_deref() == Some("GO")
         });
-        client.send("STARTED\t4242\n");
-        let started = Instant::now();
-        let file = loop {
-            time += 1.0;
-            broker.tick(&reading(time, 80), false, false);
-            let file = read_queue(&dir).unwrap().unwrap();
-            if file.running.first().is_some_and(|r| r.pgid == 4242) {
-                break file;
-            }
-            assert!(started.elapsed() < Duration::from_secs(10));
-            thread::sleep(Duration::from_millis(20));
-        };
+        let command = Sleeping::spawn();
+        client.send(&format!("STARTED\t{}\n", command.pgid()));
+        let file = status_until(&mut broker, &mut time, &dir, 80, |f| {
+            f.running.first().is_some_and(|r| r.pgid == command.pgid())
+        });
         assert_eq!((file.waiting.len(), file.running.len()), (0, 1));
 
         drop(broker);
@@ -1154,5 +1373,372 @@ mod tests {
         assert!(not_a_socket.contains("not a free socket"), "{not_a_socket}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "mine");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // STARTED names a group the daemon will measure on the sampling thread, and records the
+    // footprint under the client's signature: it must be the client's own command.
+
+    /// Asks for a turn, for a command of this signature, on a fresh connection and waits for
+    /// the go-ahead.
+    fn go(broker: &mut Broker, time: &mut f64, socket: &Path, signature: &str) -> Client {
+        let mut client = Client::connect(socket);
+        client.send(&format!("REQUEST\tv1\ttests\t{signature}\n"));
+        tick_until(broker, time, 80, || {
+            client.line(Duration::from_millis(20)).as_deref() == Some("GO")
+        });
+        client
+    }
+
+    /// The group of a command the client started is accepted, once. A group that is not a
+    /// command of this client's is an error and a hung-up connection, and nothing is learned
+    /// about it, whichever way it fails to be one: it started before the go-ahead, it is a
+    /// member and not the leader of its group, or it is not this client's child (a group that
+    /// belongs to somebody else, which the client could otherwise make the daemon measure).
+    #[test]
+    fn started_must_name_the_group_of_a_command_the_client_started_after_the_go() {
+        let (mut broker, socket, dir) = broker("started", false);
+        let mut time = 500.0;
+        // Each is made, or named, after the go-ahead, bar the first: so that each fails for
+        // one reason only.
+        let early = Sleeping::spawn(); // a child of this client, but older than any go
+        let rejected =
+            |broker: &mut Broker, time: &mut f64, why: &str, pgid: &mut dyn FnMut() -> i32| {
+                let mut client = go(broker, time, &socket, "lie");
+                let pgid = pgid();
+                client.send(&format!("STARTED\t{pgid}\n"));
+                assert_eq!(
+                    client.next(),
+                    "ERROR\tthat is not the group of the command you were let go",
+                    "{why}"
+                );
+                assert!(client.hung_up(), "{why}");
+            };
+        rejected(
+            &mut broker,
+            &mut time,
+            "it started before the go-ahead",
+            &mut || early.pgid(),
+        );
+        let (mut leader, mut member) = (None, None);
+        rejected(
+            &mut broker,
+            &mut time,
+            "a member, not the leader of its group",
+            &mut || {
+                let led = Sleeping::spawn();
+                let joined = Sleeping(
+                    Command::new("sleep")
+                        .arg("300")
+                        .process_group(led.pgid())
+                        .spawn()
+                        .unwrap(),
+                );
+                let pid = joined.0.id() as i32;
+                (leader, member) = (Some(led), Some(joined));
+                pid
+            },
+        );
+        let mut stranger = None;
+        rejected(
+            &mut broker,
+            &mut time,
+            "nobody's child of this client",
+            &mut || {
+                let orphan = orphan_group(&format!("3600.{}", std::process::id()));
+                let pid = orphan.pid;
+                stranger = Some(orphan);
+                pid
+            },
+        );
+        rejected(&mut broker, &mut time, "launchd", &mut || 1);
+        rejected(&mut broker, &mut time, "no group", &mut || 0);
+        drop((leader, member, stranger));
+
+        // The command of this client is accepted, once.
+        let mut client = go(&mut broker, &mut time, &socket, "real");
+        let command = Sleeping::spawn();
+        client.send(&format!("STARTED\t{}\n", command.pgid()));
+        let file = status_until(&mut broker, &mut time, &dir, 80, |f| {
+            f.running
+                .first()
+                .is_some_and(|r| r.pgid == command.pgid() && r.peak > 0)
+        });
+        assert_eq!(file.running.len(), 1, "only the one that was accepted");
+        client.send(&format!("STARTED\t{}\n", command.pgid()));
+        assert_eq!(client.next(), "ERROR\ta connection starts once");
+        // What the accepted command used is learned; about the groups that were refused,
+        // nothing is.
+        let core = Arc::clone(&broker.core);
+        tick_until(&mut broker, &mut time, 80, || {
+            lock(&core).sizes.get("real").is_some()
+        });
+        assert!(lock(&core).sizes.get("lie").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A command that is accepted and measured teaches the queue its size; a client that
+    /// named a group that was not its own does not.
+    #[test]
+    fn a_command_that_finishes_is_learned_and_one_that_lied_is_not() {
+        let (mut broker, socket, dir) = broker("learn", false);
+        let mut time = 600.0;
+        let mut honest = go(&mut broker, &mut time, &socket, "sig");
+        let command = Sleeping::spawn();
+        honest.send(&format!("STARTED\t{}\n", command.pgid()));
+        status_until(&mut broker, &mut time, &dir, 80, |f| {
+            f.running.first().is_some_and(|r| r.pgid > 1 && r.peak > 0)
+        });
+        honest.send("DONE\t0\n");
+        let core = Arc::clone(&broker.core);
+        tick_until(&mut broker, &mut time, 80, || {
+            lock(&core).sizes.get("sig").is_some()
+        });
+
+        let mut liar = Client::connect(&socket);
+        liar.send("REQUEST\tv1\tliar\tlie\n");
+        tick_until(&mut broker, &mut time, 80, || {
+            liar.line(Duration::from_millis(20)).as_deref() == Some("GO")
+        });
+        liar.send(&format!("STARTED\t{}\n", std::process::id()));
+        assert!(liar.next().starts_with("ERROR"));
+        tick_n(&mut broker, &mut time, 80, 3);
+        assert!(lock(&core).sizes.get("lie").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The sampling thread never waits for the socket thread.
+
+    /// The core is held, as the socket thread holds it while it works: the tick returns at
+    /// once and leaves the queue's work for the next sample, which does it.
+    #[test]
+    fn a_tick_does_not_wait_for_a_core_that_is_held() {
+        let (mut broker, socket, dir) = broker("held", false);
+        let mut client = Client::connect(&socket);
+        client.request("tests");
+        assert!(client.next().starts_with("QUEUED"));
+
+        let held = Arc::clone(&broker.core);
+        let guard = lock(&held);
+        let (done, answer) = mpsc::channel();
+        let ticking = thread::spawn(move || {
+            let notes = broker.tick(&reading(700.0, 80), false, false);
+            done.send(()).unwrap();
+            (broker, notes)
+        });
+        let in_time = answer.recv_timeout(Duration::from_secs(3)).is_ok();
+        drop(guard);
+        assert!(in_time, "the tick waited for the core");
+        let (mut broker, notes) = ticking.join().unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(client.line(Duration::from_millis(300)).is_none());
+
+        // The next sample does what the held one left.
+        let mut time = 700.0;
+        tick_until(&mut broker, &mut time, 80, || {
+            client.line(Duration::from_millis(20)).as_deref() == Some("GO")
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Neither thread touches a file: a file that blocks holds up only its own writes.
+
+    /// `queue.tsv` is a path a writer waits at for a reader that never comes. The tick still
+    /// returns at once, sample after sample, and clients are still told to go.
+    #[test]
+    fn a_status_file_that_blocks_does_not_stop_the_tick_or_the_clients() {
+        let (mut broker, socket, dir) = broker("stuck-status", false);
+        mkfifo(&dir.join(format!("{QUEUE_FILE}.tmp")));
+        let mut client = Client::connect(&socket);
+        client.request("tests");
+        assert!(client.next().starts_with("QUEUED"));
+
+        let started = Instant::now();
+        let mut time = 800.0;
+        // Every tick has a changed status to hand over (the memory in use moves), and the
+        // thread that writes it is stuck on the first.
+        for i in 0..100 {
+            time += 1.0;
+            let level = 30 + i % 7;
+            broker.tick(&reading(time, level), true, false);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "100 ticks took {:?} with the status file blocked",
+            started.elapsed()
+        );
+        let mut go = None;
+        tick_until(&mut broker, &mut time, 80, || {
+            go = client.line(Duration::from_millis(20));
+            go.is_some()
+        });
+        assert_eq!(go.as_deref(), Some("GO"));
+        let started = Instant::now();
+        drop(broker);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown waited"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `sizes.tsv` blocks. The command that just finished wanted it written, from the socket
+    /// thread's connection; the next client is told to go all the same.
+    #[test]
+    fn a_sizes_file_that_blocks_does_not_stop_the_next_client() {
+        let (mut broker, socket, dir) = broker("stuck-sizes", false);
+        mkfifo(&dir.join(format!("{SIZES_FILE}.tmp")));
+        let mut time = 900.0;
+        let mut first = go(&mut broker, &mut time, &socket, "sig");
+        let command = Sleeping::spawn();
+        first.send(&format!("STARTED\t{}\n", command.pgid()));
+        status_until(&mut broker, &mut time, &dir, 80, |f| {
+            f.running.first().is_some_and(|r| r.peak > 0)
+        });
+        first.send("DONE\t0\n");
+        let core = Arc::clone(&broker.core);
+        tick_until(&mut broker, &mut time, 80, || {
+            lock(&core).sizes.get("sig").is_some()
+        });
+
+        let mut second = go(&mut broker, &mut time, &socket, "sig");
+        second.send("DONE\t0\n");
+        assert!(second.hung_up(), "and the socket thread still answers");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Bounded work on the socket thread.
+
+    fn test_core() -> Mutex<Core> {
+        Mutex::new(Core {
+            sched: Scheduler::new(),
+            sizes: Arc::new(Sizes::default()),
+            log: Vec::new(),
+            lost_notes: 0,
+            dry_run: false,
+        })
+    }
+
+    /// Connections are taken a few at a time, whatever is waiting, so that the clients
+    /// already served are looked after between the batches.
+    #[test]
+    fn a_pass_of_the_socket_loop_takes_only_so_many_connections() {
+        let dir = scratch("budget");
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("q.sock");
+        let listener = bind(&socket).unwrap();
+        let waiting: Vec<UnixStream> = (0..40)
+            .map(|_| UnixStream::connect(&socket).unwrap())
+            .collect();
+        let (core, mut conns, mut failed) = (test_core(), Vec::new(), false);
+        accept_some(&listener, &mut conns, &core, &mut failed);
+        assert_eq!(conns.len(), ACCEPTS_PER_PASS);
+        accept_some(&listener, &mut conns, &core, &mut failed);
+        assert_eq!(conns.len(), 2 * ACCEPTS_PER_PASS);
+        accept_some(&listener, &mut conns, &core, &mut failed);
+        assert_eq!(conns.len(), 40, "and the rest on the third");
+        drop(waiting);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A connection beyond the 64th is told so and hung up on, not silently dropped, and does
+    /// not take a place: the ones that are served stay served.
+    #[test]
+    fn connections_past_the_limit_are_turned_away_with_an_error() {
+        let dir = scratch("limit");
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("q.sock");
+        let listener = bind(&socket).unwrap();
+        let (core, mut conns, mut failed) = (test_core(), Vec::new(), false);
+        let held: Vec<UnixStream> = (0..MAX_CONNECTIONS)
+            .map(|_| UnixStream::connect(&socket).unwrap())
+            .collect();
+        while conns.len() < MAX_CONNECTIONS {
+            accept_some(&listener, &mut conns, &core, &mut failed);
+        }
+        let mut extra = UnixStream::connect(&socket).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        accept_some(&listener, &mut conns, &core, &mut failed);
+        assert_eq!(conns.len(), MAX_CONNECTIONS, "no place for it");
+        let mut said = String::new();
+        extra.read_to_string(&mut said).unwrap();
+        assert_eq!(said, "ERROR\ttoo many clients\n");
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Arrivals that never stop do not stop the client that is already waiting from being
+    /// told to go: it is served between the batches of arrivals.
+    #[test]
+    fn a_flood_of_connections_does_not_keep_the_queue_from_its_client() {
+        let (mut broker, socket, dir) = broker("flood", false);
+        let mut client = Client::connect(&socket);
+        client.request("tests");
+        assert!(client.next().starts_with("QUEUED"));
+
+        let flooding = {
+            let socket = socket.clone();
+            thread::spawn(move || {
+                // Past the limit many times over; each is held open, as a stuck client is.
+                (0..400)
+                    .filter_map(|_| UnixStream::connect(&socket).ok())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut time = 1000.0;
+        let mut go = None;
+        tick_until(&mut broker, &mut time, 80, || {
+            go = client.line(Duration::from_millis(20));
+            go.is_some()
+        });
+        assert_eq!(go.as_deref(), Some("GO"));
+        let flood = flooding.join().unwrap();
+        // The ones the daemon could not take are told so, not left to wait for ever.
+        for c in &flood {
+            c.set_nonblocking(true).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !flood.iter().any(|mut c| {
+            let mut line = [0u8; 64];
+            c.read(&mut line)
+                .is_ok_and(|n| line[..n].starts_with(b"ERROR\ttoo many clients"))
+        }) {
+            assert!(Instant::now() < deadline, "no connection was turned away");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Notes that pile up while the sampling thread is busy are bounded, and the ones dropped
+    /// are counted and said.
+    #[test]
+    fn pending_notes_are_bounded_and_the_dropped_ones_counted() {
+        let core = test_core();
+        let mut guard = lock(&core);
+        for i in 0..10 * MAX_NOTES {
+            guard.note("queue", format!("note {i}"));
+        }
+        assert_eq!(guard.log.len(), MAX_NOTES);
+        let mut notes = Vec::new();
+        let lost = guard.take_notes(&mut notes);
+        assert_eq!(notes.len(), MAX_NOTES);
+        assert_eq!(notes[0].1, "note 0", "the first ones are kept");
+        assert_eq!(lost, 9 * MAX_NOTES as u64, "the rest are counted");
+        let said = lost_note(lost);
+        assert_eq!(said.0, "warn");
+        assert!(
+            said.1
+                .starts_with(&format!("{} queue note(s)", 9 * MAX_NOTES)),
+            "{}",
+            said.1
+        );
+        let mut again = Vec::new();
+        assert_eq!(guard.take_notes(&mut again), 0, "counted once");
+        assert!(again.is_empty());
     }
 }

@@ -149,9 +149,11 @@ pub enum Reason {
     SystemUser,
     /// Members run as different users: a set-uid helper (`sudo`, `login`) joined the group.
     MixedUsers,
-    /// Matched `--never` or the built-in agent and terminal list, or (test only) is outside
-    /// the `--simulate-only` filter.
+    /// Matched `--never` or the built-in agent and terminal list.
     Never,
+    /// Test only (`run --simulate`): not a group the test that started the simulated daemon
+    /// spawned, or not one the `--simulate-only` filter names.
+    Outside,
 }
 
 impl Reason {
@@ -164,6 +166,7 @@ impl Reason {
             Reason::SystemUser => "it belongs to root or a system account",
             Reason::MixedUsers => "its members run as different users",
             Reason::Never => "it matches the agent, terminal or --never protections",
+            Reason::Outside => "it is outside the simulation's confinement (test only)",
         }
     }
 }
@@ -187,9 +190,19 @@ pub struct Rules {
     protect_uids: Vec<u32>,
     include_uids: Vec<u32>,
     own_pgid: i32,
-    /// Test only (`run --simulate-only`): when set, only groups whose leader's command line
-    /// matches are eligible at all.
-    only: Option<Regex>,
+    /// Test only (`run --simulate-only`): when set, only groups the test spawned are
+    /// eligible at all.
+    only: Option<Only>,
+}
+
+/// The confinement of a simulated run to the processes of the test that started it.
+struct Only {
+    /// The leader's command line must match.
+    command: Regex,
+    /// The leader's parent must be this process: the test that spawned both the groups and
+    /// the simulated daemon. A pattern that matches everything therefore still reaches
+    /// nothing the test did not spawn.
+    parent: i32,
 }
 
 impl Rules {
@@ -218,12 +231,17 @@ impl Rules {
         })
     }
 
-    /// Test only (`run --simulate-only`): makes every group whose leader's command line does
-    /// not match `pattern` ineligible, so a run driven by scripted readings can reach the
-    /// processes a test spawned and no others. The caller's own uid counts as a user's even
-    /// below 500, because a Nix build sandbox runs its tests as a build user with such a uid.
-    pub fn only_matching(mut self, pattern: &str) -> Result<Rules, String> {
-        self.only = Some(Regex::new(pattern).map_err(|e| format!("--simulate-only {e}"))?);
+    /// Test only (`run --simulate-only`): makes every group ineligible unless its leader's
+    /// command line matches `pattern` and its leader is a child of `parent` (the test that
+    /// spawned the groups and the simulated daemon), so a run driven by scripted readings
+    /// can reach the processes a test spawned and no others, whatever the pattern. The
+    /// caller's own uid counts as a user's even below 500, because a Nix build sandbox runs
+    /// its tests as a build user with such a uid.
+    pub fn only_matching(mut self, pattern: &str, parent: i32) -> Result<Rules, String> {
+        self.only = Some(Only {
+            command: Regex::new(pattern).map_err(|e| format!("--simulate-only {e}"))?,
+            parent,
+        });
         // SAFETY: getuid has no preconditions.
         self.include_uids.push(unsafe { libc::getuid() });
         Ok(self)
@@ -251,7 +269,8 @@ impl Rules {
         uid < FIRST_USER_UID && !self.include_uids.contains(&uid)
     }
 
-    /// `leader_command` is the leader's full, untruncated command line; members are matched by
+    /// `leader_command` is the leader's full, untruncated command line and `leader_ppid` its
+    /// parent's pid (only a simulated run looks at it); members are matched by
     /// name, executable path and their own full command line, so a protected process anywhere
     /// in the group protects the group. Every member's uid is checked, not only the leader's:
     /// a group is ineligible if any member is a system account (unless named by
@@ -260,6 +279,7 @@ impl Rules {
         &self,
         pgid: i32,
         leader_uid: u32,
+        leader_ppid: i32,
         members: &[Member],
         leader_command: &str,
     ) -> Verdict {
@@ -275,12 +295,10 @@ impl Rules {
         if members.iter().any(|m| in_bundle_or_system(&m.exe)) {
             return Verdict::Ineligible(Reason::Bundle);
         }
-        if self
-            .only
-            .as_ref()
-            .is_some_and(|re| !re.is_match(leader_command))
-        {
-            return Verdict::Ineligible(Reason::Never);
+        if self.only.as_ref().is_some_and(|only| {
+            leader_ppid != only.parent || !only.command.is_match(leader_command)
+        }) {
+            return Verdict::Ineligible(Reason::Outside);
         }
         let hit = |list: &[Regex], text: &str| list.iter().any(|r| r.is_match(text));
         if hit(&self.never, leader_command)
@@ -770,7 +788,7 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
             continue;
         };
         if let Verdict::Eligible { prefer, protected } =
-            rules.classify(pgid, leader.uid, &group.members, full)
+            rules.classify(pgid, leader.uid, leader.ppid, &group.members, full)
         {
             jobs.push(Job {
                 pgid,
@@ -828,8 +846,13 @@ pub fn session_of(agent: &Regex, pid: i32) -> i32 {
 }
 
 /// The summed footprint of the live members of group `pgid`, or None if it is gone or the
-/// kernel could not list it. Allocation-free once `insp` is warm.
-pub fn group_footprint(insp: &mut Inspector, pgid: i32) -> Option<u64> {
+/// kernel could not list it, or if its leader is no longer the process that started at
+/// `leader_start_us`: a pgid is only ever measured as the group it was when it was chosen.
+/// Allocation-free once `insp` is warm.
+pub fn group_footprint(insp: &mut Inspector, pgid: i32, leader_start_us: u64) -> Option<u64> {
+    if !matches!(probe(pgid), Probe::Found(l) if l.start_us == leader_start_us) {
+        return None;
+    }
     match insp.look(pgid) {
         Look::Present => Some(insp.members().iter().map(|m| footprint(m.pid)).sum()),
         Look::Absent | Look::Unknown(_) => None,
@@ -848,7 +871,7 @@ pub fn spared(rules: &Rules, pgid: i32) -> Option<String> {
         Read::Unreadable(why) => Some(format!("it cannot be inspected: {why}")),
         Read::Facts(group) => {
             let (leader, full) = leader_and_command(pgid, &group)?;
-            match rules.classify(pgid, leader.uid, &group.members, full) {
+            match rules.classify(pgid, leader.uid, leader.ppid, &group.members, full) {
                 Verdict::Eligible { .. } => None,
                 Verdict::Ineligible(reason) => Some(reason.text().to_string()),
             }
@@ -906,7 +929,7 @@ mod tests {
             .iter()
             .map(|m| Member { uid, ..m.clone() })
             .collect();
-        r.classify(pgid, uid, &members, "node build.js")
+        r.classify(pgid, uid, 0, &members, "node build.js")
     }
 
     const PLAIN: Verdict = Verdict::Eligible {
@@ -1046,7 +1069,7 @@ mod tests {
         };
         let group = |uids: &[u32]| {
             let members: Vec<Member> = uids.iter().map(|&u| as_user(u)).collect();
-            r.classify(5000, uids[0], &members, "node build.js")
+            r.classify(5000, uids[0], 0, &members, "node build.js")
         };
         assert_eq!(group(&[501, 501]), PLAIN);
         assert_eq!(
@@ -1058,10 +1081,10 @@ mod tests {
         // Including a system user lifts the uid rule for it, but never mixes users in a group.
         let r = rules(vec![], vec![0], &[]);
         let members = [as_user(0), as_user(0)];
-        assert_eq!(r.classify(5000, 0, &members, "node build.js"), PLAIN);
+        assert_eq!(r.classify(5000, 0, 0, &members, "node build.js"), PLAIN);
         let members = [as_user(501), as_user(0)];
         assert_eq!(
-            r.classify(5000, 501, &members, "node build.js"),
+            r.classify(5000, 501, 0, &members, "node build.js"),
             Verdict::Ineligible(Reason::MixedUsers)
         );
     }
@@ -1073,7 +1096,7 @@ mod tests {
         let r = rules(vec![], vec![], &[]);
         let leader = |name: &str, exe: &str, command: &str| {
             let members = [member(name, exe)];
-            r.classify(5000, 501, &members, command)
+            r.classify(5000, 501, 0, &members, command)
         };
         let never = Verdict::Ineligible(Reason::Never);
         assert_eq!(
@@ -1147,6 +1170,85 @@ mod tests {
                 prefer: true,
                 protected: false
             }
+        );
+    }
+
+    /// A simulated run (test only) reaches what the test that started it spawned, and
+    /// nothing else, whatever its pattern says: the leader's parent must be that test.
+    #[test]
+    fn a_simulated_run_is_confined_to_the_children_of_its_test() {
+        let tsc = [member("tsc", "/usr/local/bin/node")];
+        let anything = rules(vec![], vec![], &[]).only_matching(".*", 777).unwrap();
+        let verdict =
+            |r: &Rules, ppid: i32, command: &str| r.classify(5000, 501, ppid, &tsc, command);
+        assert_eq!(verdict(&anything, 777, "node build.js"), PLAIN);
+        assert_eq!(
+            verdict(&anything, 1, "node build.js"),
+            Verdict::Ineligible(Reason::Outside),
+            "the pattern matches, the parent is not the test"
+        );
+        assert_eq!(
+            verdict(&anything, 778, "node build.js"),
+            Verdict::Ineligible(Reason::Outside)
+        );
+        let named = rules(vec![], vec![], &[])
+            .only_matching("^sleep 3600$", 777)
+            .unwrap();
+        assert_eq!(verdict(&named, 777, "sleep 3600"), PLAIN);
+        assert_eq!(
+            verdict(&named, 777, "node build.js"),
+            Verdict::Ineligible(Reason::Outside),
+            "the parent is the test, the pattern does not match"
+        );
+    }
+
+    /// The same on real processes: a group this test spawned is listed, and one with the
+    /// same command line that was started by a helper that has since exited (so its parent
+    /// is launchd) is not, nor may it be killed (`spared` says why).
+    #[test]
+    fn scan_never_lists_a_group_the_test_did_not_spawn_whatever_the_pattern() {
+        let arg = format!("3600.{}", std::process::id());
+        let mine = Sleeper(
+            Command::new("sleep")
+                .arg(&arg)
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let decoy = crate::testutil::orphan_group(&arg);
+        let me = unsafe { libc::getuid() };
+        let r = Rules::new(&[], &[], vec![], vec![me], unsafe { libc::getpgrp() })
+            .unwrap()
+            .only_matching(".*", std::process::id() as i32)
+            .unwrap();
+        let jobs = scan(&r, 0);
+        assert!(
+            jobs.iter().any(|j| j.pgid == pid_of(&mine)),
+            "mine is listed"
+        );
+        assert!(
+            jobs.iter().all(|j| j.pgid != decoy.pid),
+            "the decoy, whose command line the pattern matches, is not"
+        );
+        assert_eq!(spared(&r, pid_of(&mine)), None);
+        let why = spared(&r, decoy.pid).expect("the decoy is never to be killed");
+        assert!(why.contains("confinement"), "{why}");
+    }
+
+    /// A group is measured as the group whose leader it was when it was chosen: if the pid
+    /// now belongs to another process (it started at another time) nothing is measured.
+    #[test]
+    fn a_group_is_measured_only_while_its_leader_is_the_process_that_was_chosen() {
+        let sleeper = spawn(None, 0);
+        let pid = pid_of(&sleeper);
+        let started = bsd_info(pid).unwrap().start_us;
+        let mut insp = Inspector::new();
+        assert!(group_footprint(&mut insp, pid, started).is_some());
+        assert!(group_footprint(&mut insp, pid, started + 1).is_none());
+        assert!(group_footprint(&mut insp, pid, started - 1).is_none());
+        assert!(
+            group_footprint(&mut insp, i32::MAX, started).is_none(),
+            "gone"
         );
     }
 
