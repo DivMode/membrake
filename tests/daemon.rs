@@ -17,7 +17,10 @@ use membrake::jobs::{self, Job};
 use membrake::recorder;
 use membrake::signals::{Pressure, Signals};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -129,23 +132,43 @@ impl Daemon {
         }
     }
 
-    /// A daemon driven by the scripted signals in `script` (`run --simulate`), confined to
-    /// the groups whose command line matches `only`.
+    /// The command of a daemon driven by the scripted signals in `script` (`run --simulate`),
+    /// confined to the groups whose command line matches `only`.
+    fn simulate_command(script: &Path, only: &str, state: &Path, log: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_membrake"));
+        command
+            .args(["run", "--min-job-gb", "0", "--simulate"])
+            .arg(script)
+            .args(["--simulate-only", only])
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--log-dir")
+            .arg(log)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
     fn simulate(script: &Path, only: &str, state: &Path, log: &Path) -> Daemon {
         Daemon(
-            Command::new(env!("CARGO_BIN_EXE_membrake"))
-                .args(["run", "--min-job-gb", "0", "--simulate"])
-                .arg(script)
-                .args(["--simulate-only", only])
-                .arg("--state-dir")
-                .arg(state)
-                .arg("--log-dir")
-                .arg(log)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+            Self::simulate_command(script, only, state, log)
                 .spawn()
                 .unwrap(),
         )
+    }
+
+    /// Waits until the event log names `count` freezes, resumes and kills. The daemon hands
+    /// its events to a logger thread, so they can trail the signals they describe.
+    fn wait_actions(&self, log: &Path, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while actions(log).len() < count {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never logged {count} actions: {}",
+                events(log)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Waits until the daemon has recorded `rows` samples: it records one after it has
@@ -558,6 +581,7 @@ fn simulated_pressure_freezes_the_newest_group_resumes_it_and_kills_the_biggest(
     assert!(big.exited(), "the biggest eligible group is gone");
     assert!(small.alive() && small.running() && decoy.alive() && decoy.running());
 
+    daemon.wait_actions(&log, 3);
     assert_eq!(
         actions(&log),
         [
@@ -639,6 +663,7 @@ fn simulated_urgent_pressure_freezes_everything_before_it_kills_anything() {
         groups.iter().all(|g| g.settles(true)),
         "all three are frozen"
     );
+    daemon.wait_actions(&log, 3);
     let mut frozen: Vec<i32> = actions(&log).into_iter().map(|(_, pgid)| pgid).collect();
     frozen.sort();
     let mut all: Vec<i32> = groups.iter().map(Group::pgid).collect();
@@ -655,6 +680,7 @@ fn simulated_urgent_pressure_freezes_everything_before_it_kills_anything() {
     // The settle period is over and there is nothing left to freeze: one is killed.
     script.urgent(1);
     daemon.wait_samples(&log, 12);
+    daemon.wait_actions(&log, 4);
     let killed: Vec<_> = actions(&log)
         .into_iter()
         .filter(|(kind, _)| kind == "kill")
@@ -707,6 +733,7 @@ fn simulated_calm_resumes_groups_frozen_together_oldest_first() {
     script.calm(30);
     daemon.wait_samples(&log, 32);
     assert!(groups.iter().all(|g| g.settles(false)));
+    daemon.wait_actions(&log, 6);
     let resumed: Vec<(String, i32)> = actions(&log)
         .into_iter()
         .filter(|(kind, _)| kind == "resume")
@@ -764,4 +791,508 @@ fn simulate_needs_explicit_directories_and_a_filter_and_is_hidden() {
         .output()
         .unwrap();
     assert!(!String::from_utf8_lossy(&help.stdout).contains("simulate"));
+}
+
+// ---------------------------------------------------------------------------------------
+// Faults the daemon must survive: a log that blocks, a state file that cannot be read, a
+// command line that no longer parses, a group that stops being eligible.
+
+/// A named pipe at `path`: whoever opens it for writing waits for a reader.
+fn mkfifo(path: &Path) {
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// `text` as a POSIX regular expression that matches exactly itself.
+fn escape(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            let special = ".\\+*?()[]{}^$|".contains(c);
+            special.then_some('\\').into_iter().chain([c])
+        })
+        .collect()
+}
+
+/// A process group led by `/bin/sh` running a script, killed as a whole when dropped.
+struct ShellGroup(Child);
+
+impl ShellGroup {
+    fn spawn(script: &Path, args: &[&str]) -> ShellGroup {
+        ShellGroup(
+            Command::new("/bin/sh")
+                .arg(script)
+                .args(args)
+                .stdin(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn pgid(&self) -> i32 {
+        self.0.id() as i32
+    }
+
+    fn alive(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
+
+    fn stopped(&self) -> bool {
+        jobs::bsd_info(self.pgid())
+            .expect("the leader is visible")
+            .stopped
+    }
+
+    /// The pids of the group's live members.
+    fn members(&self) -> Vec<i32> {
+        jobs::list_pids()
+            .into_iter()
+            .filter(|&pid| jobs::bsd_info(pid).is_some_and(|p| p.pgid == self.pgid() && !p.zombie))
+            .collect()
+    }
+
+    /// Waits until the group has `count` members.
+    fn wait_members(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.members().len() != count {
+            assert!(Instant::now() < deadline, "{:?}", self.members());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn footprint(&self) -> u64 {
+        self.members().into_iter().map(jobs::footprint).sum()
+    }
+
+    /// The leader reaches (or leaves) the stopped state.
+    fn settles(&self, stopped: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.stopped() != stopped && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.stopped() == stopped
+    }
+}
+
+impl Drop for ShellGroup {
+    fn drop(&mut self) {
+        // SAFETY: signalling the group this test spawned.
+        unsafe { libc::killpg(self.pgid(), libc::SIGKILL) };
+        let _ = self.0.wait();
+    }
+}
+
+/// Logging must never stop braking. The event log here is a named pipe nobody reads, which
+/// blocks any writer that opens it. The daemon still samples, freezes at the first sign of
+/// pressure and kills at the cliff, and still exits when told to.
+#[test]
+fn a_blocked_event_log_does_not_stop_the_brake() {
+    let dir = scratch("blocked-log");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    fs::create_dir_all(&log).unwrap();
+    mkfifo(&log.join("events.log"));
+    let mine = marker();
+    let mut first = Group::spawn(&mine, 1);
+    let mut second = Group::spawn(&mine, 1);
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
+
+    script.tight(2);
+    daemon.wait_samples(&log, 2);
+    assert!(
+        second.settles(true),
+        "the newest is frozen with the log blocked"
+    );
+    script.cliff(1);
+    daemon.wait_samples(&log, 3);
+    assert!(second.exited(), "and, frozen, it is killed first");
+    assert!(first.alive() && first.running());
+    assert!(
+        daemon.terminate().success(),
+        "and the daemon still shuts down"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Under launchd stdout is a file that newsyslog cannot rotate while launchd holds it open,
+/// and the event log has every event already: events go to stdout only on a terminal.
+#[test]
+fn events_go_to_stdout_only_when_it_is_a_terminal() {
+    let run = |stdout: Stdio| {
+        let dir = scratch("stdout");
+        let (state, log) = (dir.join("state"), dir.join("log"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_membrake"));
+        command
+            .args(["run", "--min-job-gb", "1000000", "--state-dir"])
+            .arg(&state)
+            .arg("--log-dir")
+            .arg(&log)
+            .stdout(stdout)
+            .stderr(Stdio::null());
+        let daemon = Daemon(command.spawn().unwrap());
+        daemon.wait_started(&log);
+        (daemon, dir)
+    };
+
+    // A pipe, as when something reads the daemon's output.
+    let (mut daemon, dir) = run(Stdio::piped());
+    let mut out = daemon.0.stdout.take().unwrap();
+    assert!(daemon.terminate().success());
+    let mut text = String::new();
+    out.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "", "nothing is written to a pipe");
+    let _ = fs::remove_dir_all(&dir);
+
+    // A terminal: the start line appears.
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty fills in two descriptors.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty");
+    // SAFETY: both descriptors were just opened and are owned here.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let (daemon, dir) = run(Stdio::from(slave));
+    let mut shown = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&shown).contains(" start ") {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            String::from_utf8_lossy(&shown)
+        );
+        let mut chunk = [0u8; 4096];
+        let mut ready = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut ready, 1, 100) } > 0 {
+            // SAFETY: reading into a buffer of the length given.
+            let n = unsafe { libc::read(ready.fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n > 0 {
+                shown.extend_from_slice(&chunk[..n as usize]);
+            }
+        }
+    }
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every SIGSTOP is on disk before it is sent, the one that starts a kill included. The state
+/// file's write is held on a named pipe here: until it goes through, the group that is about
+/// to be killed has not been touched.
+#[test]
+fn a_kill_records_its_stop_before_it_sends_it() {
+    let dir = scratch("kill-record");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let mut big = Group::spawn(&mine, 3);
+    let small = Group::spawn(&mine, 1);
+    assert!(big.footprint() > small.footprint(), "the premise");
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
+    daemon.wait_started(&log);
+    let tmp = state.join("frozen.tsv.tmp");
+    mkfifo(&tmp);
+
+    script.cliff(1); // the biggest group is to be killed at once
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        big.alive() && big.running(),
+        "not yet stopped, not yet dead"
+    );
+    let mut written = String::new();
+    fs::File::open(&tmp)
+        .unwrap()
+        .read_to_string(&mut written)
+        .unwrap();
+    assert!(
+        written.starts_with(&format!("{}\t", big.pgid())),
+        "the record names the group: {written:?}"
+    );
+    daemon.wait_samples(&log, 1);
+    assert!(big.exited(), "and then it is killed");
+    assert_eq!(records(&state), 0, "gone, so nothing is promised");
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The fail-safe resumes frozen jobs when the signals have been unreadable for a minute. If
+/// the state file cannot be read just then, it resumes from the records it holds in memory:
+/// forgetting the jobs without a signal would leave them frozen for good.
+#[test]
+fn the_failsafe_resumes_from_memory_when_the_state_file_cannot_be_read() {
+    let dir = scratch("failsafe-unreadable");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let group = Group::spawn(&mine, 1);
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
+    daemon.wait_started(&log);
+
+    script.tight(2);
+    daemon.wait_samples(&log, 2);
+    assert!(group.settles(true));
+    assert_eq!(records(&state), 1);
+    let file = state.join("frozen.tsv");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        fs::read_to_string(&file).is_err(),
+        "the premise: unreadable"
+    );
+
+    script.unreadable(61);
+    // The daemon takes a moment to get through the 61 readings; the fail-safe says so when it
+    // acts (the same words in the old and the new log line).
+    daemon.wait_logged(&log, "resumed because the signals were unreadable for 60 s");
+    assert!(group.settles(false), "resumed all the same");
+    daemon.wait_logged(&log, "using the records in memory");
+    assert!(daemon.terminate().success());
+    assert!(group.running());
+    assert_eq!(records(&state), 0, "and forgotten, now that it is resolved");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A frozen job that someone continues, and that then becomes something the rules forbid
+/// touching (here its leader execs a different program, keeping pid and start time, so it no
+/// longer matches the simulated filter), is not killed when the cliff comes, although the
+/// engine still counts it as frozen. It is left running, and the next job is the victim.
+#[test]
+fn a_frozen_job_that_became_ineligible_is_not_killed() {
+    let dir = scratch("ineligible");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let later = marker();
+    let mut older = Group::spawn(&mine, 1);
+    let go = dir.join("go");
+    mkfifo(&go);
+    let wait = dir.join("wait.sh");
+    fs::write(&wait, "#!/bin/sh\nread line < \"$1\"\nexec sleep \"$2\"\n").unwrap();
+    let mut newer = ShellGroup::spawn(&wait, &[go.to_str().unwrap(), &later]);
+    let only = format!(
+        "^(sleep {}|/bin/sh [^ ]*/wait\\.sh .*)$",
+        mine.replace('.', "\\.")
+    );
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only, &state, &log);
+    daemon.wait_started(&log);
+
+    // The newest eligible group is frozen.
+    script.tight(2);
+    daemon.wait_samples(&log, 2);
+    assert!(newer.settles(true), "frozen");
+
+    // Someone continues it, and it becomes another program: no longer eligible.
+    // SAFETY: signalling the group this test spawned.
+    unsafe { libc::killpg(newer.pgid(), libc::SIGCONT) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let opened = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&go);
+        if let Ok(mut file) = opened {
+            file.write_all(b"go\n").unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "the script never waited for go");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    while !jobs::command_line(newer.pgid()).is_some_and(|c| c == format!("sleep {later}")) {
+        assert!(
+            Instant::now() < deadline,
+            "{:?}",
+            jobs::command_line(newer.pgid())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The cliff: the engine still counts the group as frozen, and as the first to kill.
+    script.cliff(1);
+    daemon.wait_samples(&log, 3);
+    assert!(newer.alive() && !newer.stopped(), "left running");
+    daemon.wait_logged(&log, "not killing group");
+    assert!(older.alive(), "and the other is not touched yet");
+    assert_eq!(records(&state), 0, "nothing is left recorded");
+
+    // The next cliff takes the job that is still eligible.
+    script.cliff(1);
+    daemon.wait_samples(&log, 4);
+    assert!(older.exited());
+    assert!(newer.alive());
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An agent hosted by an interpreter shows only in that member's own command line
+/// (`/bin/sh .../codex`). It protects the group it runs in even though a plain shell leads
+/// the group and nothing in the leader's command line names an agent.
+#[test]
+fn a_shell_led_group_hosting_an_agent_in_a_member_is_never_killed() {
+    let dir = scratch("agent");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let hosted = marker();
+    let mut ordinary = Group::spawn(&mine, 1);
+    // The stand-in for the agent: a script called codex, run by a shell that the leader starts.
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("codex");
+    fs::write(&agent, format!("#!/bin/sh\nsleep {hosted}\n")).unwrap();
+    let lead = dir.join("lead.sh");
+    fs::write(
+        &lead,
+        format!("#!/bin/sh\n/bin/sh {} &\nwait\n", agent.display()),
+    )
+    .unwrap();
+    let mut led = ShellGroup::spawn(&lead, &[&hosted]);
+    led.wait_members(3); // the leader, the agent's shell and its sleep
+    assert!(
+        led.footprint() > ordinary.footprint(),
+        "the premise: the shell-led group is the biggest, so it is the one to kill"
+    );
+    let only = format!(
+        "^(sleep {}|/bin/sh {}/lead\\.sh {})$",
+        escape(&mine),
+        escape(dir.to_str().unwrap()),
+        escape(&hosted)
+    );
+    let mut script = Script::new(&dir);
+    let daemon = Daemon::simulate(&script.path, &only, &state, &log);
+    daemon.wait_started(&log);
+
+    script.cliff(1);
+    daemon.wait_samples(&log, 1);
+    assert!(
+        ordinary.exited(),
+        "the ordinary group is the one that is killed"
+    );
+    assert!(
+        led.alive() && !led.stopped(),
+        "the agent's group is untouched"
+    );
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The state directory and files are readable by every user (so `membrake status` works for
+/// a normal user) and the lock is not, whatever the umask, and also when an earlier version
+/// left them as 0700 and 0600.
+#[test]
+fn state_permissions_are_set_explicitly_and_repaired() {
+    let dir = scratch("modes");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, mode) in [
+        ("frozen.tsv", 0o600),
+        ("frozen.tsv.tmp", 0o600),
+        ("membrake.lock", 0o644),
+    ] {
+        let file = state.join(name);
+        fs::write(&file, "").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_membrake"));
+    command
+        .args(["run", "--min-job-gb", "1000000", "--state-dir"])
+        .arg(&state)
+        .arg("--log-dir")
+        .arg(&log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe `umask` between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        })
+    };
+    let daemon = Daemon(command.spawn().unwrap());
+    daemon.wait_started(&log);
+    assert_eq!(mode(&state), 0o755, "the directory");
+    assert_eq!(mode(&state.join("frozen.tsv")), 0o644, "the state file");
+    assert_eq!(mode(&state.join("membrake.lock")), 0o600, "the lock");
+    assert!(daemon.terminate().success());
+    assert_eq!(
+        mode(&state.join("frozen.tsv")),
+        0o644,
+        "and after a rewrite"
+    );
+
+    // A directory that does not exist yet is created with the same modes under a strict umask.
+    let fresh = dir.join("fresh");
+    let log = dir.join("log-of-the-second");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_membrake"));
+    command
+        .args(["run", "--min-job-gb", "1000000", "--state-dir"])
+        .arg(&fresh)
+        .arg("--log-dir")
+        .arg(&log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: as above.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        })
+    };
+    let daemon = Daemon(command.spawn().unwrap());
+    daemon.wait_started(&log);
+    assert_eq!(mode(&fresh), 0o755);
+    assert_eq!(mode(&fresh.join("frozen.tsv")), 0o644);
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A flag that no longer parses, or an account that has been deleted since the daemon was
+/// set up, stops it from starting: but only after it has resumed the jobs a previous run left
+/// frozen. launchd restarts it again and again; without the recovery, those jobs would stay
+/// frozen through every restart.
+#[test]
+fn a_bad_command_line_fails_only_after_the_recovery() {
+    for bad in [
+        ["--protect-user", "no-such-user-for-membrake"],
+        ["--settle-seconds", "nan"],
+        ["--term-seconds", "nan"],
+    ] {
+        let dir = scratch("late-validation");
+        let (state, log) = (dir.join("state"), dir.join("log"));
+        let sleeper = Sleeper::spawn();
+        sleeper.freeze_into(&state);
+
+        let out = Command::new(env!("CARGO_BIN_EXE_membrake"))
+            .args(["run", "--min-job-gb", "1000000", "--state-dir"])
+            .arg(&state)
+            .arg("--log-dir")
+            .arg(&log)
+            .args(bad)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad:?}: a bad flag is an error");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no such user") || stderr.contains("non-negative"),
+            "{bad:?}: {stderr}"
+        );
+        assert!(sleeper.settles(false), "{bad:?}: the job was resumed first");
+        assert_eq!(records(&state), 0, "{bad:?}");
+        let said = events(&log);
+        assert!(said.contains("recovered at start"), "{bad:?}: {said}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

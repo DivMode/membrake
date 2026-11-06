@@ -86,15 +86,21 @@ stateDiagram-v2
    compressed or swapped once instead of thrashing, and nothing is lost.
 2. **Brake hard.** If the Mac is heading for the cliff (compressor ≥ 85%, full
    in under a minute, or swap almost out of room), it freezes **every** running
-   eligible job at once. Freezing is instant and loses no work, so it always
-   comes before killing.
+   eligible job at once, even in the middle of the 10 s pause that follows an
+   earlier freeze. Freezing is instant and loses no work, so it always comes
+   before killing.
 3. **Release.** When memory recovers, it resumes frozen jobs one at a time,
    oldest first, so the newest (the likeliest runaway) comes back last and they
    don't all regrow at once.
 4. **Stop.** Only when the Mac is still heading for the cliff with nothing left
-   to freeze, or is already at it (compressor ≥ 92%, swap headroom under 2 GB),
-   it kills the **biggest** eligible job, frozen jobs first: `SIGSTOP`,
-   `SIGTERM`, then `SIGKILL` for the whole group.
+   to freeze, or is already at it, it kills the **biggest** eligible job, frozen
+   jobs first. A job that has been frozen for 15 minutes while memory is still
+   tight is killed too, whatever else is going on.
+   - Heading for the cliff: `SIGSTOP`, then `SIGTERM` and `SIGCONT` so the job
+     can shut down, up to 5 s of grace (`--term-seconds`), then `SIGKILL`.
+   - At the cliff (compressor ≥ 92%, or swap headroom under 2 GB, with memory
+     tight) the Mac has seconds left, so there is no grace by design: `SIGSTOP`,
+     then `SIGKILL` at once, with no `SIGTERM`.
 
 ### What it watches
 
@@ -109,27 +115,59 @@ stateDiagram-v2
 ### What it never touches
 
 - Apps, app extensions and XPC services (anything inside a `.app`, `.appex` or `.xpc` bundle).
-- System processes and system users.
+- System processes and system users (a uid below 500, unless you name the
+  account with `--include-user`).
 - Groups that mix users, or include a system user's process (a `sudo` inside
   a build, say).
 - The coding agents themselves (`claude`, `codex`), terminals and multiplexers.
+  Any process in a group counts, judged by its name, its path and its complete
+  command line, so an agent run by an interpreter (`node …/codex`) protects the
+  shell-led group it is part of.
+- Anything it cannot inspect in full. A group with a process whose owner, path
+  or arguments cannot be read is left alone.
 - Users you protect with `--protect-user` (for example your CI runner account):
-  never frozen, killed only if nothing else is left.
+  never frozen, killed only if nothing else is left. This only ranks jobs that
+  are eligible already; it does not make a system account's jobs eligible.
+
+Eligibility is checked again on the group as it is, just before a kill, not
+only when it was scanned. A job that has become ineligible since (it was
+continued and started an agent, say) is left alone, and continued if it was
+frozen.
 
 ### Built to be trusted
 
-- Every freeze is written to disk **before** `SIGSTOP`. If membrake stops,
-  crashes, panics or restarts, it resumes every job it froze before doing
-  anything else, and it resumes everything if it ever loses sight of memory for
-  a minute.
-- Signals go out first and logging comes after, so a full disk can never delay
-  a freeze or a kill.
+- Every `SIGSTOP` is written to disk **before** it is sent, the one that starts
+  a kill included. If membrake stops, crashes, panics or restarts, it resumes
+  every job it stopped before doing anything else, and it resumes everything if
+  it ever loses sight of memory for a minute.
+- A job's record is dropped only once the job is confirmed gone or `SIGCONT`
+  has been sent. A resume that fails, or a job that cannot be inspected, leaves
+  the record and is tried again on every sample until it works.
+- Before every signal it looks at the group again and checks it is still the
+  one it chose (the leader's pid and start time, or, if the leader is gone, a
+  member older than the scan), so a recycled process group is never signalled.
+  `SIGKILL` goes to each member by its own pid after its start time is read
+  again. macOS has no `pidfd`, so a few microseconds between that last look and
+  the signal remain.
+- A flag that no longer parses, or an account that was deleted, stops the daemon
+  only after it has resumed what a previous run froze.
+- All of a sample's signals go out before anything is logged. Events go to a
+  logger thread over a bounded queue; if the disk stalls they are dropped and
+  counted, and the count is logged when it recovers, so a stuck log never delays
+  a freeze or a kill. (The sampling thread still appends one small row to
+  `samples.tsv` per sample, and flushes the state file before a `SIGSTOP`, by
+  design; every `fsync` of a log is on the logger thread.) Events are copied to
+  stdout only when it is a terminal: under launchd stdout is a file that
+  `newsyslog` cannot rotate, and `events.log` has them all.
 - Timers run on awake time, so a lid-close never makes a job look "frozen too
   long".
 - `--dry-run` logs every decision and sends no signals.
 - One kill in flight at a time, then a settle period before the next decision.
-- The sampling loop never allocates (a test proves it), and the daemon lifts
-  itself out of jetsam band 0 so macOS can't kill the guard first.
+- The quiet sampling path (read the kernel, decide, look at each frozen job,
+  record) does not allocate once it is warm; tests prove it with no job and
+  with a frozen, recorded one. Acting does allocate (scanning the process table,
+  signalling, logging an event). The daemon lifts itself out of jetsam band 0 so
+  macOS can't kill the guard first.
 - Every sample and event is recorded, and `membrake replay` runs a recording
   back through the policy, which is how the policy is tested.
 
@@ -184,14 +222,14 @@ membrake replay samples.tsv    # run a recording back through the policy
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--protect-user NAME` | — | Never freeze this user's jobs; kill them only last (repeatable) |
-| `--include-user NAME` | — | Treat this system account's jobs as eligible (repeatable) |
+| `--protect-user NAME` | — | Never freeze this user's jobs; kill them only last. Ranking only: it does not make a system account eligible (repeatable) |
+| `--include-user NAME` | — | Treat this system account's jobs (uid below 500) as eligible (repeatable) |
 | `--prefer REGEX` | — | Freeze and kill matching jobs first |
 | `--never REGEX` | agents, terminals | Never touch matching jobs (adds to the built-in list) |
 | `--min-job-gb GB` | `1` | Ignore jobs smaller than this |
 | `--settle-seconds S` | `10` | Spacing between freezes, resumes and kills |
 | `--max-freeze-minutes M` | `15` | Kill a job frozen this long while memory is still tight |
-| `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` |
+| `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` (none at the cliff) |
 | `--on-event CMD` | — | Run on every freeze, resume and kill, with `MEMBRAKE_*` variables |
 | `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded |
 | `--log-dir DIR` | `/var/log/membrake` | `samples.tsv` and `events.log` (dry runs default to a `dry-run` subdirectory) |

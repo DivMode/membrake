@@ -1,18 +1,34 @@
 //! Everything membrake does to the system: signalling process groups, remembering what it
-//! froze so a restart can thaw it, running hooks, and lifting itself out of jetsam band 0.
+//! stopped so a restart can continue it, running hooks, and lifting itself out of jetsam
+//! band 0.
 //!
-//! Every signal to a group first checks that it is still the group that was recorded: its
-//! leader (pid plus start time) is alive, or, if the leader has died, a surviving member
-//! started before the group was recorded. A pid that was reused for a new group has only
-//! members that started later, so it is never signalled by mistake.
+//! Identity. Every signal to a group is preceded, immediately, by a look at the group, and the
+//! group must still be the one that was recorded or scanned: its leader (pid plus start time)
+//! is alive, or, if the leader has died, a surviving member started before the bound. The
+//! bound is the time the process table was scanned (or, for a frozen job, the time of its
+//! record); it is never worked out when a signal is dispatched, which may be seconds later.
+//! A pid that was reused for a new group has only members that started later, so it is never
+//! signalled by mistake.
+//!
+//! What is left. macOS has no pidfd, so between that look and the `killpg` there are a few
+//! microseconds in which the whole group would have to exit and the kernel hand its pgid to a
+//! new group; the kernel does not reissue a pgid while any process is still in the group, so
+//! it also needs the pid counter to wrap around inside that gap. SIGKILL is not sent to the
+//! group at all: each member is signalled by its own pid, after its start time is read again,
+//! so a pid that was reissued to a new process in the meantime is skipped.
+//!
+//! Records. A record is the promise to continue a group. It is written (and flushed) before
+//! every SIGSTOP, including the one that starts a kill, and kept until the group is confirmed
+//! gone or SIGCONT has been sent to it. A group that cannot be inspected, or a SIGCONT that
+//! fails, is neither: the record stays and the signal is tried again.
 
-use crate::jobs::{self, Job, Proc, one_line};
+use crate::jobs::{Inspector, Job, Look, Probe, Seen, one_line, probe};
 use crate::signals;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +37,7 @@ use std::time::Duration;
 
 const STATE_FILE: &str = "frozen.tsv";
 const LOCK_FILE: &str = "membrake.lock";
-/// How long to wait for a group to disappear after SIGKILL.
+/// How long to keep killing a group, after SIGKILL, until it is gone.
 const KILL_WAIT: f64 = 10.0;
 const POLL: Duration = Duration::from_millis(50);
 /// No sleep is ever longer than the sampling interval, whatever the clock says.
@@ -75,14 +91,22 @@ fn sleep_length(left: f64) -> f64 {
     left.clamp(0.0, MAX_SLEEP)
 }
 
+/// Creates the state directory if needed and sets its mode, whatever the umask and whatever
+/// an earlier version left. Readable by every user, so `membrake status` can list frozen jobs;
+/// it holds only group ids and command lines, which `ps` already shows to all.
+fn secure_dir(dir: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+}
+
 /// Holds an exclusive lock on `<dir>/membrake.lock` for as long as the returned file lives,
 /// so two daemons never freeze and thaw each other's jobs. The lock goes away with the
 /// process, however it dies.
 pub fn lock_instance(dir: &Path) -> Result<fs::File, String> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(dir)
+    secure_dir(dir)
         .map_err(|e| format!("cannot create the state directory {}: {e}", dir.display()))?;
     let path = dir.join(LOCK_FILE);
     let file = fs::OpenOptions::new()
@@ -92,6 +116,8 @@ pub fn lock_instance(dir: &Path) -> Result<fs::File, String> {
         .mode(0o600)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot set the mode of {}: {e}", path.display()))?;
     // SAFETY: flock on a file descriptor we own.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let e = io::Error::last_os_error();
@@ -124,6 +150,18 @@ pub struct Record {
 }
 
 impl Record {
+    fn of(job: &Job, frozen_at: f64) -> Record {
+        Record {
+            pgid: job.pgid,
+            leader_pid: job.leader_pid,
+            leader_start_us: job.start_us,
+            frozen_at,
+            bytes: job.bytes,
+            uid: job.uid,
+            command: job.command.clone(),
+        }
+    }
+
     fn line(&self) -> String {
         format!(
             "{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\n",
@@ -148,10 +186,6 @@ impl Record {
             uid: f.next()?.parse().ok()?,
             command: f.next()?.to_string(),
         })
-    }
-
-    fn bound_us(&self) -> u64 {
-        wall_us(self.frozen_at)
     }
 }
 
@@ -187,14 +221,14 @@ pub struct State {
 }
 
 impl State {
-    /// Creates the directory (readable by every user, so `membrake status` can list frozen
-    /// jobs; it holds only group ids and command lines, which `ps` already shows to all)
-    /// and loads what a previous run left.
+    /// Creates the directory (see `secure_dir`), repairs the mode of a state file an earlier
+    /// version left unreadable to other users, and loads what a previous run left.
     pub fn open(dir: &Path) -> io::Result<State> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(dir)?;
+        secure_dir(dir)?;
+        match fs::set_permissions(dir.join(STATE_FILE), fs::Permissions::from_mode(0o644)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let (records, unparsed) = read_state(dir)?;
         Ok(State {
             dir: dir.to_path_buf(),
@@ -204,6 +238,7 @@ impl State {
     }
 
     /// Re-reads the file: it, not this copy, is the truth after a crash or an outside edit.
+    /// If the file cannot be read, this copy is left as it was.
     pub fn reload(&mut self) -> io::Result<()> {
         (self.records, self.unparsed) = read_state(&self.dir)?;
         Ok(())
@@ -222,7 +257,8 @@ impl State {
     }
 
     /// Writes the whole file atomically and flushes it to disk: the record must outlive a
-    /// crash, or a frozen job would stay frozen forever.
+    /// crash, or a frozen job would stay frozen forever. The mode is set on the file itself,
+    /// so neither the umask nor a leftover temporary file decides it.
     fn save(&self) -> io::Result<()> {
         let tmp = self.dir.join(format!("{STATE_FILE}.tmp"));
         let mut file = fs::OpenOptions::new()
@@ -231,6 +267,7 @@ impl State {
             .truncate(true)
             .mode(0o644)
             .open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
         for r in &self.records {
             file.write_all(r.line().as_bytes())?;
         }
@@ -242,10 +279,19 @@ impl State {
         fs::rename(tmp, self.dir.join(STATE_FILE))
     }
 
+    /// Records the group and writes the file. If the write fails nothing has been promised, and
+    /// the records are as they were.
     fn add(&mut self, record: Record) -> io::Result<()> {
-        self.records.retain(|r| r.pgid != record.pgid);
+        let replaced = self
+            .records
+            .iter()
+            .position(|r| r.pgid == record.pgid)
+            .map(|at| self.records.remove(at));
         self.records.push(record);
-        self.save()
+        self.save().inspect_err(|_| {
+            self.records.pop();
+            self.records.extend(replaced);
+        })
     }
 
     /// Drops the record for `pgid`, if any.
@@ -264,8 +310,11 @@ impl State {
 
 #[derive(Debug)]
 pub enum ActError {
-    /// The group is gone, or its pid now belongs to a newer group.
+    /// Confirmed: the group is gone, or its pid now belongs to a newer group.
     Gone,
+    /// The group could not be inspected. Nothing was signalled and nothing is known: this is
+    /// not `Gone`, and no record may be dropped because of it.
+    Unknown(String),
     Io(io::Error),
 }
 
@@ -273,6 +322,7 @@ impl fmt::Display for ActError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ActError::Gone => write!(f, "the job has exited"),
+            ActError::Unknown(why) => write!(f, "the job cannot be inspected: {why}"),
             ActError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -284,40 +334,62 @@ impl From<io::Error> for ActError {
     }
 }
 
-/// The live (non-zombie) members of process group `pgid`.
-fn live_members(pgid: i32) -> Vec<Proc> {
-    let mut pids = vec![0i32; 4096];
-    let bytes = (pids.len() * size_of::<i32>()) as libc::c_int;
-    // SAFETY: `pids` is `bytes` long.
-    let got = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes) };
-    // Like proc_listallpids, this wrapper returns a count of pids, not bytes.
-    let count = (got.max(0) as usize).min(pids.len());
-    pids[..count]
-        .iter()
-        .filter_map(|&pid| jobs::bsd_info(pid))
-        .filter(|p| !p.zombie && p.pgid == pgid)
-        .collect()
-}
-
-/// The members of the group that was recorded, or None if it is gone. It is the same group
-/// if its leader is alive, or if the leader has died but a surviving member started before
-/// `bound_us` (when the group was recorded). A group that merely reuses the pgid has only
-/// members that started later.
-fn recorded_group(
+/// The group a signal is meant for.
+struct Identity {
     pgid: i32,
     leader_pid: i32,
     leader_start_us: u64,
+    /// A member that started at or after this is not part of the group that was recorded.
     bound_us: u64,
-) -> Option<Vec<Proc>> {
-    let members = live_members(pgid);
-    let leader = members
-        .iter()
-        .any(|p| p.pid == leader_pid && p.start_us == leader_start_us);
-    let survivor = members.iter().any(|p| p.start_us < bound_us);
-    (leader || survivor).then_some(members)
+}
+
+impl Identity {
+    /// `bound` is wall-clock Unix seconds.
+    fn of_job(job: &Job, bound: f64) -> Identity {
+        Identity {
+            pgid: job.pgid,
+            leader_pid: job.leader_pid,
+            leader_start_us: job.start_us,
+            bound_us: wall_us(bound),
+        }
+    }
+
+    fn of_record(rec: &Record) -> Identity {
+        Identity {
+            pgid: rec.pgid,
+            leader_pid: rec.leader_pid,
+            leader_start_us: rec.leader_start_us,
+            bound_us: wall_us(rec.frozen_at),
+        }
+    }
+
+    /// Whether `members` (the live members of the pgid) are the recorded group: its leader is
+    /// among them, or, the leader having died, a member that started before the bound is.
+    fn holds(&self, members: &[Seen]) -> bool {
+        members
+            .iter()
+            .any(|p| p.pid == self.leader_pid && p.start_us == self.leader_start_us)
+            || members.iter().any(|p| p.start_us < self.bound_us)
+    }
+}
+
+/// Looks at the group and checks that it is still the one in `id`. Leaves its members in
+/// `insp`. `Gone` means absent or replaced by a newer group; a group that could not be
+/// listed or read is `Unknown`, never `Gone`.
+fn verify(insp: &mut Inspector, id: &Identity) -> Result<(), ActError> {
+    match insp.look(id.pgid) {
+        Look::Absent => Err(ActError::Gone),
+        Look::Unknown(why) => Err(ActError::Unknown(why)),
+        Look::Present if id.holds(insp.members()) => Ok(()),
+        Look::Present => Err(ActError::Gone),
+    }
 }
 
 fn signal_group(pgid: i32, sig: libc::c_int) -> Result<(), ActError> {
+    #[cfg(test)]
+    if crate::testutil::fault::take(&crate::testutil::fault::SIGNAL) {
+        return Err(ActError::Io(io::Error::from_raw_os_error(libc::EPERM)));
+    }
     // SAFETY: killpg has no memory-safety preconditions.
     if unsafe { libc::killpg(pgid, sig) } == 0 {
         return Ok(());
@@ -330,21 +402,33 @@ fn signal_group(pgid: i32, sig: libc::c_int) -> Result<(), ActError> {
     })
 }
 
-/// SIGSTOP the group. The record is written and flushed first: a crash between the two
-/// steps leaves a record for a running job, which recovery thaws harmlessly. `now` is the
-/// wall clock.
+/// Signals the group, after looking at it once more: every signal is preceded by its own
+/// identity check, however recently the last one was made.
+fn signal_verified(insp: &mut Inspector, id: &Identity, sig: libc::c_int) -> Result<(), ActError> {
+    verify(insp, id)?;
+    signal_group(id.pgid, sig)
+}
+
+/// Drops the record of a group that is confirmed gone; any other error leaves it. Returns
+/// the error for the caller.
+fn settle(state: &mut State, pgid: i32, error: ActError) -> ActError {
+    if matches!(error, ActError::Gone) {
+        let _ = state.remove(pgid);
+    }
+    error
+}
+
+/// SIGSTOP the group. The record is written and flushed first, and the group is looked at
+/// again after the write (which can take a while) and before the signal: a crash between the
+/// two steps leaves a record for a running job, which recovery thaws harmlessly. `now` is the
+/// wall-clock time the process table was scanned, the bound of the group's identity.
 pub fn freeze(state: &mut State, job: &Job, now: f64) -> Result<(), ActError> {
-    recorded_group(job.pgid, job.leader_pid, job.start_us, wall_us(now)).ok_or(ActError::Gone)?;
-    state.add(Record {
-        pgid: job.pgid,
-        leader_pid: job.leader_pid,
-        leader_start_us: job.start_us,
-        frozen_at: now,
-        bytes: job.bytes,
-        uid: job.uid,
-        command: job.command.clone(),
-    })?;
-    if let Err(e) = signal_group(job.pgid, libc::SIGSTOP) {
+    let id = Identity::of_job(job, now);
+    let mut insp = Inspector::new();
+    verify(&mut insp, &id)?;
+    state.add(Record::of(job, now))?;
+    if let Err(e) = signal_verified(&mut insp, &id, libc::SIGSTOP) {
+        // Nothing was stopped, so there is nothing to promise.
         let _ = state.remove(job.pgid);
         return Err(e);
     }
@@ -352,25 +436,24 @@ pub fn freeze(state: &mut State, job: &Job, now: f64) -> Result<(), ActError> {
 }
 
 /// SIGCONT the recorded group, if it is still the same group.
-fn thaw(rec: &Record) -> Result<(), ActError> {
-    recorded_group(
-        rec.pgid,
-        rec.leader_pid,
-        rec.leader_start_us,
-        rec.bound_us(),
-    )
-    .ok_or(ActError::Gone)?;
-    signal_group(rec.pgid, libc::SIGCONT)
+fn thaw(rec: &Record, insp: &mut Inspector) -> Result<(), ActError> {
+    signal_verified(insp, &Identity::of_record(rec), libc::SIGCONT)
 }
 
-/// SIGCONT the group and forget it. A job that has already gone, or was never recorded, is
-/// not an error worth more than `Gone`.
-pub fn resume(state: &mut State, job: &Job) -> Result<(), ActError> {
-    let Some(rec) = state.record(job.pgid).cloned() else {
+/// SIGCONT the recorded group `pgid`. The record is dropped only once the group is confirmed
+/// gone (or replaced) or the SIGCONT has been sent; if the signal fails, or the group cannot
+/// be inspected, the record stays so that it can be tried again. A group that was never
+/// recorded is `Gone`.
+pub fn resume(state: &mut State, pgid: i32) -> Result<(), ActError> {
+    let Some(rec) = state.record(pgid).cloned() else {
         return Err(ActError::Gone);
     };
-    let result = thaw(&rec);
-    state.remove(job.pgid)?;
+    let result = thaw(&rec, &mut Inspector::new());
+    if matches!(result, Ok(()) | Err(ActError::Gone)) {
+        // If this write fails the file keeps a record that recovery will find gone or
+        // continued: harmless.
+        let _ = state.remove(pgid);
+    }
     result
 }
 
@@ -380,21 +463,28 @@ pub enum Recovered {
     /// The recorded group is gone, or its pgid now belongs to a newer group: nothing was
     /// signalled.
     Skipped,
+    /// The signal failed or the group could not be inspected. The record is kept.
     Failed(String),
 }
 
-/// Thaws every recorded job whose group is still the recorded one, then empties the records
-/// (unreadable lines stay). Run at start and on shutdown, before anything else.
+/// Thaws every recorded job whose group is still the recorded one and drops its record, and
+/// the record of every group that is gone. A record whose job could not be continued stays
+/// (unreadable lines stay too). Run at start and on shutdown, before anything else.
 pub fn recover(state: &mut State) -> io::Result<Vec<(Record, Recovered)>> {
-    let mut report = Vec::new();
+    let mut insp = Inspector::new();
+    let (mut report, mut kept) = (Vec::new(), Vec::new());
     for r in std::mem::take(&mut state.records) {
-        let outcome = match thaw(&r) {
+        let outcome = match thaw(&r, &mut insp) {
             Ok(()) => Recovered::Resumed,
             Err(ActError::Gone) => Recovered::Skipped,
-            Err(ActError::Io(e)) => Recovered::Failed(e.to_string()),
+            Err(e) => Recovered::Failed(e.to_string()),
         };
+        if matches!(outcome, Recovered::Failed(_)) {
+            kept.push(r.clone());
+        }
         report.push((r, outcome));
     }
+    state.records = kept;
     state.save()?;
     Ok(report)
 }
@@ -411,59 +501,142 @@ pub enum FrozenState {
     /// Someone continued it (`fg`, `kill -CONT`).
     ResumedOutside,
     Gone,
+    /// The group could not be inspected: nothing can be said about it.
+    Unknown,
 }
 
-/// What became of a job membrake froze. Cheap: it looks at one group only.
-pub fn frozen_state(rec: &Record) -> FrozenState {
-    match recorded_group(
-        rec.pgid,
-        rec.leader_pid,
-        rec.leader_start_us,
-        rec.bound_us(),
-    ) {
-        None => FrozenState::Gone,
-        Some(members) if members.iter().all(|p| p.stopped) => FrozenState::Stopped,
-        Some(_) => FrozenState::ResumedOutside,
+/// What became of a job membrake froze. Cheap: it looks at one group only, through the
+/// buffers in `insp`, and allocates nothing once they are warm.
+pub fn frozen_state(rec: &Record, insp: &mut Inspector) -> FrozenState {
+    match insp.look(rec.pgid) {
+        Look::Absent => FrozenState::Gone,
+        Look::Unknown(_) => FrozenState::Unknown,
+        Look::Present if !Identity::of_record(rec).holds(insp.members()) => FrozenState::Gone,
+        Look::Present if insp.members().iter().all(|p| p.stopped) => FrozenState::Stopped,
+        Look::Present => FrozenState::ResumedOutside,
     }
 }
 
-fn wait_for_exit(pgid: i32, seconds: f64) -> bool {
+/// True once the group is gone or replaced by a newer one; false at the deadline or when
+/// shutdown is requested. A group that cannot be inspected is not gone.
+fn wait_gone(insp: &mut Inspector, id: &Identity, seconds: f64) -> bool {
     let deadline = signals::uptime() + seconds;
-    while !live_members(pgid).is_empty() {
+    loop {
+        if matches!(verify(insp, id), Err(ActError::Gone)) {
+            return true;
+        }
         if signals::uptime() >= deadline || shutdown_requested() {
             return false;
         }
         thread::sleep(POLL);
     }
-    true
+}
+
+/// SIGKILL one member by its own pid, if it is still the process that was seen: same start
+/// time, same group, not a zombie. The start time is read again immediately before `kill(2)`,
+/// so a pid reissued to a new process since the group was looked at is skipped.
+fn kill_member(seen: &Seen) -> bool {
+    match probe(seen.pid) {
+        Probe::Found(now)
+            if now.start_us == seen.start_us && now.pgid == seen.pgid && !now.zombie =>
+        {
+            // SAFETY: kill has no memory-safety preconditions.
+            unsafe { libc::kill(seen.pid, libc::SIGKILL) == 0 }
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Killed {
+    /// The group is gone (or its pgid now belongs to a newer group). Its record is dropped.
+    Exited,
+    /// Processes were still there when the wait for SIGKILL ran out. The record is kept, and
+    /// the group is continued on later samples until it is confirmed gone.
+    Survivors,
+    /// `allowed` refused: the group must not be killed (the reason is the text). If it was
+    /// frozen it has been continued.
+    Spared(String),
 }
 
 /// SIGSTOP the group so it stops growing, then (unless `immediate`) SIGTERM and SIGCONT and
-/// wait up to `term_seconds`, then SIGKILL and wait for the group to exit. Returns whether
-/// it exited. Blocks: only one kill is ever in flight. `frozen_at` is when membrake froze
-/// the job, if it did (see `recorded_group`).
+/// wait up to `term_seconds`, then SIGKILL the members until the group is gone. An emergency
+/// (`immediate`) has no seconds to spare: SIGSTOP, then SIGKILL, with no SIGTERM and no grace.
+/// Blocks: only one kill is ever in flight.
+///
+/// The SIGSTOP of a job that is not frozen is recorded in `state` first, like a freeze; the
+/// record goes when the group is confirmed gone. `scanned` is the wall-clock time the process
+/// table was scanned to choose the job (the bound of its identity), unless the job was
+/// frozen, when the record's time is the bound. `allowed` is asked before anything is signalled and
+/// again before SIGKILL; it returns the reason the group may no longer be killed, if so.
 pub fn kill(
+    state: &mut State,
     job: &Job,
+    scanned: f64,
     immediate: bool,
     term_seconds: f64,
-    frozen_at: Option<f64>,
-) -> Result<bool, ActError> {
-    let bound = wall_us(frozen_at.unwrap_or_else(signals::wall));
-    recorded_group(job.pgid, job.leader_pid, job.start_us, bound).ok_or(ActError::Gone)?;
-    signal_group(job.pgid, libc::SIGSTOP)?;
+    allowed: &mut dyn FnMut() -> Option<String>,
+) -> Result<Killed, ActError> {
+    let pgid = job.pgid;
+    let frozen_at = state.record(pgid).map(|r| r.frozen_at);
+    let id = Identity::of_job(job, frozen_at.unwrap_or(scanned));
+    let mut insp = Inspector::new();
+
+    verify(&mut insp, &id).map_err(|e| settle(state, pgid, e))?;
+    if let Some(why) = allowed() {
+        // Not ours to kill, and not to be left frozen either.
+        let _ = resume(state, pgid);
+        return Ok(Killed::Spared(why));
+    }
+    // The record first, then the stop. If the record cannot be written the group is not
+    // stopped: it is terminated (or killed) running, which no crash can leave frozen.
+    let adds_record = frozen_at.is_none();
+    let may_stop = !adds_record || state.add(Record::of(job, scanned)).is_ok();
+    if may_stop && let Err(e) = signal_verified(&mut insp, &id, libc::SIGSTOP) {
+        if adds_record {
+            let _ = state.remove(pgid);
+        }
+        return Err(settle(state, pgid, e));
+    }
     // The SIGSTOP succeeded, so we are allowed to signal this group. A later error therefore
-    // means the group has already exited: macOS answers EPERM, not ESRCH, for a zombie that
-    // its parent has not reaped yet. Whether it is gone is decided by `wait_for_exit`.
+    // means the group has already exited or been replaced (every signal looks first, and
+    // macOS answers EPERM, not ESRCH, for a zombie that its parent has not reaped yet).
+    // Whether it is gone is decided by `wait_gone`.
     if !immediate && term_seconds > 0.0 {
-        let _ = signal_group(job.pgid, libc::SIGTERM);
+        let _ = signal_verified(&mut insp, &id, libc::SIGTERM);
         // A stopped process cannot run its SIGTERM handler.
-        let _ = signal_group(job.pgid, libc::SIGCONT);
-        if wait_for_exit(job.pgid, term_seconds) {
-            return Ok(true);
+        let _ = signal_verified(&mut insp, &id, libc::SIGCONT);
+        if wait_gone(&mut insp, &id, term_seconds) {
+            let _ = state.remove(pgid);
+            return Ok(Killed::Exited);
+        }
+        // The grace period was long enough for the group to change: ask again before the
+        // signal that cannot be taken back.
+        if let Some(why) = allowed() {
+            let _ = resume(state, pgid);
+            return Ok(Killed::Spared(why));
         }
     }
-    let _ = signal_group(job.pgid, libc::SIGKILL);
-    Ok(wait_for_exit(job.pgid, KILL_WAIT))
+    let deadline = signals::uptime() + KILL_WAIT;
+    loop {
+        match verify(&mut insp, &id) {
+            Err(ActError::Gone) => {
+                let _ = state.remove(pgid);
+                return Ok(Killed::Exited);
+            }
+            Ok(()) => {
+                for member in insp.members() {
+                    kill_member(member);
+                }
+            }
+            // Could not look: signal nothing, look again.
+            Err(_) => {}
+        }
+        if signals::uptime() >= deadline || shutdown_requested() {
+            return Ok(Killed::Survivors);
+        }
+        thread::sleep(POLL);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -628,7 +801,9 @@ pub fn protect_self() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{Sleeper, scratch};
+    use crate::jobs;
+    use crate::testutil::{Sleeper, fault, mkfifo, scratch};
+    use std::io::Read;
 
     /// A clock that jumps or a bad deadline must not put the brake to sleep.
     #[test]
@@ -641,6 +816,22 @@ mod tests {
 
     fn records_on_disk(dir: &Path) -> usize {
         read_state(dir).unwrap().0.len()
+    }
+
+    /// Kills with the rules never objecting, as a plain eligible job.
+    fn kill_job(
+        state: &mut State,
+        job: &Job,
+        immediate: bool,
+        term_seconds: f64,
+        scanned: f64,
+    ) -> Result<Killed, ActError> {
+        kill(state, job, scanned, immediate, term_seconds, &mut || None)
+    }
+
+    /// The wall-clock time, in seconds, `micros` after the start of a process.
+    fn secs_after(start_us: u64, micros: i64) -> f64 {
+        (start_us as i64 + micros) as f64 / 1e6
     }
 
     /// The crash-safety contract: a frozen job recorded by one run is thawed by the next
@@ -723,14 +914,21 @@ mod tests {
     /// Kill reaches a frozen group's survivors the same way.
     #[test]
     fn kill_reaches_the_survivor_of_a_group_whose_leader_died() {
+        let dir = scratch("kill-survivor");
         let mut leader = Sleeper::spawn();
         let member = Sleeper::spawn_in(leader.pid(), false);
         let job = leader.job(2);
         let frozen_at = signals::wall();
         leader.die();
-        assert!(kill(&job, true, 5.0, Some(frozen_at)).unwrap());
-        assert!(live_members(job.pgid).is_empty());
+        let mut state = State::open(&dir).unwrap();
+        assert_eq!(
+            kill_job(&mut state, &job, true, 5.0, frozen_at).unwrap(),
+            Killed::Exited
+        );
+        let mut insp = Inspector::new();
+        assert!(matches!(insp.look(job.pgid), Look::Absent));
         drop(member);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A record whose group has exited has nothing to resume and is dropped.
@@ -757,7 +955,7 @@ mod tests {
         freeze(&mut state, &job, signals::wall()).unwrap();
         assert!(sleeper.settles(true));
         assert_eq!(records_on_disk(&dir), 1);
-        resume(&mut state, &job).unwrap();
+        resume(&mut state, job.pgid).unwrap();
         assert!(sleeper.settles(false));
         assert_eq!(records_on_disk(&dir), 0);
         let _ = fs::remove_dir_all(&dir);
@@ -773,58 +971,364 @@ mod tests {
         freeze(&mut state, &job, signals::wall()).unwrap();
         assert!(sleeper.settles(true));
         let rec = state.record(job.pgid).unwrap().clone();
-        assert_eq!(frozen_state(&rec), FrozenState::Stopped);
+        let mut insp = Inspector::new();
+        assert_eq!(frozen_state(&rec, &mut insp), FrozenState::Stopped);
 
         signal_group(job.pgid, libc::SIGCONT).unwrap(); // `kill -CONT`, not membrake
         assert!(sleeper.settles(false));
-        assert_eq!(frozen_state(&rec), FrozenState::ResumedOutside);
+        assert_eq!(frozen_state(&rec, &mut insp), FrozenState::ResumedOutside);
 
         sleeper.die();
-        assert_eq!(frozen_state(&rec), FrozenState::Gone);
+        assert_eq!(frozen_state(&rec, &mut insp), FrozenState::Gone);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // -----------------------------------------------------------------------------------
+    // Findings: a record outlives anything short of the group being gone or continued.
+
+    /// A group the kernel could not list is not a group that is gone. Nothing that follows
+    /// from "gone" (a dropped record, a forgotten job) may follow from "unknown".
+    #[test]
+    fn a_group_that_cannot_be_listed_is_unknown_never_gone() {
+        let dir = scratch("unknown");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        freeze(&mut state, &job, signals::wall()).unwrap();
+        assert!(sleeper.settles(true));
+        let rec = state.record(job.pgid).unwrap().clone();
+        let mut insp = Inspector::new();
+
+        fault::arm(&fault::LIST, 1);
+        assert_eq!(frozen_state(&rec, &mut insp), FrozenState::Unknown);
+
+        fault::arm(&fault::LIST, 1);
+        assert!(matches!(
+            resume(&mut state, job.pgid),
+            Err(ActError::Unknown(_))
+        ));
+        assert_eq!(records_on_disk(&dir), 1, "the record stays");
+        assert!(sleeper.stopped(), "and nothing was signalled");
+
+        fault::arm(&fault::LIST, 1);
+        let report = recover(&mut state).unwrap();
+        assert!(matches!(report[0].1, Recovered::Failed(_)));
+        assert_eq!(records_on_disk(&dir), 1, "recovery keeps it too");
+        assert_eq!(state.records().len(), 1);
+
+        // Once the group can be read again the same record is resolved.
+        resume(&mut state, job.pgid).unwrap();
+        assert!(sleeper.settles(false));
+        assert_eq!(records_on_disk(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A SIGCONT that fails is not a SIGCONT that was sent: `resume` and `recover` keep the
+    /// record, and the job is continued the next time it works.
+    #[test]
+    fn a_failed_sigcont_leaves_the_record_to_be_tried_again() {
+        let dir = scratch("sigcont");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        freeze(&mut state, &job, signals::wall()).unwrap();
+        assert!(sleeper.settles(true));
+
+        fault::arm(&fault::SIGNAL, 1);
+        assert!(matches!(resume(&mut state, job.pgid), Err(ActError::Io(_))));
+        assert_eq!(records_on_disk(&dir), 1);
+        assert!(sleeper.stopped());
+
+        fault::arm(&fault::SIGNAL, 1);
+        let report = recover(&mut state).unwrap();
+        assert!(matches!(report[0].1, Recovered::Failed(_)));
+        assert_eq!(records_on_disk(&dir), 1);
+
+        let report = recover(&mut state).unwrap();
+        assert_eq!(report[0].1, Recovered::Resumed);
+        assert!(sleeper.settles(false));
+        assert_eq!(records_on_disk(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Findings: identity is checked at the signal, from the bound taken at scan time.
+
+    /// A group that merely reuses the pgid of the one that was scanned: its leader is another
+    /// process, and everything in it started after the sample. Nothing is signalled to it.
+    /// (Worked out at dispatch, the bound would be later than that group's start.)
+    #[test]
+    fn a_kill_never_signals_a_group_that_only_reuses_the_pgid() {
+        let dir = scratch("reuse-kill");
+        let sleeper = Sleeper::spawn();
+        let mut job = sleeper.job(1);
+        let scanned = secs_after(job.start_us, -1_000_000);
+        job.start_us -= 5_000_000; // the leader that was scanned is not this process
+        let mut state = State::open(&dir).unwrap();
+
+        let result = kill_job(&mut state, &job, true, 1.0, scanned);
+        assert!(matches!(result, Err(ActError::Gone)), "{result:?}");
+        assert!(sleeper.0.id() > 0 && !sleeper.stopped(), "not even stopped");
+        assert!(state.records().is_empty() && records_on_disk(&dir) == 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Writing the record can take a while. The group is looked at again after it, and a
+    /// group that has changed meanwhile is not stopped. Here the write is held on a named
+    /// pipe while the leader dies, leaving only a member that started after the bound.
+    #[test]
+    fn freeze_looks_at_the_group_again_after_the_record_is_written() {
+        let dir = scratch("freeze-again");
+        let mut leader = Sleeper::spawn();
+        let member = Sleeper::spawn_in(leader.pid(), false);
+        let job = leader.job(2);
+        let bound = secs_after(jobs::bsd_info(member.pid()).unwrap().start_us, -1000);
+        let mut state = State::open(&dir).unwrap();
+        let tmp = dir.join(format!("{STATE_FILE}.tmp"));
+        mkfifo(&tmp);
+
+        let freezing = thread::spawn(move || {
+            let result = freeze(&mut state, &job, bound);
+            (state, result)
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(!freezing.is_finished(), "the write is waiting for a reader");
+        leader.die(); // what is left is a member the bound says is a newer group
+        let mut written = String::new();
+        fs::File::open(&tmp)
+            .unwrap()
+            .read_to_string(&mut written)
+            .unwrap();
+        assert!(written.starts_with(&job_pgid_text(&member)), "{written}");
+
+        let (state, result) = freezing.join().unwrap();
+        assert!(matches!(result, Err(ActError::Gone)), "{result:?}");
+        assert!(!member.stopped(), "the newer group was not stopped");
+        assert!(state.records().is_empty(), "and nothing is promised");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn job_pgid_text(member: &Sleeper) -> String {
+        format!("{}\t", jobs::bsd_info(member.pid()).unwrap().pgid)
+    }
+
+    /// While a kill waits out the grace period the group is looked at again each time: once
+    /// the leader is gone and only a member that started after the bound is left, the group
+    /// that was meant is gone, and the member is not killed.
+    #[test]
+    fn a_kill_stops_when_what_is_left_of_the_group_is_a_newer_one() {
+        let dir = scratch("kill-newer");
+        let mut leader = Sleeper::spawn_in(0, true);
+        let member = Sleeper::spawn_in(leader.pid(), true);
+        let job = leader.job(2);
+        let scanned = secs_after(jobs::bsd_info(member.pid()).unwrap().start_us, -1000);
+        let mut state = State::open(&dir).unwrap();
+
+        let killing = thread::spawn(move || {
+            let result = kill_job(&mut state, &job, false, 3.0, scanned);
+            (state, result)
+        });
+        thread::sleep(Duration::from_millis(500)); // stopped, TERM ignored, waiting
+        leader.die();
+        let started = std::time::Instant::now();
+        let (state, result) = killing.join().unwrap();
+        assert_eq!(result.unwrap(), Killed::Exited);
+        assert!(started.elapsed() < Duration::from_secs(2), "not the grace");
+        assert!(state.records().is_empty());
+        assert!(
+            member.0.id() > 0 && member.settles(false),
+            "the member runs on"
+        );
+        assert!(!member.stopped());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// SIGKILL goes to a member only if it is still the process that was seen.
+    #[test]
+    fn sigkill_skips_a_member_whose_start_time_changed() {
+        let mut sleeper = Sleeper::spawn();
+        let p = jobs::probe(sleeper.pid());
+        let jobs::Probe::Found(seen) = p else {
+            panic!("{p:?}")
+        };
+        let reissued = Seen {
+            start_us: seen.start_us + 1,
+            ..seen
+        };
+        assert!(!kill_member(&reissued), "a pid with another start time");
+        assert!(sleeper.0.try_wait().unwrap().is_none(), "is left alone");
+        assert!(kill_member(&seen));
+        assert!(sleeper.0.wait().is_ok());
+        sleeper.die();
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Findings: every SIGSTOP is recorded first.
+
+    /// A kill starts with a SIGSTOP of a job membrake never froze. That stop is on disk
+    /// before it is sent: here the write is held on a named pipe, and nothing is stopped
+    /// until it is let through.
+    #[test]
+    fn a_kill_records_its_stop_before_it_sends_it() {
+        let dir = scratch("kill-record");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let record_starts = job_pgid_text(&sleeper);
+        let mut state = State::open(&dir).unwrap();
+        let tmp = dir.join(format!("{STATE_FILE}.tmp"));
+        mkfifo(&tmp);
+
+        let killing = thread::spawn(move || {
+            let result = kill_job(&mut state, &job, true, 1.0, signals::wall());
+            (state, result)
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(!killing.is_finished(), "the kill waits for its record");
+        assert!(!sleeper.stopped(), "so nothing has been stopped yet");
+        let mut written = String::new();
+        fs::File::open(&tmp)
+            .unwrap()
+            .read_to_string(&mut written)
+            .unwrap();
+        assert!(written.starts_with(&record_starts), "{written}");
+
+        let (state, result) = killing.join().unwrap();
+        assert_eq!(result.unwrap(), Killed::Exited);
+        assert!(state.records().is_empty(), "gone, so no promise remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// If the record cannot be written the group is not stopped, but it is still killed:
+    /// no crash can leave it frozen, and a full disk must not stop the brake.
+    #[test]
+    fn a_kill_still_kills_when_its_record_cannot_be_written() {
+        let dir = scratch("kill-no-record");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = kill_job(&mut state, &job, true, 1.0, signals::wall());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap(), Killed::Exited);
+        assert!(state.records().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Findings: the rules are asked again before anything is killed.
+
+    /// A job that is no longer eligible is not killed, and one membrake froze is continued.
+    #[test]
+    fn a_kill_is_refused_for_a_group_the_rules_now_exclude_and_it_is_continued() {
+        let dir = scratch("spared");
+        let mut sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        freeze(&mut state, &job, signals::wall()).unwrap();
+        assert!(sleeper.settles(true));
+
+        let result = kill(&mut state, &job, 0.0, true, 1.0, &mut || {
+            Some("it is now excluded".into())
+        });
+        assert_eq!(result.unwrap(), Killed::Spared("it is now excluded".into()));
+        assert!(sleeper.settles(false), "continued");
+        assert!(sleeper.0.try_wait().unwrap().is_none(), "and alive");
+        assert_eq!(records_on_disk(&dir), 0);
+        sleeper.die();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The rules are asked once more before SIGKILL, after the grace period: a group that
+    /// has become ineligible by then is continued, not killed.
+    #[test]
+    fn the_rules_are_asked_again_before_sigkill() {
+        let dir = scratch("spared-late");
+        let sleeper = Sleeper::spawn_in(0, true);
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        let mut asked = 0;
+        let started = std::time::Instant::now();
+        let result = kill(&mut state, &job, signals::wall(), false, 1.0, &mut || {
+            asked += 1;
+            (asked > 1).then(|| "it changed".to_string())
+        });
+        assert_eq!(result.unwrap(), Killed::Spared("it changed".into()));
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "after the grace"
+        );
+        assert_eq!(asked, 2);
+        assert!(sleeper.settles(false) && sleeper.job(1).pgid == job.pgid);
+        assert!(state.records().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Kill sequences
 
     /// A non-emergency kill stops the group, sends SIGTERM and returns once the group is gone,
     /// well before the grace period runs out. (A plain `sleep` dies of SIGTERM even while
     /// stopped, so this does not show that SIGCONT is needed for a process with a handler.)
     #[test]
     fn kill_ends_a_stopped_group() {
+        let dir = scratch("kill-term");
         let sleeper = Sleeper::spawn();
         let job = sleeper.job(1);
-        assert!(!live_members(job.pgid).is_empty());
+        let mut state = State::open(&dir).unwrap();
         let started = std::time::Instant::now();
-        assert!(kill(&job, false, 5.0, None).unwrap(), "group exited");
-        assert!(live_members(job.pgid).is_empty());
+        assert_eq!(
+            kill_job(&mut state, &job, false, 5.0, signals::wall()).unwrap(),
+            Killed::Exited
+        );
+        let mut insp = Inspector::new();
+        assert!(matches!(insp.look(job.pgid), Look::Absent));
         // It ended on SIGTERM, not by waiting out the 5 s grace period for SIGKILL.
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "{:?}",
             started.elapsed()
         );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A job that ignores SIGTERM is waited for through the grace period and then SIGKILLed.
     #[test]
     fn kill_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let dir = scratch("kill-escalate");
         let sleeper = Sleeper::spawn_in(0, true);
         let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
         let started = std::time::Instant::now();
-        assert!(kill(&job, false, 1.0, None).unwrap(), "group exited");
+        assert_eq!(
+            kill_job(&mut state, &job, false, 1.0, signals::wall()).unwrap(),
+            Killed::Exited
+        );
         let took = started.elapsed();
-        assert!(live_members(job.pgid).is_empty());
+        let mut insp = Inspector::new();
+        assert!(matches!(insp.look(job.pgid), Look::Absent));
         assert!(
             took >= Duration::from_secs(1) && took < Duration::from_secs(8),
             "SIGTERM was ignored, so the 1 s grace period must pass first: {took:?}"
         );
+        let _ = fs::remove_dir_all(&dir);
     }
 
+    /// An emergency has no seconds to spare: no SIGTERM, no grace. The job here ignores
+    /// SIGTERM, and still dies at once.
     #[test]
     fn immediate_kill_skips_the_grace_period() {
+        let dir = scratch("kill-now");
         let sleeper = Sleeper::spawn_in(0, true);
         let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
         let started = std::time::Instant::now();
-        assert!(kill(&job, true, 5.0, None).unwrap());
+        assert_eq!(
+            kill_job(&mut state, &job, true, 5.0, signals::wall()).unwrap(),
+            Killed::Exited
+        );
         assert!(started.elapsed() < Duration::from_secs(3));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Two daemons must not run at once; the lock frees when the first goes away.

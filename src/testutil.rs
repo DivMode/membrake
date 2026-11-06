@@ -1,8 +1,9 @@
 //! Helpers shared by the unit tests: real `sleep` process groups the tests spawn themselves.
 
 use crate::jobs::{self, Job};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
@@ -83,6 +84,14 @@ impl Drop for Sleeper {
     }
 }
 
+/// A named pipe at `path`. A writer that opens it waits for a reader, which lets a test hold a
+/// write (a state file, a log) at a known point and release it when it chooses.
+pub fn mkfifo(path: &Path) {
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+}
+
 /// A fresh, empty-and-absent scratch path unique to this process and call.
 pub fn scratch(name: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
@@ -93,4 +102,34 @@ pub fn scratch(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// Failures to inject into the operating-system calls that cannot be made to fail on demand
+/// (a signal refused, a process group the kernel will not list). Per thread, so tests do not
+/// disturb each other, and compiled in only for tests.
+pub mod fault {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        /// How many of the next group listings fail.
+        pub static LIST: Cell<u32> = const { Cell::new(0) };
+        /// How many of the next group signals fail with EPERM.
+        pub static SIGNAL: Cell<u32> = const { Cell::new(0) };
+        /// How many of the next executable-path reads fail.
+        pub static READ: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub fn arm(counter: &'static LocalKey<Cell<u32>>, times: u32) {
+        counter.with(|c| c.set(times));
+    }
+
+    /// True while the counter has failures left, using one up.
+    pub fn take(counter: &'static LocalKey<Cell<u32>>) -> bool {
+        counter.with(|c| {
+            let left = c.get();
+            c.set(left.saturating_sub(1));
+            left > 0
+        })
+    }
 }

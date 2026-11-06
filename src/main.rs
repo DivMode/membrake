@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use membrake::engine::Policy;
 use membrake::jobs::{self, Rules};
 use membrake::recorder;
-use membrake::runner::{self, RunOptions};
+use membrake::runner::{self, Location, RunOptions};
 use membrake::source::{Live, Scripted};
 use std::fs::File;
 use std::io::{BufReader, Write};
@@ -74,7 +74,8 @@ struct PolicyArgs {
 #[derive(Args)]
 struct RuleArgs {
     /// This user's jobs are never frozen and are killed only when no other eligible job is
-    /// left, e.g. a CI runner account (repeatable)
+    /// left, e.g. a CI runner account. Ranking only: a uid below 500 also needs
+    /// --include-user (repeatable)
     #[arg(long, value_name = "NAME")]
     protect_user: Vec<String>,
     /// Treat this user's jobs as eligible even though its uid is below 500 (repeatable)
@@ -192,27 +193,48 @@ fn rules(args: &RuleArgs) -> Result<Rules, String> {
 fn execute(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Run(a) => {
-            if !a.term_seconds.is_finite() || a.term_seconds < 0.0 {
-                return Err("--term-seconds must be a non-negative number".into());
-            }
-            let mut rules = rules(&a.rules)?;
-            if let Some(only) = &a.simulate_only {
-                rules = rules.only_matching(only)?;
-            }
-            let options = RunOptions {
-                policy: policy(&a.policy)?,
-                rules,
-                term_seconds: a.term_seconds,
-                state_dir: a.state_dir,
-                log_dir: a.log_dir.unwrap_or_else(|| {
-                    PathBuf::from(if a.dry_run { DRY_RUN_LOG_DIR } else { LOG_DIR })
+            let RunArgs {
+                policy: policy_args,
+                rules: rule_args,
+                dry_run,
+                term_seconds,
+                state_dir,
+                log_dir,
+                on_event,
+                simulate,
+                simulate_only,
+            } = a;
+            // Only where the files are is needed to recover the jobs a previous run froze, so
+            // that comes first. The rest is checked after the recovery: a flag that no longer
+            // parses, or an account that has been deleted since the daemon was configured,
+            // must not leave work frozen.
+            let location = Location {
+                state_dir,
+                log_dir: log_dir.unwrap_or_else(|| {
+                    PathBuf::from(if dry_run { DRY_RUN_LOG_DIR } else { LOG_DIR })
                 }),
-                on_event: a.on_event,
-                dry_run: a.dry_run,
+                dry_run,
             };
-            match a.simulate {
-                Some(script) => runner::run(options, Scripted::open(&script)?),
-                None => runner::run(options, Live::new()),
+            let configure = move || -> Result<RunOptions, String> {
+                if !term_seconds.is_finite() || term_seconds < 0.0 {
+                    return Err("--term-seconds must be a non-negative number".into());
+                }
+                let mut rules = rules(&rule_args)?;
+                if let Some(only) = &simulate_only {
+                    rules = rules.only_matching(only)?;
+                }
+                Ok(RunOptions {
+                    policy: policy(&policy_args)?,
+                    rules,
+                    term_seconds,
+                    on_event,
+                })
+            };
+            match simulate {
+                Some(script) => runner::run(location, move || {
+                    Ok((configure()?, Scripted::open(&script)?))
+                }),
+                None => runner::run(location, move || Ok((configure()?, Live::new()))),
             }
         }
         Command::Status(a) => runner::status(&policy(&a.policy)?, &rules(&a.rules)?, &a.state_dir),
