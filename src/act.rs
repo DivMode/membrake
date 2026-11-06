@@ -2696,8 +2696,15 @@ mod tests {
         assert_eq!(records_on_disk(&dir), 1, "so the record is kept");
 
         state.remove(pgid).unwrap();
-        assert!(left.settles(false), "the member that left the group runs again");
-        assert_eq!(records_on_disk(&dir), 0, "and only then is the record dropped");
+        assert!(
+            left.settles(false),
+            "the member that left the group runs again"
+        );
+        assert_eq!(
+            records_on_disk(&dir),
+            0,
+            "and only then is the record dropped"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
