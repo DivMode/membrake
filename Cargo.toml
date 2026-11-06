@@ -1,0 +1,18 @@
+[package]
+name = "membrake"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A memory brake for macOS: freezes the newest heavy job before the compressor runs out, resumes it when memory recovers, kills only at the cliff"
+license = "MIT"
+keywords = ["macos", "memory", "oom", "daemon", "launchd"]
+categories = ["command-line-utilities", "os::macos-apis"]
+
+[dependencies]
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

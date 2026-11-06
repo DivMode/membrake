@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example LaunchDaemon. Install as root-owned /Library/LaunchDaemons/dev.membrake.plist
+  (mode 644), point the first ProgramArguments entry at the installed binary, then:
+    launchctl bootstrap system /Library/LaunchDaemons/dev.membrake.plist
+  Add --dry-run first to watch decisions without any signal being sent; a dry run logs to
+  /var/log/membrake/dry-run, apart from the live daemon's /var/log/membrake.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.membrake</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/membrake</string>
+    <string>run</string>
+    <!--
+      Never freeze a CI runner's jobs (they are killed only when nothing else is left).
+      Uncomment and replace the placeholder with the runner account's real user name:
+      membrake refuses to start if the user does not exist, so this line is off by default.
+    <string>--protect-user</string>
+    <string>RUNNER_USER</string>
+    -->
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- membrake resumes every frozen job on SIGTERM; give it time to do so. -->
+  <key>ExitTimeOut</key>
+  <integer>20</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <!-- membrake's own samples.tsv and events.log go to /var/log/membrake/, which it creates.
+       launchd creates a missing log file but not a missing directory, so its stdout and
+       stderr go to a file directly in /var/log. -->
+  <key>StandardOutPath</key>
+  <string>/var/log/membrake.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/membrake.log</string>
+</dict>
+</plist>
