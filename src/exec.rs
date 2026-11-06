@@ -145,9 +145,12 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
         label: label.to_string(),
         signature: signature.to_string(),
     };
+    // The timeout is set before the request goes out: once the daemon has read the request it
+    // may hang up at any moment, and macOS refuses setsockopt on a socket whose peer has closed
+    // (EINVAL), which would hide the hang-up behind "Invalid argument".
     stream
-        .write_all(request.line().as_bytes())
-        .and_then(|()| stream.set_read_timeout(Some(LOOK_UP)))
+        .set_read_timeout(Some(LOOK_UP))
+        .and_then(|()| stream.write_all(request.line().as_bytes()))
         .map_err(|e| Stopped::Unavailable(e.to_string()))?;
 
     let asked = Instant::now();
