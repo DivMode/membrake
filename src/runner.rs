@@ -10,11 +10,11 @@ use crate::engine::{Action, Engine, Policy};
 use crate::jobs::{self, Job, Rules};
 use crate::recorder::{Recorder, describe};
 use crate::signals::{self, KERNEL_LIMIT, Signals};
+use crate::source::{SignalSource, Unreadable};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
-const INTERVAL: f64 = 1.0;
 /// Say a persistent problem at most this often (seconds).
 const WARN_EVERY: f64 = 60.0;
 /// If the signals cannot be read for this long (seconds) while jobs are frozen, resume them
@@ -80,7 +80,8 @@ struct Runner {
     outside: Vec<(i32, u32)>,
 }
 
-pub fn run(opts: RunOptions) -> Result<(), String> {
+/// Runs the loop on the readings of `source` (the kernel, except in tests).
+pub fn run(opts: RunOptions, source: impl SignalSource) -> Result<(), String> {
     // First, before any file is opened: the fallback re-executes the process.
     let protection = act::protect_self();
     act::install_signal_handlers();
@@ -90,7 +91,7 @@ pub fn run(opts: RunOptions) -> Result<(), String> {
         Some(act::lock_instance(&opts.state_dir)?)
     };
     let state_dir = (!opts.dry_run).then(|| opts.state_dir.clone());
-    guarded(state_dir.as_deref(), || run_loop(opts, &protection))
+    guarded(state_dir.as_deref(), || run_loop(opts, &protection, source))
 }
 
 /// The kind and text of an event for each recovered record.
@@ -117,7 +118,11 @@ fn thaw_lines(report: Vec<(act::Record, Recovered)>, what: &str) -> Vec<(&'stati
         .collect()
 }
 
-fn run_loop(opts: RunOptions, protection: &str) -> Result<(), String> {
+fn run_loop(
+    opts: RunOptions,
+    protection: &str,
+    mut source: impl SignalSource,
+) -> Result<(), String> {
     // State first, and thaw whatever a previous run left frozen, before anything that could
     // fail for an unrelated reason such as a full log disk.
     let mut startup: Vec<(&'static str, String)> = Vec::new();
@@ -175,26 +180,25 @@ fn run_loop(opts: RunOptions, protection: &str) -> Result<(), String> {
     r.rec.event(wall, "start", &start);
     r.rec.sync_events();
 
-    let mut next_tick = signals::uptime();
     let mut unreadable_since: Option<f64> = None;
     let mut failsafe_done = false;
     let mut last_read_warning = f64::NEG_INFINITY;
+    let mut broken_source = None;
     while !act::shutdown_requested() {
-        match signals::read() {
-            Ok(s) => {
+        match source.next_reading() {
+            Ok(Some(Ok(s))) => {
                 unreadable_since = None;
                 failsafe_done = false;
                 r.tick(&s);
             }
-            Err(e) => {
-                let now = signals::uptime();
+            Ok(Some(Err(Unreadable { time: now, error }))) => {
                 let since = *unreadable_since.get_or_insert(now);
                 if now - last_read_warning >= WARN_EVERY {
                     last_read_warning = now;
                     r.rec.event(
                         signals::wall(),
                         "warn",
-                        &format!("cannot read signals: {e}"),
+                        &format!("cannot read signals: {error}"),
                     );
                     r.rec.sync_events();
                 }
@@ -203,14 +207,17 @@ fn run_loop(opts: RunOptions, protection: &str) -> Result<(), String> {
                     r.thaw("resumed because the signals were unreadable for 60 s");
                 }
             }
+            Ok(None) => break,
+            Err(e) => {
+                broken_source = Some(e);
+                break;
+            }
         }
-        next_tick = (next_tick + INTERVAL).max(signals::uptime());
-        act::sleep_until(next_tick);
     }
     r.thaw("resumed on shutdown");
     r.rec.event(signals::wall(), "stop", "membrake stopped");
     r.rec.sync_events();
-    Ok(())
+    broken_source.map_or(Ok(()), Err)
 }
 
 impl Runner {

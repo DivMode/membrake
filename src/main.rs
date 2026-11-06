@@ -3,6 +3,7 @@ use membrake::engine::Policy;
 use membrake::jobs::{self, Rules};
 use membrake::recorder;
 use membrake::runner::{self, RunOptions};
+use membrake::source::{Live, Scripted};
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
@@ -115,6 +116,24 @@ struct RunArgs {
     /// MEMBRAKE_PGID, MEMBRAKE_BYTES, MEMBRAKE_COMMAND and MEMBRAKE_UID set
     #[arg(long, value_name = "CMD")]
     on_event: Option<String>,
+    /// TEST ONLY, hidden from `--help`. Take the readings from this file (the samples.tsv
+    /// format, one row per tick; see `source::Scripted`) instead of the kernel. The process
+    /// table is still scanned and real groups are still signalled, so it also needs
+    /// `--simulate-only`, explicit `--state-dir` and `--log-dir` (never the live daemon's
+    /// defaults), and refuses to run as root.
+    #[arg(
+        long,
+        value_name = "FILE",
+        hide = true,
+        conflicts_with = "dry_run",
+        requires_all = ["simulate_only", "state_dir", "log_dir"]
+    )]
+    simulate: Option<PathBuf>,
+    /// TEST ONLY, hidden. With `--simulate`: only groups whose leader's command line matches
+    /// this regex are eligible, so simulated readings reach the processes a test spawned
+    /// and no others.
+    #[arg(long, value_name = "REGEX", hide = true, requires = "simulate")]
+    simulate_only: Option<String>,
 }
 
 #[derive(Args)]
@@ -176,9 +195,13 @@ fn execute(cli: Cli) -> Result<(), String> {
             if !a.term_seconds.is_finite() || a.term_seconds < 0.0 {
                 return Err("--term-seconds must be a non-negative number".into());
             }
-            runner::run(RunOptions {
+            let mut rules = rules(&a.rules)?;
+            if let Some(only) = &a.simulate_only {
+                rules = rules.only_matching(only)?;
+            }
+            let options = RunOptions {
                 policy: policy(&a.policy)?,
-                rules: rules(&a.rules)?,
+                rules,
                 term_seconds: a.term_seconds,
                 state_dir: a.state_dir,
                 log_dir: a.log_dir.unwrap_or_else(|| {
@@ -186,7 +209,11 @@ fn execute(cli: Cli) -> Result<(), String> {
                 }),
                 on_event: a.on_event,
                 dry_run: a.dry_run,
-            })
+            };
+            match a.simulate {
+                Some(script) => runner::run(options, Scripted::open(&script)?),
+                None => runner::run(options, Live::new()),
+            }
         }
         Command::Status(a) => runner::status(&policy(&a.policy)?, &rules(&a.rules)?, &a.state_dir),
         Command::Replay(a) => {
