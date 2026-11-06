@@ -379,6 +379,30 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
     })
 }
 
+/// First field of the line that stands for a tick whose signals could not be read, in a
+/// script for `run --simulate`: `unreadable<TAB>UPTIME`. Never written by the recorder.
+pub const UNREADABLE: &str = "unreadable";
+
+/// One line of a script for `run --simulate` (test only).
+pub enum ScriptedRow {
+    Signals(Signals),
+    Unreadable { time: f64 },
+}
+
+/// A samples.tsv row, or the `unreadable` marker line. The jobs column of a row is ignored.
+pub fn parse_scripted(line: &str) -> Result<ScriptedRow, String> {
+    let Some(rest) = line
+        .strip_prefix(UNREADABLE)
+        .and_then(|r| r.strip_prefix('\t'))
+    else {
+        return parse_row(line).map(|row| ScriptedRow::Signals(row.signals));
+    };
+    match rest.parse::<f64>() {
+        Ok(time) if time.is_finite() => Ok(ScriptedRow::Unreadable { time }),
+        _ => Err(format!("{UNREADABLE} needs an uptime, found {rest:?}")),
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     pub samples: u64,

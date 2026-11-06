@@ -125,7 +125,8 @@ pub enum Reason {
     SystemUser,
     /// Members run as different users: a set-uid helper (`sudo`, `login`) joined the group.
     MixedUsers,
-    /// Matched `--never` or the built-in agent and terminal list.
+    /// Matched `--never` or the built-in agent and terminal list, or (test only) is outside
+    /// the `--simulate-only` filter.
     Never,
 }
 
@@ -148,6 +149,9 @@ pub struct Rules {
     protect_uids: Vec<u32>,
     include_uids: Vec<u32>,
     own_pgid: i32,
+    /// Test only (`run --simulate-only`): when set, only groups whose leader's command line
+    /// matches are eligible at all.
+    only: Option<Regex>,
 }
 
 impl Rules {
@@ -172,7 +176,19 @@ impl Rules {
             protect_uids,
             include_uids,
             own_pgid,
+            only: None,
         })
+    }
+
+    /// Test only (`run --simulate-only`): makes every group whose leader's command line does
+    /// not match `pattern` ineligible, so a run driven by scripted readings can reach the
+    /// processes a test spawned and no others. The caller's own uid counts as a user's even
+    /// below 500, because a Nix build sandbox runs its tests as a build user with such a uid.
+    pub fn only_matching(mut self, pattern: &str) -> Result<Rules, String> {
+        self.only = Some(Regex::new(pattern).map_err(|e| format!("--simulate-only {e}"))?);
+        // SAFETY: getuid has no preconditions.
+        self.include_uids.push(unsafe { libc::getuid() });
+        Ok(self)
     }
 
     /// The checks that need only the pgid and the leader's uid, so a scan can skip a group
@@ -220,6 +236,13 @@ impl Rules {
         }
         if members.iter().any(|m| in_bundle_or_system(&m.exe)) {
             return Verdict::Ineligible(Reason::Bundle);
+        }
+        if self
+            .only
+            .as_ref()
+            .is_some_and(|re| !re.is_match(leader_command))
+        {
+            return Verdict::Ineligible(Reason::Never);
         }
         let hit = |list: &[Regex], text: &str| list.iter().any(|r| r.is_match(text));
         if hit(&self.never, leader_command)
