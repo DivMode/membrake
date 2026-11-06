@@ -483,6 +483,14 @@ impl State {
         {
             return Ok(());
         }
+        self.discard(pgid)
+    }
+
+    /// Drops the record for `pgid`, if any, without a signal. Only for a record this call has
+    /// just written and no SIGSTOP went out under: no process it lists was stopped by membrake,
+    /// so none may be continued (one may be stopped by someone else, as a job suspended in a
+    /// shell is, or have become a process membrake must not touch).
+    pub fn discard(&mut self, pgid: i32) -> io::Result<()> {
         self.pending.retain(|&p| p != pgid);
         let before = self.records.len();
         self.records.retain(|r| r.pgid != pgid);
@@ -825,7 +833,7 @@ pub fn freeze(
         Ok(()) => Ok(()),
         Err(ActError::Ineligible(why)) => {
             if sent.is_empty() {
-                let _ = state.remove(job.pgid);
+                let _ = state.discard(job.pgid);
             } else {
                 // If this cannot continue the group the record stays, and it is tried again.
                 let _ = resume(state, job.pgid);
@@ -834,9 +842,14 @@ pub fn freeze(
         }
         // Stopped, and on record, in part: the rest is for `finish_pending`.
         Err(ActError::Unknown(_) | ActError::Io(_)) if !sent.is_empty() => Ok(()),
-        // Nothing was stopped, so there is nothing to promise.
+        // Nothing was stopped, so there is nothing to promise; or the group is gone, and what
+        // was stopped of it and is still ours is continued.
         Err(e) => {
-            let _ = state.remove(job.pgid);
+            if sent.is_empty() {
+                let _ = state.discard(job.pgid);
+            } else {
+                let _ = state.remove(job.pgid);
+            }
             Err(e)
         }
     }
@@ -1132,7 +1145,7 @@ pub fn kill(
                 if !adds_record || !sent.is_empty() {
                     let _ = resume(state, pgid);
                 } else {
-                    let _ = state.remove(pgid);
+                    let _ = state.discard(pgid);
                 }
                 return Ok(Killed::Spared(why));
             }
@@ -1141,22 +1154,27 @@ pub fn kill(
             // it is not ours to adopt as witnesses (a group that took over the pgid would
             // then be signalled), and nothing more is sent to the group on its strength.
             // Gone: whatever of the record is stopped and still ours is continued, and the
-            // job is dropped.
+            // job is dropped. A record this kill wrote with nothing stopped under it goes
+            // without a signal, here and below.
             Err(ActError::Gone) => {
-                let _ = resume(state, pgid);
+                if adds_record && sent.is_empty() {
+                    let _ = state.discard(pgid);
+                } else {
+                    let _ = resume(state, pgid);
+                }
                 return Err(ActError::Gone);
             }
             // Unknown: the record stays, whatever was stopped with it, and every later signal
             // (the next resume, the next kill) starts with a look of its own.
             Err(e @ ActError::Unknown(_)) => {
                 if adds_record && sent.is_empty() {
-                    let _ = state.remove(pgid);
+                    let _ = state.discard(pgid);
                 }
                 return Err(e);
             }
             Err(e) if sent.is_empty() => {
                 if adds_record {
-                    let _ = state.remove(pgid);
+                    let _ = state.discard(pgid);
                 }
                 return Err(e);
             }
@@ -2705,6 +2723,42 @@ mod tests {
             0,
             "and only then is the record dropped"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A freeze or a kill that gives up before its first SIGSTOP stopped nothing, so the record
+    /// it just wrote goes without a signal: a process someone else stopped (a job suspended in
+    /// a shell) stays stopped, and one that became untouchable is not touched.
+    #[test]
+    fn giving_up_before_the_first_stop_signals_nothing() {
+        let dir = scratch("give-up");
+        let leader = Sleeper::spawn();
+        let job = leader.job(2);
+        let sleeper = Sleeper::spawn_in(job.pgid, false);
+        // SAFETY: stopping the child this test spawned, as a shell's Ctrl-Z would.
+        unsafe { libc::kill(sleeper.pid(), libc::SIGSTOP) };
+        assert!(sleeper.settles(true));
+        let mut state = State::open(&dir).unwrap();
+
+        let froze = freeze(&mut state, &job, signals::wall(), &mut || {
+            Some("it changed".into())
+        });
+        assert!(matches!(froze, Err(ActError::Ineligible(_))), "{froze:?}");
+        assert!(
+            sleeper.stopped(),
+            "the freeze continued what it never stopped"
+        );
+        assert_eq!(records_on_disk(&dir), 0);
+
+        let killed = kill(&mut state, &job, signals::wall(), true, 1.0, &mut || {
+            Some("it changed".into())
+        });
+        assert_eq!(killed.unwrap(), Killed::Spared("it changed".into()));
+        assert!(
+            sleeper.stopped(),
+            "the kill continued what it never stopped"
+        );
+        assert_eq!(records_on_disk(&dir), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
