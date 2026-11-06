@@ -1,0 +1,36 @@
+name: release
+
+# Publishes to crates.io when a version tag is pushed, through crates.io
+# trusted publishing: no registry token is stored anywhere. crates.io accepts
+# only this workflow file, in this repository, running in the `release`
+# environment, which only `v*` tags may use.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: The tag matches the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      - name: Test
+        run: cargo test
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
