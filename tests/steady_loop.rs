@@ -226,6 +226,12 @@ fn steady_loop_with_the_queue_and_no_clients_does_not_allocate() {
     for _ in 0..20 {
         tick();
     }
+    // The status file is written by a background writer, so give it time to land
+    // rather than racing it (a slow CI machine lost that race).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !state_dir.join("queue.tsv").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         state_dir.join("queue.tsv").exists(),
         "the queue's part of the tick ran"
