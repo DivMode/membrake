@@ -8,7 +8,12 @@
 //! leave an arm primed for minutes after memory recovers.
 //!
 //! Two tiers. The freeze tier is cheap and reversible: SIGSTOP the newest eligible job.
-//! The kill tier is for the cliff: kill the biggest. Every arm except critical pressure
+//! The kill tier is for the cliff: kill the biggest. Of the kill tier's arms, the two
+//! emergency ones (compressor >= 92%, swap headroom under 2 GB) kill at once, with no SIGTERM
+//! grace: the Mac has seconds left. The others mean the cliff is near, not here: they freeze
+//! every running eligible job at once, whatever settle period is running, and the kill that
+//! follows waits for it. A job frozen past the limit while memory stays tight is killed
+//! whatever else the sample did. Every arm except critical pressure
 //! counts only while memory is tight: the kernel frees empty compressor segments lazily, so
 //! occupancy can sit high for hours after a crunch with RAM free again, and a nearly full
 //! disk says nothing about a machine that is not swapping. Resume ignores the compressor for
@@ -99,7 +104,8 @@ pub enum Action {
     Resume {
         job: Job,
     },
-    /// `immediate` means an emergency arm fired: no SIGTERM grace period.
+    /// `immediate` means an emergency arm fired: the Mac has seconds left, so SIGSTOP is
+    /// followed by SIGKILL with no SIGTERM and no grace period.
     Kill {
         job: Job,
         immediate: bool,
@@ -292,6 +298,29 @@ fn same(a: &Job, b: &Job) -> bool {
     a.pgid == b.pgid && a.start_us == b.start_us
 }
 
+/// The job list of one step: the process table is scanned the first time it is asked for, and
+/// never if nothing needs it.
+struct Candidates<F> {
+    scan: Option<F>,
+    list: Vec<Job>,
+}
+
+impl<F: FnOnce() -> Vec<Job>> Candidates<F> {
+    fn new(scan: F) -> Candidates<F> {
+        Candidates {
+            scan: Some(scan),
+            list: Vec::new(),
+        }
+    }
+
+    fn get(&mut self) -> &[Job] {
+        if let Some(scan) = self.scan.take() {
+            self.list = scan();
+        }
+        &self.list
+    }
+}
+
 impl Engine {
     pub fn new(policy: Policy) -> Engine {
         Engine {
@@ -321,9 +350,10 @@ impl Engine {
         self.frozen.retain(|f| f.job.pgid != pgid);
     }
 
-    /// Everything was resumed outside the engine's own plan (the fail-safe).
-    pub fn forget_all(&mut self) {
-        self.frozen.clear();
+    /// The fail-safe resumed the frozen jobs: keep only those `keep` says are still frozen
+    /// (their resume did not go through), so they stay tracked and are tried again.
+    pub fn retain_frozen(&mut self, mut keep: impl FnMut(i32) -> bool) {
+        self.frozen.retain(|f| keep(f.job.pgid));
     }
 
     /// Call after anything that blocked the loop on purpose (a kill waiting for exit), so
@@ -370,52 +400,74 @@ impl Engine {
         self.calm_streak = if tight { 0 } else { self.calm_streak + 1 };
 
         let quiet = now < self.quiet_until;
-        let kill_arms = self.fired(Tier::Kill, quiet);
+        // Kill-tier arms at their threshold, settle period or not: the emergency ones kill at
+        // once and the others freeze at once; only the kill that follows a freeze waits.
+        let kill_arms = self.fired(Tier::Kill, false);
         let freeze_arms = self.fired(Tier::Freeze, quiet);
-        let expired = self
-            .frozen
-            .iter()
-            .find(|f| now - f.since > self.policy.max_freeze)
+        // Frozen past the limit while memory is still tight. Checked on its own, not behind
+        // the kill arms: while they keep firing it would never be reached.
+        let expired = (!quiet && tight)
+            .then(|| {
+                self.frozen
+                    .iter()
+                    .find(|f| now - f.since > self.policy.max_freeze)
+            })
+            .flatten()
             .map(|f| f.job.pgid);
+        let mut candidates = Candidates::new(jobs);
 
-        if !kill_arms.is_empty() {
+        if kill_arms.iter().any(|a| a.immediate()) {
             let reason = self.reasons(&kill_arms);
-            if kill_arms.iter().any(|a| a.immediate()) {
-                self.kill(now, jobs, None, true, reason, &mut actions);
+            self.kill(now, &mut candidates, None, true, reason, &mut actions);
+        } else {
+            let urgent = !kill_arms.is_empty();
+            let reason = if urgent {
+                self.reasons(&kill_arms)
             } else {
-                self.brake_all(now, jobs, reason, &mut actions);
+                String::new()
+            };
+            let froze = urgent && self.freeze_running(now, &mut candidates, &reason, &mut actions);
+            if let Some(pgid) = expired {
+                let reason = format!(
+                    "frozen for more than {} minutes while memory is still tight",
+                    (self.policy.max_freeze / 60.0).round()
+                );
+                self.kill(
+                    now,
+                    &mut candidates,
+                    Some(pgid),
+                    false,
+                    reason,
+                    &mut actions,
+                );
+            } else if urgent {
+                // Nothing is left to freeze and the settle period is over: now kill.
+                if !quiet && !froze {
+                    self.kill(now, &mut candidates, None, false, reason, &mut actions);
+                }
+            } else if !freeze_arms.is_empty() {
+                let reason = self.reasons(&freeze_arms);
+                self.freeze(now, &mut candidates, reason, &mut actions);
+            } else if !quiet
+                && self.calm_streak >= self.policy.resume_samples
+                && !self.frozen.is_empty()
+            {
+                // The job frozen first goes first; among jobs frozen together, the oldest
+                // job, so the newest (the likeliest runaway) comes back last.
+                let next = (0..self.frozen.len())
+                    .min_by(|&a, &b| {
+                        let (a, b) = (&self.frozen[a], &self.frozen[b]);
+                        a.since
+                            .total_cmp(&b.since)
+                            .then(a.job.start_us.cmp(&b.job.start_us))
+                    })
+                    .unwrap_or(0);
+                let job = self.frozen.remove(next).job;
+                self.quiet_until = now + self.policy.settle;
+                actions.push(Action::Resume { job });
+            } else if self.strikes.iter().all(|&n| n == 0.0) {
+                self.warned_no_victim = false;
             }
-        } else if !quiet
-            && tight
-            && let Some(pgid) = expired
-        {
-            let reason = format!(
-                "frozen for more than {} minutes while memory is still tight",
-                (self.policy.max_freeze / 60.0).round()
-            );
-            self.kill(now, jobs, Some(pgid), false, reason, &mut actions);
-        } else if !freeze_arms.is_empty() {
-            let reason = self.reasons(&freeze_arms);
-            self.freeze(now, jobs, reason, &mut actions);
-        } else if !quiet
-            && self.calm_streak >= self.policy.resume_samples
-            && !self.frozen.is_empty()
-        {
-            // The job frozen first goes first; among jobs frozen together, the oldest job,
-            // so the newest (the likeliest runaway) comes back last.
-            let next = (0..self.frozen.len())
-                .min_by(|&a, &b| {
-                    let (a, b) = (&self.frozen[a], &self.frozen[b]);
-                    a.since
-                        .total_cmp(&b.since)
-                        .then(a.job.start_us.cmp(&b.job.start_us))
-                })
-                .unwrap_or(0);
-            let job = self.frozen.remove(next).job;
-            self.quiet_until = now + self.policy.settle;
-            actions.push(Action::Resume { job });
-        } else if self.strikes.iter().all(|&n| n == 0.0) {
-            self.warned_no_victim = false;
         }
         Step {
             occupancy,
@@ -425,7 +477,7 @@ impl Engine {
         }
     }
 
-    /// Arms of `tier` at their threshold. While quiet only the immediate arms count.
+    /// Arms of `tier` at their threshold. While `quiet`, only the immediate arms count.
     fn fired(&self, tier: Tier, quiet: bool) -> Vec<Arm> {
         ARMS.iter()
             .zip(&self.strikes)
@@ -444,17 +496,19 @@ impl Engine {
     }
 
     /// The newest running job of at least the minimum size, preferred jobs first.
-    fn freeze(
+    fn freeze<F: FnOnce() -> Vec<Job>>(
         &mut self,
         now: f64,
-        jobs: impl FnOnce() -> Vec<Job>,
+        candidates: &mut Candidates<F>,
         reason: String,
         actions: &mut Vec<Action>,
     ) {
-        let victim = jobs()
-            .into_iter()
+        let victim = candidates
+            .get()
+            .iter()
             .filter(|j| self.freezable(j))
-            .max_by_key(|j| (j.prefer, j.start_us, j.bytes));
+            .max_by_key(|j| (j.prefer, j.start_us, j.bytes))
+            .cloned();
         let Some(job) = victim else {
             self.no_victim("freeze", &reason, actions);
             return;
@@ -479,19 +533,23 @@ impl Engine {
 
     /// A non-immediate kill arm fired: the machine is heading for the cliff, but not there
     /// yet. Freezing is instant and loses no work, so freeze every running eligible job at
-    /// once, and kill only when a kill arm fires again with nothing left to freeze.
-    fn brake_all(
+    /// once, even in the middle of an earlier settle period, and kill only when a kill arm
+    /// fires again with nothing left to freeze. Returns whether there was anything to freeze.
+    fn freeze_running<F: FnOnce() -> Vec<Job>>(
         &mut self,
         now: f64,
-        jobs: impl FnOnce() -> Vec<Job>,
-        reason: String,
+        candidates: &mut Candidates<F>,
+        reason: &str,
         actions: &mut Vec<Action>,
-    ) {
-        let list = jobs();
-        let running: Vec<Job> = list.iter().filter(|j| self.freezable(j)).cloned().collect();
+    ) -> bool {
+        let running: Vec<Job> = candidates
+            .get()
+            .iter()
+            .filter(|j| self.freezable(j))
+            .cloned()
+            .collect();
         if running.is_empty() {
-            self.kill(now, || list, None, false, reason, actions);
-            return;
+            return false;
         }
         let reason = format!("{reason}; freeze all first");
         for job in running {
@@ -508,14 +566,15 @@ impl Engine {
         self.strikes = [0.0; ARMS.len()];
         self.history.clear();
         self.quiet_until = now + self.policy.settle;
+        true
     }
 
     /// The biggest job, protected users' jobs last, preferred jobs first, jobs already
     /// frozen before running ones. `only` restricts the choice to one frozen job.
-    fn kill(
+    fn kill<F: FnOnce() -> Vec<Job>>(
         &mut self,
         now: f64,
-        jobs: impl FnOnce() -> Vec<Job>,
+        candidates: &mut Candidates<F>,
         only: Option<i32>,
         immediate: bool,
         reason: String,
@@ -530,14 +589,15 @@ impl Engine {
                     .map(|f| (f.job.clone(), true)),
             );
         } else {
-            for job in jobs() {
-                let frozen = self.frozen.iter().any(|f| same(&f.job, &job));
+            for job in candidates.get() {
+                let frozen = self.frozen.iter().any(|f| same(&f.job, job));
                 if frozen || job.bytes >= self.policy.min_job_bytes {
-                    pool.push((job, frozen));
+                    pool.push((job.clone(), frozen));
                 }
             }
-            // A frozen job the scan no longer lists (it shrank, or was not scanned) can still
-            // be killed.
+            // A frozen job the scan no longer lists (it shrank, it was not scanned, or it has
+            // since been excluded) stays a candidate here; the runner re-checks the full
+            // rules on the group itself before it signals anything.
             for f in &self.frozen {
                 if !pool.iter().any(|(j, _)| same(j, &f.job)) {
                     pool.push((f.job.clone(), true));
@@ -801,6 +861,72 @@ mod tests {
         frozen.sort_unstable();
         assert_eq!(frozen, vec![10, 11, 12]);
         assert_eq!(kills(&actions), vec![(11.0, 10, false)]);
+    }
+
+    /// The cliff comes into view while an earlier freeze's settle period is still running:
+    /// the jobs still running are frozen at once, not when the period ends. Only the kill
+    /// that follows waits for the settle period.
+    #[test]
+    fn an_urgent_arm_freezes_the_rest_at_once_even_during_an_earlier_settle_period() {
+        let jobs = three_jobs();
+        let mut e = Engine::new(Policy::default());
+        // 65% for two samples freezes the newest job (12) and starts a settle period that
+        // runs to t=11. From t=2 the compressor is at 86%, which is two strikes at t=3.
+        let mut signals = steady(0.0, 2, 0.65, 35);
+        signals.extend(steady(2.0, 12, 0.86, 35));
+        let actions = drive(&mut e, &signals, &jobs);
+
+        let mut f = freezes(&actions);
+        f.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(f, vec![(1.0, 12), (3.0, 10), (3.0, 11)], "{actions:?}");
+        // The kill waits a settle period from that freeze, and takes the biggest.
+        assert_eq!(kills(&actions), vec![(13.0, 10, false)]);
+    }
+
+    /// Urgent arms that keep firing must not hide a job frozen past the limit: new jobs keep
+    /// arriving, one per settle period, and each time the arm freezes the newcomer. The job
+    /// that has been frozen for more than 15 minutes is still killed, once the period allows.
+    #[test]
+    fn a_job_frozen_too_long_is_killed_even_while_urgent_arms_keep_firing() {
+        let mut e = Engine::new(Policy::default());
+        let jobs_at = |t: u32, gone: &[i32]| -> Vec<Job> {
+            let mut jobs = vec![job(10, 100, 8)];
+            if t >= 2 {
+                jobs.extend(
+                    (0..=(t - 2) / 10)
+                        .map(|k| job(100 + i32::try_from(k).unwrap(), 1000 + u64::from(k), 4)),
+                );
+            }
+            jobs.retain(|j| !gone.contains(&j.pgid));
+            jobs
+        };
+        let mut gone: Vec<i32> = Vec::new();
+        let mut killed: Vec<(u32, i32, String)> = Vec::new();
+        for t in 0..1000 {
+            // Two tight samples at 65% freeze the only job, 10; then 86% for good.
+            let s = if t < 2 {
+                sample(f64::from(t), 0.65, 35)
+            } else {
+                sample(f64::from(t), 0.86, 35)
+            };
+            let jobs = jobs_at(t, &gone);
+            for action in e.step(&s, || jobs).actions {
+                if let Action::Kill { job, reason, .. } = action {
+                    gone.push(job.pgid);
+                    killed.push((t, job.pgid, reason));
+                }
+            }
+        }
+        let overdue: Vec<_> = killed
+            .iter()
+            .filter(|(_, _, reason)| reason.contains("frozen for more than 15 minutes"))
+            .collect();
+        // The oldest comes first (the newcomers frozen after it come due one period later
+        // each), as soon as it is overdue and the settle period allows.
+        let (t, pgid, _) = overdue.first().expect("an overdue job is killed");
+        assert_eq!(*pgid, 10, "{killed:?}");
+        // Frozen at t=1: overdue after t=901.
+        assert!((902..=913).contains(t), "killed at t={t}");
     }
 
     /// Jobs frozen together come back oldest first, so the newest, the likeliest runaway,

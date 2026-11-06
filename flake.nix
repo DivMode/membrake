@@ -1,12 +1,15 @@
 {
   description = "membrake: a memory brake for macOS";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
 
   outputs =
     { self, nixpkgs }:
     let
-      systems = [ "aarch64-darwin" ];
+      systems = [
+        "aarch64-darwin"
+        "x86_64-darwin"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
     in

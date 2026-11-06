@@ -6,10 +6,13 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::io;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 
 /// Groups led by a user below this uid (root and the system accounts) are never touched,
-/// unless the user is named by `--protect-user` or `--include-user`.
+/// unless the user is named by `--include-user`. (`--protect-user` only changes the ranking
+/// of jobs that are already eligible; it does not lift this floor.)
 pub const FIRST_USER_UID: u32 = 500;
 
 /// Always protected, whatever `--never` says: the agent CLIs themselves, terminal
@@ -19,6 +22,9 @@ pub const FIRST_USER_UID: u32 = 500;
 /// - Claude Code by install directory, because its process name is its version string, and
 ///   by package name when it runs under node;
 /// - a `codex` binary, including one run via node (`node /path/to/codex ...`).
+///
+/// Matched against every member's complete command line, not only the leader's, so an agent
+/// hosted by an interpreter (`node /path/to/codex ...`) protects the shell-led group it runs in.
 pub const ALWAYS_NEVER: &str = r"^(claude|codex|tmux|herdr|zellij|screen|ghostty|alacritty|kitty|wezterm|wezterm-gui|\.(herdr|tmux|zellij)-wrapped)$|/\.(herdr|tmux|zellij)-wrapped$|/\.local/share/claude/|@anthropic-ai/claude-code|/codex( |$)";
 
 const COMMAND_CHARS: usize = 200;
@@ -44,7 +50,8 @@ pub struct Job {
     pub command: String,
 }
 
-/// Replaces control characters so a command fits on one line of a log or TSV.
+/// Replaces control characters so a command fits on one line of a log or TSV. Display only:
+/// never shorten text that is being matched against the rules.
 pub fn one_line(text: &str, max_chars: usize) -> String {
     text.chars()
         .take(max_chars)
@@ -110,6 +117,9 @@ pub struct Member {
     pub exe: String,
     /// The member's effective uid.
     pub uid: u32,
+    /// The member's complete arguments joined by spaces (`KERN_PROCARGS2`), untruncated: the
+    /// only place an interpreter-hosted agent (`node /path/to/codex`) shows.
+    pub command: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +138,20 @@ pub enum Reason {
     /// Matched `--never` or the built-in agent and terminal list, or (test only) is outside
     /// the `--simulate-only` filter.
     Never,
+}
+
+impl Reason {
+    /// For log lines.
+    pub fn text(self) -> &'static str {
+        match self {
+            Reason::System => "it is a system process group",
+            Reason::OwnGroup => "it is membrake's own group",
+            Reason::Bundle => "a member runs from an application or system bundle",
+            Reason::SystemUser => "it belongs to root or a system account",
+            Reason::MixedUsers => "its members run as different users",
+            Reason::Never => "it matches the agent, terminal or --never protections",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,21 +224,24 @@ impl Rules {
         if pgid == self.own_pgid {
             return Some(Reason::OwnGroup);
         }
-        if leader_uid < FIRST_USER_UID && !self.named(leader_uid) {
+        if self.below_floor(leader_uid) {
             return Some(Reason::SystemUser);
         }
         None
     }
 
-    /// A user named by `--protect-user` or `--include-user` may have a uid below 500.
-    fn named(&self, uid: u32) -> bool {
-        self.protect_uids.contains(&uid) || self.include_uids.contains(&uid)
+    /// A uid below 500 is a system account unless `--include-user` names it. `--protect-user`
+    /// does not: it ranks jobs that are already eligible, it must not make a system account's
+    /// jobs killable.
+    fn below_floor(&self, uid: u32) -> bool {
+        uid < FIRST_USER_UID && !self.include_uids.contains(&uid)
     }
 
-    /// `leader_command` is the leader's full command line; members are matched by name and
-    /// executable path, so a protected process anywhere in the group protects the group.
-    /// Every member's uid is checked, not only the leader's: a group is ineligible if any
-    /// member is a system account (unless named) or runs as a different user than the leader.
+    /// `leader_command` is the leader's full, untruncated command line; members are matched by
+    /// name, executable path and their own full command line, so a protected process anywhere
+    /// in the group protects the group. Every member's uid is checked, not only the leader's:
+    /// a group is ineligible if any member is a system account (unless named by
+    /// `--include-user`) or runs as a different user than the leader.
     pub fn classify(
         &self,
         pgid: i32,
@@ -225,10 +252,7 @@ impl Rules {
         if let Some(reason) = self.precheck(pgid, leader_uid) {
             return Verdict::Ineligible(reason);
         }
-        if members
-            .iter()
-            .any(|m| m.uid < FIRST_USER_UID && !self.named(m.uid))
-        {
+        if members.iter().any(|m| self.below_floor(m.uid)) {
             return Verdict::Ineligible(Reason::SystemUser);
         }
         if members.iter().any(|m| m.uid != leader_uid) {
@@ -246,9 +270,11 @@ impl Rules {
         }
         let hit = |list: &[Regex], text: &str| list.iter().any(|r| r.is_match(text));
         if hit(&self.never, leader_command)
-            || members
-                .iter()
-                .any(|m| hit(&self.never, &m.name) || hit(&self.never, &m.exe))
+            || members.iter().any(|m| {
+                hit(&self.never, &m.name)
+                    || hit(&self.never, &m.exe)
+                    || hit(&self.never, &m.command)
+            })
         {
             return Verdict::Ineligible(Reason::Never);
         }
@@ -266,16 +292,118 @@ impl Rules {
 // ---------------------------------------------------------------------------------------
 // libproc
 
-/// What `proc_pidinfo(PROC_PIDTBSDINFO)` says about one process.
-#[derive(Clone, Debug)]
-pub struct Proc {
+/// What `proc_pidinfo(PROC_PIDTBSDINFO)` says about one process, without its name: plain
+/// data, so polling a group allocates nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Seen {
     pub pid: i32,
     pub pgid: i32,
     pub uid: u32,
     pub start_us: u64,
-    pub name: String,
     pub zombie: bool,
     pub stopped: bool,
+}
+
+/// `Seen` and the process name.
+#[derive(Clone, Debug)]
+pub struct Proc {
+    seen: Seen,
+    pub name: String,
+}
+
+impl Deref for Proc {
+    type Target = Seen;
+    fn deref(&self) -> &Seen {
+        &self.seen
+    }
+}
+
+/// One fact about one process. Three outcomes, never two: a process that has exited is not
+/// the same as one that could not be read, and taking the second for the first is how a
+/// frozen group gets forgotten.
+#[derive(Debug)]
+pub enum Probe<T> {
+    Found(T),
+    /// The process does not exist (any more).
+    Gone,
+    Unreadable(io::Error),
+}
+
+impl<T> Probe<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Probe<U> {
+        match self {
+            Probe::Found(t) => Probe::Found(f(t)),
+            Probe::Gone => Probe::Gone,
+            Probe::Unreadable(e) => Probe::Unreadable(e),
+        }
+    }
+}
+
+fn clear_errno() {
+    // SAFETY: __error returns the calling thread's errno slot.
+    unsafe { *libc::__error() = 0 };
+}
+
+/// Sorts a failed libproc call by errno: ESRCH means the process does not exist, anything
+/// else (or no errno at all) means it may exist and could not be read.
+fn failure<T>(what: &str) -> Probe<T> {
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ESRCH) => Probe::Gone,
+        Some(0) | None => Probe::Unreadable(io::Error::other(format!("{what} returned no data"))),
+        Some(_) => Probe::Unreadable(io::Error::new(e.kind(), format!("{what}: {e}"))),
+    }
+}
+
+fn bsd_info_raw(pid: i32) -> Probe<libc::proc_bsdinfo> {
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    clear_errno();
+    // SAFETY: the buffer is a zeroed proc_bsdinfo of `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    match got {
+        // SAFETY: the kernel filled the whole struct.
+        n if n == size => Probe::Found(unsafe { info.assume_init() }),
+        0 => failure("proc_pidinfo"),
+        _ => Probe::Unreadable(io::Error::other("proc_pidinfo returned a short read")),
+    }
+}
+
+fn seen_from(pid: i32, info: &libc::proc_bsdinfo) -> Seen {
+    Seen {
+        pid,
+        pgid: info.pbi_pgid as i32,
+        uid: info.pbi_uid,
+        start_us: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        zombie: info.pbi_status == libc::SZOMB,
+        stopped: info.pbi_status == libc::SSTOP,
+    }
+}
+
+/// Reads one process. Allocation-free.
+pub fn probe(pid: i32) -> Probe<Seen> {
+    bsd_info_raw(pid).map(|info| seen_from(pid, &info))
+}
+
+fn probe_proc(pid: i32) -> Probe<Proc> {
+    bsd_info_raw(pid).map(|info| {
+        let name = match c_chars(&info.pbi_name) {
+            n if n.is_empty() => c_chars(&info.pbi_comm),
+            n => n,
+        };
+        Proc {
+            seen: seen_from(pid, &info),
+            name,
+        }
+    })
 }
 
 fn c_chars(raw: &[libc::c_char]) -> String {
@@ -287,37 +415,13 @@ fn c_chars(raw: &[libc::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// The process, or None if it is gone or unreadable. Where the difference matters, use
+/// `probe`.
 pub fn bsd_info(pid: i32) -> Option<Proc> {
-    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: the buffer is a zeroed proc_bsdinfo of `size` bytes.
-    let got = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if got != size {
-        return None;
+    match probe_proc(pid) {
+        Probe::Found(p) => Some(p),
+        Probe::Gone | Probe::Unreadable(_) => None,
     }
-    // SAFETY: the kernel filled the whole struct.
-    let info = unsafe { info.assume_init() };
-    let name = match c_chars(&info.pbi_name) {
-        n if n.is_empty() => c_chars(&info.pbi_comm),
-        n => n,
-    };
-    Some(Proc {
-        pid,
-        pgid: info.pbi_pgid as i32,
-        uid: info.pbi_uid,
-        start_us: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
-        name,
-        zombie: info.pbi_status == libc::SZOMB,
-        stopped: info.pbi_status == libc::SSTOP,
-    })
 }
 
 pub fn list_pids() -> Vec<i32> {
@@ -347,17 +451,28 @@ pub fn footprint(pid: i32) -> u64 {
     unsafe { ri.assume_init() }.ri_phys_footprint
 }
 
-pub fn exe_path(pid: i32) -> Option<String> {
+fn exe_path(pid: i32) -> Probe<String> {
+    #[cfg(test)]
+    if crate::testutil::fault::take(&crate::testutil::fault::READ) {
+        return Probe::Unreadable(io::Error::other("injected failure"));
+    }
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    clear_errno();
     // SAFETY: `buf` is as long as the size passed.
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    if n > 0 {
+        Probe::Found(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    } else {
+        failure("proc_pidpath")
+    }
 }
 
-/// The command line, from `KERN_PROCARGS2`. Read only for candidates, never every sample.
-pub fn command_line(pid: i32) -> Option<String> {
+/// A process's complete arguments joined by spaces, from `KERN_PROCARGS2`: every one of them,
+/// however long. An empty string if it has none. Read only for candidates, never every sample.
+fn args_line(pid: i32) -> Probe<String> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size = 0usize;
+    clear_errno();
     // SAFETY: a null buffer asks only for the size.
     let rc = unsafe {
         libc::sysctl(
@@ -369,8 +484,11 @@ pub fn command_line(pid: i32) -> Option<String> {
             0,
         )
     };
-    if rc != 0 || size <= size_of::<i32>() {
-        return None;
+    if rc != 0 {
+        return failure("KERN_PROCARGS2");
+    }
+    if size <= size_of::<i32>() {
+        return Probe::Found(String::new());
     }
     let mut buf = vec![0u8; size];
     // SAFETY: `buf` is `size` bytes long.
@@ -385,10 +503,13 @@ pub fn command_line(pid: i32) -> Option<String> {
         )
     };
     if rc != 0 {
-        return None;
+        return failure("KERN_PROCARGS2");
     }
     buf.truncate(size);
-    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?).max(0) as usize;
+    let Some(head) = buf.first_chunk::<4>() else {
+        return Probe::Unreadable(io::Error::other("KERN_PROCARGS2 returned a short read"));
+    };
+    let argc = i32::from_ne_bytes(*head).max(0) as usize;
     let mut at = 4;
     while at < buf.len() && buf[at] != 0 {
         at += 1; // the executable path
@@ -405,7 +526,184 @@ pub fn command_line(pid: i32) -> Option<String> {
         args.push(String::from_utf8_lossy(&buf[at..end]).into_owned());
         at = end + 1;
     }
-    (!args.is_empty()).then(|| one_line(&args.join(" "), COMMAND_CHARS))
+    Probe::Found(args.join(" "))
+}
+
+/// The command line as shown to people: one line, cut at 200 characters.
+pub fn command_line(pid: i32) -> Option<String> {
+    match args_line(pid) {
+        Probe::Found(line) if !line.is_empty() => Some(one_line(&line, COMMAND_CHARS)),
+        _ => None,
+    }
+}
+
+/// What a look at one process group found. Three outcomes, never two.
+#[derive(Debug)]
+pub enum Look {
+    /// At least one live member; see `Inspector::members`.
+    Present,
+    /// Confirmed: the kernel lists no live process in the group.
+    Absent,
+    /// The kernel could not say, or a member could not be read. This is not `Absent`: nothing
+    /// may be concluded about the group, least of all that it is gone.
+    Unknown(String),
+}
+
+/// Looks at process groups through buffers it keeps, so polling a frozen group on every
+/// sample allocates nothing once they have grown to fit.
+pub struct Inspector {
+    pids: Vec<i32>,
+    members: Vec<Seen>,
+}
+
+impl Default for Inspector {
+    fn default() -> Inspector {
+        Inspector::new()
+    }
+}
+
+impl Inspector {
+    pub fn new() -> Inspector {
+        Inspector {
+            pids: vec![0; 1024],
+            members: Vec::with_capacity(64),
+        }
+    }
+
+    /// The live (non-zombie) members of the group found by the last `look`.
+    pub fn members(&self) -> &[Seen] {
+        &self.members
+    }
+
+    /// Fills `pids` with the group's pids and says how many. Err if the kernel could not say.
+    fn list(&mut self, pgid: i32) -> Result<usize, String> {
+        #[cfg(test)]
+        if crate::testutil::fault::take(&crate::testutil::fault::LIST) {
+            return Err("injected failure".into());
+        }
+        loop {
+            let bytes = (self.pids.len() * size_of::<i32>()) as libc::c_int;
+            clear_errno();
+            // SAFETY: `pids` is `bytes` long.
+            let got =
+                unsafe { libc::proc_listpgrppids(pgid, self.pids.as_mut_ptr().cast(), bytes) };
+            // Like proc_listallpids, this wrapper returns a count of pids, not bytes. It also
+            // returns zero when the enumeration itself failed (libproc.c), so only errno says
+            // whether a zero is an empty group.
+            if got <= 0 {
+                let e = io::Error::last_os_error();
+                return match (got, e.raw_os_error()) {
+                    (0, Some(0) | None) => Ok(0),
+                    _ => Err(format!("proc_listpgrppids({pgid}): {e}")),
+                };
+            }
+            let count = got as usize;
+            if count < self.pids.len() {
+                return Ok(count);
+            }
+            // Possibly cut off by the end of the buffer: grow it and ask again.
+            self.pids.resize(self.pids.len() * 2, 0);
+        }
+    }
+
+    /// Lists group `pgid` and reads each member. Allocation-free once warm.
+    pub fn look(&mut self, pgid: i32) -> Look {
+        let count = match self.list(pgid) {
+            Ok(count) => count,
+            Err(why) => return Look::Unknown(why),
+        };
+        self.members.clear();
+        for i in 0..count {
+            let pid = self.pids[i];
+            match probe(pid) {
+                Probe::Found(s) if !s.zombie && s.pgid == pgid => self.members.push(s),
+                // Exited, a zombie, or moved to another group since the list was made.
+                Probe::Found(_) | Probe::Gone => {}
+                Probe::Unreadable(e) => return Look::Unknown(format!("pid {pid}: {e}")),
+            }
+        }
+        if self.members.is_empty() {
+            Look::Absent
+        } else {
+            Look::Present
+        }
+    }
+}
+
+/// Everything the rules need to know about a group, every member fully read.
+pub struct Facts {
+    pub procs: Vec<Proc>,
+    /// One per entry of `procs`, in the same order.
+    pub members: Vec<Member>,
+}
+
+pub enum Read {
+    Facts(Facts),
+    Absent,
+    /// The kernel could not list the group, or a member's uid, path or arguments could not be
+    /// read: the rules cannot be applied, so the group is ineligible.
+    Unreadable(String),
+}
+
+fn why(probe: &Probe<String>) -> Option<String> {
+    match probe {
+        Probe::Unreadable(e) => Some(e.to_string()),
+        Probe::Found(_) | Probe::Gone => None,
+    }
+}
+
+/// A member's facts, None if it exited while being read, Err if it is still there and could
+/// not be read.
+fn read_member(p: &Proc) -> Result<Option<Member>, String> {
+    match (exe_path(p.pid), args_line(p.pid)) {
+        (Probe::Found(exe), Probe::Found(command)) => Ok(Some(Member {
+            name: p.name.clone(),
+            exe,
+            uid: p.uid,
+            command,
+        })),
+        (exe, command) => match probe(p.pid) {
+            Probe::Gone => Ok(None),
+            Probe::Found(now) if now.zombie || now.pgid != p.pgid => Ok(None),
+            _ => Err(format!(
+                "pid {}: {}",
+                p.pid,
+                why(&exe)
+                    .or_else(|| why(&command))
+                    .unwrap_or_else(|| "unreadable".into())
+            )),
+        },
+    }
+}
+
+/// Reads group `pgid` from the kernel's own list of its members and each member in full.
+pub fn read_group(pgid: i32, insp: &mut Inspector) -> Read {
+    let count = match insp.list(pgid) {
+        Ok(count) => count,
+        Err(why) => return Read::Unreadable(why),
+    };
+    let (mut procs, mut members) = (Vec::new(), Vec::new());
+    for i in 0..count {
+        let pid = insp.pids[i];
+        let p = match probe_proc(pid) {
+            Probe::Found(p) if !p.zombie && p.pgid == pgid => p,
+            Probe::Found(_) | Probe::Gone => continue,
+            Probe::Unreadable(e) => return Read::Unreadable(format!("pid {pid}: {e}")),
+        };
+        match read_member(&p) {
+            Ok(Some(member)) => {
+                procs.push(p);
+                members.push(member);
+            }
+            Ok(None) => {}
+            Err(why) => return Read::Unreadable(why),
+        }
+    }
+    if procs.is_empty() {
+        Read::Absent
+    } else {
+        Read::Facts(Facts { procs, members })
+    }
 }
 
 fn leader_of(pgid: i32, procs: &[Proc]) -> Option<&Proc> {
@@ -415,14 +713,25 @@ fn leader_of(pgid: i32, procs: &[Proc]) -> Option<&Proc> {
         .or_else(|| procs.iter().min_by_key(|p| p.start_us))
 }
 
-/// Every eligible group of at least `min_bytes`. The one place that reads the process table.
+/// The leader of a fully read group and its complete command line.
+fn leader_and_command(pgid: i32, group: &Facts) -> Option<(&Proc, &str)> {
+    let leader = leader_of(pgid, &group.procs)?;
+    let at = group.procs.iter().position(|p| p.pid == leader.pid)?;
+    Some((leader, group.members[at].command.as_str()))
+}
+
+/// Every eligible group of at least `min_bytes`. The one place that reads the whole process
+/// table.
 pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
     let mut groups: HashMap<i32, Vec<Proc>> = HashMap::new();
     for pid in list_pids() {
-        if let Some(p) = bsd_info(pid).filter(|p| !p.zombie) {
+        if let Probe::Found(p) = probe_proc(pid)
+            && !p.zombie
+        {
             groups.entry(p.pgid).or_default().push(p);
         }
     }
+    let mut insp = Inspector::new();
     let mut jobs = Vec::new();
     for (pgid, procs) in groups {
         let Some(leader) = leader_of(pgid, &procs) else {
@@ -435,18 +744,17 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
         if bytes < min_bytes {
             continue;
         }
-        let members: Vec<Member> = procs
-            .iter()
-            .map(|p| Member {
-                name: p.name.clone(),
-                exe: exe_path(p.pid).unwrap_or_default(),
-                uid: p.uid,
-            })
-            .collect();
-        let command =
-            command_line(leader.pid).unwrap_or_else(|| one_line(&leader.name, COMMAND_CHARS));
+        // Heavy enough to matter: read the group afresh from the kernel's list of its members
+        // (a process that failed to read above is in no group of `groups`, but is in this
+        // list). A member that cannot be read in full makes the group ineligible.
+        let Read::Facts(group) = read_group(pgid, &mut insp) else {
+            continue;
+        };
+        let Some((leader, full)) = leader_and_command(pgid, &group) else {
+            continue;
+        };
         if let Verdict::Eligible { prefer, protected } =
-            rules.classify(pgid, leader.uid, &members, &command)
+            rules.classify(pgid, leader.uid, &group.members, full)
         {
             jobs.push(Job {
                 pgid,
@@ -454,15 +762,38 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
                 start_us: leader.start_us,
                 uid: leader.uid,
                 bytes,
-                procs: procs.len() as u32,
+                procs: group.procs.len() as u32,
                 prefer,
                 protected,
-                stopped: procs.iter().all(|p| p.stopped),
-                command,
+                stopped: group.procs.iter().all(|p| p.stopped),
+                command: one_line(
+                    if full.is_empty() { &leader.name } else { full },
+                    COMMAND_CHARS,
+                ),
             });
         }
     }
     jobs
+}
+
+/// Why group `pgid` must not be killed right now, or None if the full rules still allow it.
+/// Judged on the group as it is now, whatever size it has: a frozen job that shrank, or one the
+/// scan no longer lists because it has since been excluded (it exec'd an agent, a helper from
+/// another user joined it), is told apart from one that is merely small. A group that cannot be
+/// read in full is excluded, as in `scan`.
+pub fn spared(rules: &Rules, pgid: i32) -> Option<String> {
+    match read_group(pgid, &mut Inspector::new()) {
+        // Nothing left to kill; the caller's own check finds that out.
+        Read::Absent => None,
+        Read::Unreadable(why) => Some(format!("it cannot be inspected: {why}")),
+        Read::Facts(group) => {
+            let (leader, full) = leader_and_command(pgid, &group)?;
+            match rules.classify(pgid, leader.uid, &group.members, full) {
+                Verdict::Eligible { .. } => None,
+                Verdict::Ineligible(reason) => Some(reason.text().to_string()),
+            }
+        }
+    }
 }
 
 /// Looks a user name up in the account database.
@@ -491,6 +822,7 @@ pub fn uid_of(name: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::fault;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
 
@@ -504,6 +836,7 @@ mod tests {
             name: name.into(),
             exe: exe.into(),
             uid: 501,
+            command: name.into(),
         }
     }
 
@@ -603,17 +936,22 @@ mod tests {
         );
     }
 
-    /// uid < 500 is lifted for named users only; --never still wins over a protected user.
+    /// uid < 500 is lifted by `--include-user` only. `--protect-user` ranks jobs that are
+    /// already eligible; it must not make a system account's jobs killable. --never still
+    /// wins over an included user.
     #[test]
-    fn named_users_lift_the_system_user_rule() {
+    fn only_include_user_lifts_the_system_user_rule() {
         let tsc = [member("tsc", "/usr/local/bin/node")];
         let r = rules(vec![200], vec![], &[]);
         assert_eq!(
             classify(&r, 5000, 200, &tsc),
-            Verdict::Eligible {
-                prefer: false,
-                protected: true
-            }
+            Verdict::Ineligible(Reason::SystemUser),
+            "protecting a system account does not make its jobs eligible"
+        );
+        assert_eq!(
+            r.precheck(5000, 200),
+            Some(Reason::SystemUser),
+            "nor does it pass the cheap pre-check the scan applies"
         );
         let r = rules(vec![], vec![201], &[]);
         assert_eq!(classify(&r, 5000, 201, &tsc), PLAIN);
@@ -621,7 +959,15 @@ mod tests {
             classify(&r, 5000, 202, &tsc),
             Verdict::Ineligible(Reason::SystemUser)
         );
-        let r = rules(vec![200], vec![], &[]);
+        // Protected and included: eligible, and ranked last.
+        let r = rules(vec![200], vec![200], &[]);
+        assert_eq!(
+            classify(&r, 5000, 200, &tsc),
+            Verdict::Eligible {
+                prefer: false,
+                protected: true
+            }
+        );
         let agent = [member("codex", "/opt/bin/codex")];
         assert_eq!(
             classify(&r, 5000, 200, &agent),
@@ -649,7 +995,7 @@ mod tests {
         );
         assert_eq!(group(&[501, 499]), Verdict::Ineligible(Reason::SystemUser));
         assert_eq!(group(&[501, 502]), Verdict::Ineligible(Reason::MixedUsers));
-        // Naming a system user lifts the uid rule for it, but never mixes users in a group.
+        // Including a system user lifts the uid rule for it, but never mixes users in a group.
         let r = rules(vec![], vec![0], &[]);
         let members = [as_user(0), as_user(0)];
         assert_eq!(r.classify(5000, 0, &members, "node build.js"), PLAIN);
@@ -710,6 +1056,27 @@ mod tests {
         );
     }
 
+    /// An agent hosted by an interpreter shows only in that member's own arguments: its name
+    /// and path are `node`'s. It protects the group it runs in, whoever leads it.
+    #[test]
+    fn an_interpreter_hosted_agent_in_any_member_protects_the_group() {
+        let r = rules(vec![], vec![], &[]);
+        let shell = member("sh", "/bin/sh");
+        let hosted = Member {
+            command: "node /opt/agents/bin/codex exec fix".into(),
+            ..member("node", "/usr/local/bin/node")
+        };
+        assert_eq!(
+            classify(&r, 5000, 501, &[shell.clone(), hosted]),
+            Verdict::Ineligible(Reason::Never)
+        );
+        let look_alike = Member {
+            command: "node /opt/codex-tools/run.js".into(),
+            ..member("node", "/usr/local/bin/node")
+        };
+        assert_eq!(classify(&r, 5000, 501, &[shell, look_alike]), PLAIN);
+    }
+
     #[test]
     fn prefer_marks_matching_jobs() {
         let r = rules(vec![], vec![], &[]);
@@ -765,5 +1132,130 @@ mod tests {
         assert!(job.start_us as f64 <= now_us && now_us - (job.start_us as f64) < 300e6);
         // membrake's own group is never listed.
         assert!(jobs.iter().all(|j| j.pgid != unsafe { libc::getpgrp() }));
+    }
+
+    fn spawn(arg0: Option<&str>, pgid: i32) -> Sleeper {
+        let mut cmd = Command::new("sleep");
+        if let Some(arg0) = arg0 {
+            cmd.arg0(arg0);
+        }
+        Sleeper(cmd.arg("300").process_group(pgid).spawn().unwrap())
+    }
+
+    fn pid_of(s: &Sleeper) -> i32 {
+        s.0.id() as i32
+    }
+
+    /// Rules that include the current user (a build sandbox runs as a uid below 500).
+    fn my_rules() -> Rules {
+        let me = unsafe { libc::getuid() };
+        Rules::new(&[], &[], vec![], vec![me], unsafe { libc::getpgrp() }).unwrap()
+    }
+
+    /// Kills the whole process group when dropped.
+    struct KillGroup(i32);
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            // SAFETY: signalling a group this test spawned.
+            unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        }
+    }
+
+    /// The agent protections read the complete arguments of every member, not only the
+    /// leader's, and not the shortened text shown to people: here an agent is a shell running
+    /// a script called codex in a directory 240 characters deep, a member of a group whose
+    /// leader is a plain `sleep`. The leader's command line and the member's name and path
+    /// (`sh`, `/bin/sh`) say nothing of an agent, and the shortened command line ends before
+    /// its name.
+    #[test]
+    fn scan_protects_a_group_by_the_full_arguments_of_any_member() {
+        let dir = crate::testutil::scratch("agent-path");
+        let deep = dir.join("a".repeat(120)).join("b".repeat(120));
+        std::fs::create_dir_all(&deep).unwrap();
+        let agent = deep.join("codex");
+        std::fs::write(&agent, "#!/bin/sh\nsleep 300\n").unwrap();
+
+        let leader = spawn(None, 0);
+        let pgid = pid_of(&leader);
+        let _group = KillGroup(pgid);
+        let host = Sleeper(
+            Command::new("/bin/sh")
+                .arg(&agent)
+                .process_group(pgid)
+                .spawn()
+                .unwrap(),
+        );
+        let control = spawn(None, 0);
+        let jobs = scan(&my_rules(), 0);
+        assert!(
+            jobs.iter().all(|j| j.pgid != pgid),
+            "a member's arguments name an agent"
+        );
+        assert!(
+            jobs.iter().any(|j| j.pgid == pid_of(&control)),
+            "an ordinary group is listed"
+        );
+        drop(host);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What cannot be read is not judged: a member whose path cannot be read makes its group
+    /// ineligible, and `spared` says so before anything is killed.
+    #[test]
+    fn a_group_with_an_unreadable_member_is_not_eligible() {
+        let sleeper = spawn(None, 0);
+        let pgid = pid_of(&sleeper);
+        let rules = my_rules();
+        assert!(scan(&rules, 0).iter().any(|j| j.pgid == pgid), "readable");
+        assert_eq!(spared(&rules, pgid), None);
+
+        fault::arm(&fault::READ, u32::MAX);
+        assert!(scan(&rules, 0).iter().all(|j| j.pgid != pgid));
+        assert!(matches!(
+            read_group(pgid, &mut Inspector::new()),
+            Read::Unreadable(_)
+        ));
+        let why = spared(&rules, pgid).expect("a group that cannot be read is not killed");
+        fault::arm(&fault::READ, 0);
+        assert!(why.contains("cannot be inspected"), "{why}");
+    }
+
+    /// The same without injecting anything: launchd's group holds a process owned by root,
+    /// which a normal user cannot read at all.
+    #[test]
+    fn a_member_owned_by_root_is_unreadable_to_a_normal_user() {
+        assert_ne!(
+            unsafe { libc::getuid() },
+            0,
+            "the tests run as a normal user"
+        );
+        assert!(matches!(
+            read_group(1, &mut Inspector::new()),
+            Read::Unreadable(_)
+        ));
+    }
+
+    /// A process that exited is told apart from one that cannot be read, and a group nobody
+    /// is in from a group the kernel failed to list: only the first of each is "gone".
+    #[test]
+    fn gone_absent_and_unknown_are_told_apart() {
+        let mut child = spawn(None, 0);
+        let pid = pid_of(&child);
+        let mut insp = Inspector::new();
+        assert!(matches!(probe(pid), Probe::Found(_)));
+        assert!(matches!(insp.look(pid), Look::Present));
+        assert_eq!(insp.members().len(), 1);
+
+        fault::arm(&fault::LIST, 1);
+        assert!(
+            matches!(insp.look(pid), Look::Unknown(_)),
+            "a failed listing is not an empty group"
+        );
+        assert!(matches!(insp.look(pid), Look::Present));
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(matches!(probe(pid), Probe::Gone));
+        assert!(matches!(insp.look(pid), Look::Absent));
     }
 }
