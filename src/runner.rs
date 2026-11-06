@@ -22,6 +22,12 @@ const WARN_EVERY: f64 = 60.0;
 const FAILSAFE_AFTER: f64 = 60.0;
 /// A SIGSTOP takes a moment to show in the process table; do not judge a fresh freeze.
 const STOP_GRACE: f64 = 2.0;
+/// Consecutive checks a frozen job must look continued before membrake believes it. A
+/// member blocked in the kernel (a page fault served from swap, while memory is tight)
+/// only reaches the stopped state when the wait ends, which can take seconds; on
+/// 2026-11-05 a 22-process job read "resumed outside" 3 s after its freeze, with memory
+/// tight, and no one is known to have continued it.
+const OUTSIDE_CHECKS: u32 = 3;
 
 pub struct RunOptions {
     pub policy: Policy,
@@ -70,6 +76,8 @@ struct Runner {
     /// None in a dry run: nothing is frozen, so nothing is recorded.
     state: Option<State>,
     last_stderr: f64,
+    /// Frozen groups seen not fully stopped, and on how many consecutive checks.
+    outside: Vec<(i32, u32)>,
 }
 
 pub fn run(opts: RunOptions) -> Result<(), String> {
@@ -157,6 +165,7 @@ fn run_loop(opts: RunOptions, protection: &str) -> Result<(), String> {
         rec,
         state,
         last_stderr: f64::NEG_INFINITY,
+        outside: Vec::new(),
     };
     let wall = signals::wall();
     for (kind, text) in &startup {
@@ -317,33 +326,65 @@ impl Runner {
 
     /// Forgets frozen jobs that are no longer frozen: someone continued them by hand, or they
     /// exited. Looks at the frozen groups only, so it costs nothing when there are none.
+    ///
+    /// A job must look continued on `OUTSIDE_CHECKS` consecutive checks, and is then sent
+    /// SIGCONT before it is forgotten: a no-op if it really was continued, and if a slow
+    /// member had only not yet stopped, the job is resumed rather than left stopped with no
+    /// one to resume it.
     fn check_frozen(&mut self, s: &Signals) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        let changed: Vec<(i32, FrozenState)> = self
-            .engine
-            .frozen()
-            .iter()
-            .filter(|f| s.time - f.since >= STOP_GRACE)
-            .filter_map(|f| {
-                let rec = state.record(f.job.pgid)?;
-                match act::frozen_state(rec) {
-                    FrozenState::Stopped => None,
-                    other => Some((f.job.pgid, other)),
+        let mut changed: Vec<(Job, FrozenState)> = Vec::new();
+        for f in self.engine.frozen() {
+            if s.time - f.since < STOP_GRACE {
+                continue;
+            }
+            let Some(rec) = state.record(f.job.pgid) else {
+                continue;
+            };
+            let pgid = f.job.pgid;
+            match act::frozen_state(rec) {
+                FrozenState::Stopped => self.outside.retain(|&(g, _)| g != pgid),
+                FrozenState::ResumedOutside => {
+                    let seen = match self.outside.iter_mut().find(|(g, _)| *g == pgid) {
+                        Some((_, n)) => {
+                            *n += 1;
+                            *n
+                        }
+                        None => {
+                            self.outside.push((pgid, 1));
+                            1
+                        }
+                    };
+                    if seen >= OUTSIDE_CHECKS {
+                        changed.push((f.job.clone(), FrozenState::ResumedOutside));
+                    }
                 }
-            })
-            .collect();
-        for (pgid, why) in changed {
+                FrozenState::Gone => changed.push((f.job.clone(), FrozenState::Gone)),
+            }
+        }
+        for (job, why) in changed {
+            let pgid = job.pgid;
             self.engine.forget(pgid);
+            self.outside.retain(|&(g, _)| g != pgid);
             let command = state
                 .record(pgid)
                 .map(|r| r.command.clone())
                 .unwrap_or_default();
-            let _ = state.remove(pgid);
             let (kind, what) = match why {
-                FrozenState::ResumedOutside => ("resume", "resumed outside membrake"),
-                _ => ("warn", "frozen job exited while frozen"),
+                FrozenState::ResumedOutside => {
+                    // Sends SIGCONT and removes the record.
+                    let _ = act::resume(state, &job);
+                    (
+                        "resume",
+                        "resumed outside membrake (sent SIGCONT to be sure)",
+                    )
+                }
+                _ => {
+                    let _ = state.remove(pgid);
+                    ("warn", "frozen job exited while frozen")
+                }
             };
             self.rec
                 .event(s.wall, kind, &format!("{what}: group {pgid}: {command}"));
@@ -551,6 +592,7 @@ mod tests {
             rec: Recorder::new(&opts.log_dir),
             state: Some(State::open(&opts.state_dir).unwrap()),
             last_stderr: f64::NEG_INFINITY,
+            outside: Vec::new(),
             opts,
         };
         for time in [100.0, 101.0] {
@@ -584,7 +626,11 @@ mod tests {
         // SAFETY: signalling the group this test spawned.
         unsafe { libc::killpg(job.pgid, libc::SIGCONT) };
         assert!(sleeper.settles(false));
+        // One or two checks are not enough: a member may only be slow to stop.
         r.check_frozen(&signals_at(111.0));
+        r.check_frozen(&signals_at(112.0));
+        assert_eq!(r.engine.frozen().len(), 1, "not yet believed");
+        r.check_frozen(&signals_at(113.0));
         assert!(r.engine.frozen().is_empty());
         assert!(r.state.as_ref().unwrap().records().is_empty());
         assert!(
@@ -592,6 +638,37 @@ mod tests {
             "{}",
             events(&dir)
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A job that looks continued and then reads stopped again (a member was only slow to
+    /// stop) stays frozen: the count of continued-looking checks starts over.
+    #[test]
+    fn a_job_that_only_looked_continued_stays_frozen() {
+        let dir = scratch("straggler");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut r = runner_with_frozen(&dir, &job);
+        assert!(sleeper.settles(true));
+        for (i, time) in [110.0, 111.0, 112.0, 113.0].into_iter().enumerate() {
+            // SAFETY: signalling the group this test spawned.
+            unsafe { libc::killpg(job.pgid, libc::SIGCONT) };
+            assert!(sleeper.settles(false));
+            r.check_frozen(&signals_at(time));
+            // Stopped again before the next check, as a slow member would be.
+            // SAFETY: as above.
+            unsafe { libc::killpg(job.pgid, libc::SIGSTOP) };
+            assert!(sleeper.settles(true));
+            r.check_frozen(&signals_at(time + 0.5));
+            assert_eq!(r.engine.frozen().len(), 1, "round {i}: still frozen");
+        }
+        assert!(
+            !events(&dir).contains("resumed outside"),
+            "{}",
+            events(&dir)
+        );
+        // SAFETY: as above; leave nothing stopped behind.
+        unsafe { libc::killpg(job.pgid, libc::SIGCONT) };
         let _ = fs::remove_dir_all(&dir);
     }
 
