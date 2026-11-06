@@ -501,6 +501,14 @@ impl Script {
         self.readings(count, 0.65, 35);
     }
 
+    /// Memory is tight but the compressor nearly empty: the queue holds its clients, and the
+    /// brake has nothing to look at. (It scans the process table on every reading past its
+    /// freeze line, which on a busy machine takes seconds, and a daemon that is slow to get
+    /// through its script is not what a test of the queue is about.)
+    fn tight_and_quiet(&mut self, count: u32) {
+        self.readings(count, 0.10, 35);
+    }
+
     /// Tight and 88% full: past the urgent line (85%), short of the cliff (92%).
     fn urgent(&mut self, count: u32) {
         self.readings(count, 0.88, 35);
@@ -1701,16 +1709,17 @@ fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer(
     let socket = queue_socket("silent");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let (release, released) = std::sync::mpsc::channel::<()>();
+    let (answered, answers) = std::sync::mpsc::channel::<Instant>();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut line = [0u8; 256];
         let _ = stream.read(&mut line);
         stream.write_all(b"QUEUED\t1\t1073741824\n").unwrap();
+        answered.send(Instant::now()).unwrap();
         // Silent, and open, until the test is over.
         let _ = released.recv();
     });
 
-    let started = Instant::now();
     let mut client = Client::spawn_with(
         &dir,
         "c",
@@ -1726,10 +1735,12 @@ fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer(
         "it ran its command: {}",
         client.said()
     );
+    // The limit runs from the first answer, so that is where the silence is measured from.
+    let answered_at = answers.recv().unwrap();
     assert!(
-        started.elapsed() >= SILENCE,
+        answered_at.elapsed() >= SILENCE,
         "not before the daemon had been silent for the whole limit: {:?}",
-        started.elapsed()
+        answered_at.elapsed()
     );
     assert!(
         client
@@ -1747,15 +1758,16 @@ fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer(
 /// given up on: the daemon tells it where it stands every keep-alive though the place has not
 /// changed, so a running daemon never lets it hear nothing. The hand-made client, which
 /// asked first, only listens, and sees the same line repeated; the real one is still waiting
-/// when its limit has passed, and runs its command when memory is calm. (The daemon's script
-/// has no more readings in all that time: the lines come from its socket thread, not from a
-/// sample.)
+/// when its limit has passed, and runs its command when memory is calm. The daemon is healthy
+/// all that time: its sampling loop keeps getting readings, every one tight, so it keeps
+/// scheduling the queue and deciding that nobody may start. (The lines themselves come from
+/// the socket thread; see the next test for a daemon whose sampling loop is not scheduling.)
 #[test]
 fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_silence_limit() {
     let dir = scratch("qkeep");
     let socket = queue_socket("keep");
     let mut script = Script::new(&dir);
-    script.tight(3);
+    script.tight_and_quiet(3);
     let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, SHORT);
 
     // The hand-made client only listens. It asks first, and is told its place at once (the
@@ -1773,7 +1785,18 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     let mut input = Vec::new();
     let mut lines: Vec<String> = Vec::new();
     let started = Instant::now();
+    let mut fed = started;
     while started.elapsed() < SILENCE + SILENCE / 2 {
+        // A reading for the sampling loop every eighth of the limit for a loop that has
+        // stopped scheduling. (Readings past the brake's freeze line make it scan the process
+        // table, which on a busy machine is slow enough to fall behind the script: in one run,
+        // with such a reading every 0.1 s, the daemon had got through 62 of 64 rows 30 s after
+        // the last was appended; in another, at a load average near 50, it had recorded 2 of
+        // 6 rows 5 s in, and its loop was rightly called stalled.)
+        if fed.elapsed() >= SILENCE / 8 {
+            script.tight_and_quiet(1);
+            fed = Instant::now();
+        }
         let mut chunk = [0u8; 256];
         if let Ok(n) = listener.read(&mut chunk) {
             input.extend_from_slice(&chunk[..n]);
@@ -1794,6 +1817,96 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     assert_eq!(client.code(), Some(0));
     assert!(Path::new(&ran).exists());
     assert!(!client.said().contains("unavailable"), "{}", client.said());
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The lines that keep a client waiting come from the daemon's socket thread, which shows that
+/// the daemon is up, not that its sampling loop is scheduling anything. Here the loop is
+/// alive and never does: every reading is unreadable, so it never reaches the queue, and no
+/// turn will ever be given. Past the silence limit the clients that wait are told so
+/// (`ERROR`, which the real one takes as the queue being unavailable and runs its command)
+/// instead of being told their place for ever, and so is one that asks while it lasts; once
+/// the readings are good again the queue serves clients as before.
+#[test]
+fn queue_clients_are_sent_away_while_the_sampling_loop_is_not_scheduling() {
+    let dir = scratch("qstalled");
+    let socket = queue_socket("stalled");
+    let mut script = Script::new(&dir);
+    script.tight_and_quiet(3);
+    let log = dir.join("log");
+    let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, SHORT);
+    daemon.wait_samples(&log, 3);
+
+    // Two clients wait: one that only listens, and a real one.
+    let mut listener = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    listener.write_all(b"REQUEST\tv1\tlistener\tsig\n").unwrap();
+    let ran = marker_file(&dir, "ran");
+    let mut client = Client::spawn_with(&dir, "c", &socket, &[], &["touch", &ran], false, SHORT);
+    client.wait_said("position 2");
+
+    // From here on the readings are unreadable, one every eighth of the silence limit (the loop
+    // is alive), until the listener has been told, which takes the silence limit.
+    let (mut input, mut lines) = (Vec::new(), Vec::new());
+    let started = Instant::now();
+    let mut fed = started;
+    script.unreadable(1);
+    while !lines.iter().any(|l: &String| l.starts_with("ERROR")) {
+        assert!(
+            started.elapsed() < SILENCE * 4,
+            "never sent away: {lines:?}, {}",
+            client.said()
+        );
+        if fed.elapsed() >= SILENCE / 8 {
+            script.unreadable(1);
+            fed = Instant::now();
+        }
+        let mut chunk = [0u8; 256];
+        if let Ok(n) = listener.read(&mut chunk) {
+            input.extend_from_slice(&chunk[..n]);
+        }
+        while let Some(line) = membrake::wire::take_line(&mut input) {
+            lines.push(line);
+        }
+    }
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("ERROR\tthe queue is not scheduling"),
+        "{lines:?}"
+    );
+    assert_eq!(client.code(), Some(0), "{}", client.said());
+    assert!(Path::new(&ran).exists(), "the real client ran its command");
+    assert!(
+        client
+            .said()
+            .contains("queue unavailable (the queue is not scheduling); running now"),
+        "{}",
+        client.said()
+    );
+
+    // A client that asks while the loop is still not scheduling is sent away at once.
+    let mut late = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    late.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    late.write_all(b"REQUEST\tv1\tlate\tsig\n").unwrap();
+    let mut said = [0u8; 256];
+    let n = late.read(&mut said).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&said[..n]),
+        "ERROR\tthe queue is not scheduling\n"
+    );
+
+    // Good readings again: an ordinary client waits for its turn and runs.
+    script.calm(3);
+    daemon.wait_samples(&log, 6);
+    let again = marker_file(&dir, "again");
+    let mut served = Client::spawn_with(&dir, "s", &socket, &[], &["touch", &again], false, SHORT);
+    assert_eq!(served.code_while_calm(&mut script), Some(0));
+    assert!(Path::new(&again).exists());
+    assert!(!served.said().contains("unavailable"), "{}", served.said());
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
 }

@@ -163,10 +163,16 @@ or killed, and is continued if it was frozen.
   not be written down are not stopped, and are written down and stopped on a later
   sample. If membrake stops, crashes, panics or restarts, it resumes every job it
   stopped before doing anything else, and it resumes everything if it ever loses
-  sight of memory for a minute. After a panic the records the loop still held are
-  continued first, from memory, whatever state the state directory is in.
+  sight of memory for a minute. After a panic every record the loop still held, not
+  only the unfinished ones, is continued first, from memory, before the state
+  directory is touched at all, whatever state it is in; the records the state file has
+  besides are continued after that.
 - A job's record is dropped only once the job is confirmed gone or `SIGCONT`
-  has been sent. A resume that fails, or a job that cannot be inspected, leaves
+  has been sent, and every process the record lists is gone or running: a member
+  that left the group (`setpgid`, `setsid`) before it was stopped is stopped
+  outside it, so each listed process also gets its own `SIGCONT`, wherever its group
+  is now, while its start time is still the recorded one. A resume that fails, a
+  listed process that is still stopped, or a job that cannot be inspected leaves
   the record and is tried again on every sample until it works.
 - Before every signal it looks at the group again and checks it is still the
   one it chose: the leader's pid and start time; or, if the leader is gone, a
@@ -399,10 +405,12 @@ answer the request within 10 s, or says nothing at all for 30 s after that,
 for its turn the daemon tells it where it stands at least every 5 s, whether or not
 that changed, so 30 s of silence is a daemon that has stopped answering, not a long
 wait; waiting for a turn is never a reason to give up, however long it takes. Those
-lines come from the daemon's socket thread, a thread of its own: they show that the
-daemon is up, not that its sampling loop is making progress, so a daemon whose
-sampling hung while the socket thread lived would keep its clients waiting. The line
-reads:
+lines come from the daemon's socket thread, a thread of its own, so on their own they
+would show only that the daemon is up, not that its sampling loop is making progress:
+they are sent only while the loop is scheduling the queue. If it has not done so for
+30 s (its signals are unreadable, or it is stuck), every client that waits is sent
+`ERROR the queue is not scheduling` instead and runs its command, and so is any that
+asks, until the loop is scheduling again. The line reads:
 
 ```text
 membrake: queue unavailable (no daemon is listening on /var/run/membrake.sock); running now

@@ -4,7 +4,8 @@
 //! The client never stands between a command and the machine for longer than the daemon says.
 //! If the socket is missing or refuses, or the daemon sends an error, hangs up, does not answer
 //! the request within `FIRST_ANSWER`, or says nothing at all for `wire::SILENCE` after that (it
-//! tells every client that waits where it stands at least every `wire::KEEP_ALIVE`), it says so
+//! tells every client that waits where it stands at least every `wire::KEEP_ALIVE`, for as long
+//! as its sampling loop is scheduling the queue), it says so
 //! on one line of stderr and runs the command at once. A command
 //! started by one that was already admitted (`MEMBRAKE_ADMITTED` is set) is run directly, so
 //! the heavy commands a heavy command starts do not queue behind it.
@@ -144,9 +145,12 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
         label: label.to_string(),
         signature: signature.to_string(),
     };
+    // The timeout is set before the request goes out: once the daemon has read the request it
+    // may hang up at any moment, and macOS refuses setsockopt on a socket whose peer has closed
+    // (EINVAL), which would hide the hang-up behind "Invalid argument".
     stream
-        .write_all(request.line().as_bytes())
-        .and_then(|()| stream.set_read_timeout(Some(LOOK_UP)))
+        .set_read_timeout(Some(LOOK_UP))
+        .and_then(|()| stream.write_all(request.line().as_bytes()))
         .map_err(|e| Stopped::Unavailable(e.to_string()))?;
 
     let asked = Instant::now();

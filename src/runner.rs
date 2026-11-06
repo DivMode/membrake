@@ -1450,7 +1450,9 @@ mod tests {
         let mut r = runner_with_frozen(&dir, &job);
         assert!(sleeper.settles(true));
 
+        // The group's SIGCONT fails, and so does the one to the member the record lists.
         fault::arm(&fault::SIGNAL, 1);
+        fault::arm(&fault::CONT, 1);
         r.thaw("test", 200.0);
         assert!(sleeper.stopped());
         assert_eq!(r.engine.frozen().len(), 1, "still tracked");
@@ -1489,7 +1491,9 @@ mod tests {
         let (action, s) = resumed.expect("the engine resumes the job");
         assert!(r.engine.frozen().is_empty(), "the engine let go of it");
 
+        // The group's SIGCONT fails, and so does the one to the member the record lists.
         fault::arm(&fault::SIGNAL, 1);
+        fault::arm(&fault::CONT, 1);
         r.perform(&action, &s, s.wall);
         assert!(sleeper.stopped(), "the signal failed");
         assert!(r.has_records(), "so the record stays");

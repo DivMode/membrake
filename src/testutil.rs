@@ -196,6 +196,8 @@ pub mod fault {
         pub static READ: Cell<u32> = const { Cell::new(0) };
         /// How many of the next SIGKILLs to a single member are not sent.
         pub static KILL: Cell<u32> = const { Cell::new(0) };
+        /// How many of the next SIGCONTs to a single recorded member fail with EPERM.
+        pub static CONT: Cell<u32> = const { Cell::new(0) };
     }
 
     pub fn arm(counter: &'static LocalKey<Cell<u32>>, times: u32) {

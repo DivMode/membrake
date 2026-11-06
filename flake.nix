@@ -46,6 +46,7 @@
           packages = with pkgs; [
             cargo
             clippy
+            jq
             rustc
             rustfmt
           ];
