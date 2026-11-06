@@ -107,6 +107,9 @@ impl Daemon {
                 .arg(state)
                 .arg("--log-dir")
                 .arg(log)
+                // Never the live daemon's socket.
+                .arg("--socket")
+                .arg(state.with_file_name("q.sock"))
                 .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -932,6 +935,8 @@ fn events_go_to_stdout_only_when_it_is_a_terminal() {
             .arg(&state)
             .arg("--log-dir")
             .arg(&log)
+            .arg("--socket")
+            .arg(dir.join("q.sock"))
             .stdout(stdout)
             .stderr(Stdio::null());
         let daemon = Daemon(command.spawn().unwrap());
@@ -1212,6 +1217,8 @@ fn state_permissions_are_set_explicitly_and_repaired() {
         .arg(&state)
         .arg("--log-dir")
         .arg(&log)
+        .arg("--socket")
+        .arg(dir.join("q.sock"))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // SAFETY: only async-signal-safe `umask` between fork and exec.
@@ -1226,7 +1233,21 @@ fn state_permissions_are_set_explicitly_and_repaired() {
     assert_eq!(mode(&state), 0o755, "the directory");
     assert_eq!(mode(&state.join("frozen.tsv")), 0o644, "the state file");
     assert_eq!(mode(&state.join("membrake.lock")), 0o600, "the lock");
+    // The queue's socket is open to every user and its status file readable by all, whatever
+    // the umask. The status file is written by the first sample.
+    assert_eq!(mode(&dir.join("q.sock")), 0o666, "the queue socket");
+    let status = state.join("queue.tsv");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !status.exists() {
+        assert!(Instant::now() < deadline, "no queue status file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(mode(&status), 0o644, "the queue status file");
     assert!(daemon.terminate().success());
+    assert!(
+        !dir.join("q.sock").exists(),
+        "the socket goes with the daemon"
+    );
     assert_eq!(
         mode(&state.join("frozen.tsv")),
         0o644,
@@ -1242,6 +1263,8 @@ fn state_permissions_are_set_explicitly_and_repaired() {
         .arg(&fresh)
         .arg("--log-dir")
         .arg(&log)
+        .arg("--socket")
+        .arg(dir.join("q.sock"))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // SAFETY: as above.
@@ -1295,4 +1318,566 @@ fn a_bad_command_line_fails_only_after_the_recovery() {
         assert!(said.contains("recovered at start"), "{bad:?}: {said}");
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The queue (`membrake exec`), against a real daemon on scripted readings
+
+/// A socket path of its own, short enough for `sockaddr_un` (104 bytes) wherever the
+/// temporary directory is. The file, if there is one, is removed when this is dropped.
+struct TempSocket(PathBuf);
+
+impl std::ops::Deref for TempSocket {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempSocket {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn queue_socket(name: &str) -> TempSocket {
+    let path = std::env::temp_dir().join(format!("mbq-{}-{name}.sock", std::process::id()));
+    assert!(path.as_os_str().len() < 100, "{}", path.display());
+    let _ = fs::remove_file(&path);
+    TempSocket(path)
+}
+
+/// Polls `done` for up to `seconds`, failing with `what` if it never holds.
+fn wait_until(what: &str, seconds: u64, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A simulated daemon that serves the queue on `socket`. `only` decides which groups the
+/// brake may touch; most queue tests give it a pattern nothing matches, so that no process
+/// at all can be frozen or killed.
+fn queue_daemon(script: &Script, dir: &Path, socket: &Path, only: &str) -> Daemon {
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mut command = Daemon::simulate_command(&script.path, only, &state, &log);
+    command.arg("--socket").arg(socket);
+    let daemon = Daemon(command.spawn().unwrap());
+    daemon.wait_started(&log);
+    wait_until("the queue socket", 20, || socket.exists());
+    daemon
+}
+
+const NOTHING: &str = "^no group is called this$";
+
+/// A `membrake exec` client with its stderr in a file. It is told to stop, and then killed,
+/// when dropped.
+struct Client {
+    child: Child,
+    stderr: PathBuf,
+}
+
+impl Client {
+    fn spawn(dir: &Path, name: &str, socket: &Path, options: &[&str], command: &[&str]) -> Client {
+        Client::spawn_with(dir, name, socket, options, command, false)
+    }
+
+    /// `admitted`: the client runs as inside a command the queue already admitted.
+    fn spawn_with(
+        dir: &Path,
+        name: &str,
+        socket: &Path,
+        options: &[&str],
+        command: &[&str],
+        admitted: bool,
+    ) -> Client {
+        let stderr = dir.join(format!("{name}.stderr"));
+        let mut exec = Command::new(env!("CARGO_BIN_EXE_membrake"));
+        // These tests may themselves be running inside an admitted command.
+        exec.env_remove("MEMBRAKE_ADMITTED");
+        if admitted {
+            exec.env("MEMBRAKE_ADMITTED", "1");
+        }
+        let child = exec
+            .arg("exec")
+            .arg("--socket")
+            .arg(socket)
+            .args(options)
+            .arg("--")
+            .args(command)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        Client { child, stderr }
+    }
+
+    fn said(&self) -> String {
+        fs::read_to_string(&self.stderr).unwrap_or_default()
+    }
+
+    fn wait_said(&self, text: &str) {
+        wait_until(&format!("{text:?} on stderr"), 20, || {
+            self.said().contains(text)
+        });
+    }
+
+    fn running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+
+    /// The exit code, once it has ended.
+    fn code(&mut self) -> Option<i32> {
+        let mut status = None;
+        wait_until("the client to end", 30, || {
+            status = self.child.try_wait().unwrap();
+            status.is_some()
+        });
+        status.and_then(|s| s.code())
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // SIGTERM first: the client passes it to the group it started.
+        // SAFETY: signalling the child this test spawned.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn marker_file(dir: &Path, name: &str) -> String {
+    dir.join(name).to_string_lossy().into_owned()
+}
+
+/// While memory is tight the client is told its place and waits, and its command does not
+/// run; when memory is calm it runs. The command is `touch`, so that "it ran" is a fact on
+/// disk and not the client's say-so.
+#[test]
+fn queue_a_client_waits_while_memory_is_tight_and_runs_when_it_is_calm() {
+    let dir = scratch("qwait");
+    let socket = queue_socket("wait");
+    let mut script = Script::new(&dir);
+    script.tight(3);
+    let log = dir.join("log");
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let ran = marker_file(&dir, "ran");
+    let mut client = Client::spawn(&dir, "c", &socket, &["--label", "tests"], &["touch", &ran]);
+    client.wait_said("membrake: queued for memory (position 1, needs 1.0 GB)");
+    script.tight(8);
+    daemon.wait_samples(&log, 11);
+    assert!(client.running(), "held while memory is tight");
+    assert!(!Path::new(&ran).exists(), "and its command has not run");
+
+    script.calm(8);
+    assert_eq!(client.code(), Some(0));
+    assert!(Path::new(&ran).exists(), "it ran once memory was calm");
+    assert_eq!(client.said().matches("queued for memory").count(), 1);
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The client exits with its command's exit code, with 128 plus the signal when the client is
+/// signalled and passes the signal on, and with a shell's 127 when there is no such command.
+#[test]
+fn queue_the_exit_code_is_passed_through() {
+    let dir = scratch("qcode");
+    let socket = queue_socket("code");
+    let mut script = Script::new(&dir);
+    script.calm(10);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let mut three = Client::spawn(&dir, "three", &socket, &[], &["sh", "-c", "exit 3"]);
+    assert_eq!(three.code(), Some(3));
+
+    let mut missing = Client::spawn(&dir, "missing", &socket, &[], &["membrake-no-such-command"]);
+    assert_eq!(missing.code(), Some(127));
+    assert!(
+        missing.said().contains("command not found"),
+        "{}",
+        missing.said()
+    );
+
+    // SIGTERM to the client reaches the command (here a `sleep` that `sh` became), which
+    // dies of it: 128 + 15.
+    let started = marker_file(&dir, "started");
+    let mut slow = Client::spawn(
+        &dir,
+        "slow",
+        &socket,
+        &[],
+        &["sh", "-c", &format!("touch {started}; exec sleep 300")],
+    );
+    wait_until("the command to start", 20, || Path::new(&started).exists());
+    // SAFETY: signalling the client this test spawned.
+    unsafe { libc::kill(slow.pid(), libc::SIGTERM) };
+    assert_eq!(slow.code(), Some(128 + 15));
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A client that is killed while it waits gives up its place: the one behind it moves up and
+/// is the next to run, and the one that left never runs anything.
+#[test]
+fn queue_a_client_killed_while_waiting_releases_its_turn() {
+    let dir = scratch("qkill");
+    let socket = queue_socket("kill");
+    let mut script = Script::new(&dir);
+    script.tight(3);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let (first_ran, second_ran) = (marker_file(&dir, "first"), marker_file(&dir, "second"));
+    let mut first = Client::spawn(&dir, "a", &socket, &[], &["touch", &first_ran]);
+    first.wait_said("position 1");
+    let mut second = Client::spawn(&dir, "b", &socket, &[], &["touch", &second_ran]);
+    second.wait_said("position 2");
+
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+    second.wait_said("position 1");
+
+    script.calm(8);
+    assert_eq!(second.code(), Some(0));
+    assert!(Path::new(&second_ran).exists());
+    assert!(
+        !Path::new(&first_ran).exists(),
+        "the client that left never ran"
+    );
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// With no daemon the command runs at once, after one line saying why, and its exit code is
+/// still passed on. The same when the "daemon" answers with an error, and when it hangs up.
+#[test]
+fn queue_a_client_fails_open_when_the_daemon_cannot_be_used() {
+    let dir = scratch("qopen");
+
+    let nobody = queue_socket("nobody");
+    let mut client = Client::spawn(&dir, "none", &nobody, &[], &["sh", "-c", "exit 3"]);
+    assert_eq!(client.code(), Some(3));
+    let said = client.said();
+    assert!(
+        said.starts_with("membrake: queue unavailable (no daemon is listening on")
+            && said.trim_end().ends_with("; running now"),
+        "{said}"
+    );
+
+    // A socket nobody listens on any more is the same as none.
+    let stale = queue_socket("stale");
+    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+    let mut client = Client::spawn(&dir, "stale", &stale, &[], &["sh", "-c", "exit 4"]);
+    assert_eq!(client.code(), Some(4));
+    assert!(
+        client.said().contains("queue unavailable"),
+        "{}",
+        client.said()
+    );
+
+    // A daemon that errors, and one that hangs up on the request.
+    let broken = queue_socket("broken");
+    let listener = std::os::unix::net::UnixListener::bind(&broken).unwrap();
+    let server = std::thread::spawn(move || {
+        for reply in [Some("ERROR\tboom\n"), None] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = [0u8; 64];
+            let _ = stream.read(&mut line);
+            if let Some(reply) = reply {
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        }
+    });
+    let mut client = Client::spawn(&dir, "error", &broken, &[], &["sh", "-c", "exit 5"]);
+    assert_eq!(client.code(), Some(5));
+    assert!(
+        client.said().contains("queue unavailable (boom)"),
+        "{}",
+        client.said()
+    );
+    let mut client = Client::spawn(&dir, "hangup", &broken, &[], &["sh", "-c", "exit 6"]);
+    assert_eq!(client.code(), Some(6));
+    assert!(
+        client
+            .said()
+            .contains("queue unavailable (the daemon closed the connection)"),
+        "{}",
+        client.said()
+    );
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Inside an admitted command a `membrake exec` runs its command directly. The proof is a
+/// daemon that would hold it for good (memory is tight) and never hears of it.
+#[test]
+fn queue_a_nested_call_runs_directly() {
+    let dir = scratch("qnest");
+    let socket = queue_socket("nest");
+    let mut script = Script::new(&dir);
+    script.tight(5);
+    let log = dir.join("log");
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let mut nested = Client::spawn_with(&dir, "n", &socket, &[], &["sh", "-c", "exit 3"], true);
+    assert_eq!(nested.code(), Some(3));
+    assert_eq!(nested.said(), "", "no queue, no line");
+    script.tight(2);
+    daemon.wait_samples(&log, 7);
+    assert!(
+        !events(&log).contains("asks for a turn"),
+        "{}",
+        events(&log)
+    );
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `status` shows the learned cap and the memory in use, who waits (with place, session,
+/// label and need) and what runs.
+#[test]
+fn queue_status_lists_the_waiting_and_the_admitted() {
+    let dir = scratch("qstat");
+    let socket = queue_socket("stat");
+    let mut script = Script::new(&dir);
+    script.calm(10);
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let started = marker_file(&dir, "started");
+    let mut running = Client::spawn(
+        &dir,
+        "run",
+        &socket,
+        &["--label", "alpha"],
+        &["sh", "-c", &format!("touch {started}; exec sleep 300")],
+    );
+    wait_until("alpha to run", 20, || Path::new(&started).exists());
+    // The daemon reads its script at its own pace: beta must ask only once it has read
+    // that memory is tight, or a calm reading could still admit it.
+    script.tight(3);
+    daemon.wait_samples(&log, 13);
+    let ran = marker_file(&dir, "beta-ran");
+    let waiting = Client::spawn(
+        &dir,
+        "wait",
+        &socket,
+        &["--label", "beta"],
+        &["touch", &ran],
+    );
+    waiting.wait_said("position 1");
+    script.tight(3);
+    daemon.wait_samples(&log, 16);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_membrake"))
+        .arg("status")
+        .arg("--state-dir")
+        .arg(&state)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    let queue: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("queue"))
+        .take_while(|l| !l.trim().is_empty())
+        .collect();
+    let queue = queue.join("\n");
+    assert!(queue.starts_with("queue       cap "), "{out}");
+    assert!(queue.contains("1 running, 1 waiting"), "{queue}");
+    assert!(
+        queue.contains("running   group") && queue.contains("alpha"),
+        "{queue}"
+    );
+    assert!(
+        queue
+            .lines()
+            .any(|l| l.contains("waiting   #1") && l.contains("needs") && l.contains("beta")),
+        "{queue}"
+    );
+    assert!(!Path::new(&ran).exists());
+    // The session is worked out by the daemon from the client's pid as the kernel reports it:
+    // the same as working it out here from the pid of the client this test spawned.
+    let agents = membrake::jobs::Regex::new(membrake::jobs::AGENT_CLI).unwrap();
+    let session = membrake::jobs::session_of(&agents, waiting.pid());
+    assert!(
+        queue.contains(&format!("session {session} ")),
+        "session {session}: {queue}"
+    );
+
+    // SAFETY: signalling the client this test spawned, which passes it to its command.
+    unsafe { libc::kill(running.pid(), libc::SIGTERM) };
+    assert_eq!(running.code(), Some(128 + 15));
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The command is a process group of its own, below interactive apps (nice 10 or lower
+/// priority still), and knows it was admitted, so what it starts does not queue again.
+#[test]
+fn queue_the_command_runs_below_interactive_apps_in_a_group_of_its_own() {
+    let dir = scratch("qprio");
+    let socket = queue_socket("prio");
+    let mut script = Script::new(&dir);
+    script.calm(10);
+    let state = dir.join("state");
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let env = marker_file(&dir, "env");
+    let client = Client::spawn(
+        &dir,
+        "c",
+        &socket,
+        &[],
+        &[
+            "sh",
+            "-c",
+            &format!("echo $MEMBRAKE_ADMITTED > {env}; exec sleep 300"),
+        ],
+    );
+    let mut group = 0;
+    wait_until("the group to be known", 30, || {
+        script.calm(1);
+        let queue = membrake::broker::read_queue(&state).ok().flatten();
+        group = queue
+            .and_then(|q| q.running.first().map(|r| r.pgid))
+            .unwrap_or(0);
+        group > 1 && Path::new(&env).exists()
+    });
+    assert_ne!(group, client.pid(), "not the client's group");
+    let leader = jobs::bsd_info(group).expect("the command is running");
+    assert_eq!(leader.pgid, group, "it leads the group it runs in");
+    // SAFETY: getpriority has no preconditions.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, group as libc::id_t) };
+    assert!(nice >= 10, "nice {nice}");
+    assert_eq!(fs::read_to_string(&env).unwrap().trim(), "1");
+    drop(client);
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// What a command was seen to need is written down when it is done, under its signature.
+#[test]
+fn queue_the_learned_size_is_written_after_the_command_is_done() {
+    let dir = scratch("qsize");
+    let socket = queue_socket("size");
+    let mut script = Script::new(&dir);
+    script.calm(10);
+    let state = dir.join("state");
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    assert!(!state.join("sizes.tsv").exists());
+
+    let mut client = Client::spawn(&dir, "c", &socket, &[], &["sleep", "2"]);
+    // A reading while it runs measures the group; keep the readings coming.
+    wait_until("the group to be measured", 30, || {
+        script.calm(1);
+        membrake::broker::read_queue(&state)
+            .ok()
+            .flatten()
+            .is_some_and(|q| q.running.iter().any(|r| r.pgid > 1 && r.peak > 0))
+    });
+    assert_eq!(client.code(), Some(0));
+    wait_until("sizes.tsv", 20, || state.join("sizes.tsv").exists());
+    let (sizes, skipped) =
+        membrake::sizes::Sizes::parse(&fs::read_to_string(state.join("sizes.tsv")).unwrap());
+    assert_eq!(skipped, 0);
+    assert!(
+        sizes.get("sleep 2").is_some_and(|peak| peak > 0),
+        "{}",
+        sizes.render()
+    );
+    assert_eq!(mode(&state.join("sizes.tsv")), 0o644);
+    assert!(daemon.terminate().success());
+
+    // A restarted daemon starts out knowing it.
+    let again = queue_daemon(&script, &dir, &socket, NOTHING);
+    script.calm(1);
+    again.wait_logged(&dir.join("log"), "1 sizes learned");
+    assert!(again.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The queue and the brake are one ordered system: while the brake holds a job frozen nothing
+/// is admitted, however calm memory looks, and the queue goes on as soon as it is resumed.
+#[test]
+fn queue_nothing_is_admitted_while_a_job_is_frozen() {
+    let dir = scratch("qfrozen");
+    let socket = queue_socket("frozen");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let mine = marker();
+    let group = Group::spawn(&mine, 1);
+    let mut script = Script::new(&dir);
+    let daemon = queue_daemon(&script, &dir, &socket, &only(&mine));
+
+    script.tight(2);
+    daemon.wait_samples(&log, 2);
+    assert!(group.settles(true), "the brake froze the group");
+    assert_eq!(records(&state), 1);
+
+    let ran = marker_file(&dir, "ran");
+    let mut client = Client::spawn(&dir, "c", &socket, &[], &["touch", &ran]);
+    client.wait_said("queued for memory");
+    // Calm, but inside the 10 s the brake waits before it resumes anything.
+    script.calm(8);
+    daemon.wait_samples(&log, 10);
+    assert!(
+        client.running() && !Path::new(&ran).exists(),
+        "held while frozen"
+    );
+    assert!(!group.running(), "still frozen");
+
+    script.calm(8);
+    assert!(group.settles(false), "the brake resumed it");
+    assert_eq!(client.code(), Some(0));
+    assert!(Path::new(&ran).exists());
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A dry run never holds a client, and writes nothing into the state directory.
+#[test]
+fn queue_a_dry_run_never_holds_a_client() {
+    let dir = scratch("qdry");
+    let socket = queue_socket("dry");
+    let (state, log) = (dir.join("state"), dir.join("log"));
+    let daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_membrake"))
+            .args(["run", "--dry-run", "--min-job-gb", "1000000", "--state-dir"])
+            .arg(&state)
+            .arg("--log-dir")
+            .arg(&log)
+            .arg("--socket")
+            .arg(&*socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    daemon.wait_started(&log);
+    wait_until("the queue socket", 20, || socket.exists());
+
+    let mut client = Client::spawn(&dir, "c", &socket, &[], &["sh", "-c", "exit 3"]);
+    assert_eq!(client.code(), Some(3));
+    assert!(!client.said().contains("unavailable"), "{}", client.said());
+    assert!(daemon.terminate().success());
+    assert!(
+        !state.exists(),
+        "a dry run leaves the state directory alone"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

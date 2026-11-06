@@ -9,8 +9,12 @@
 //! Another orders the state file: a job is dropped from it only once it is confirmed gone or
 //! continued. A resume that fails, or a group that cannot be inspected, leaves the record, and
 //! every sample tries again.
+//!
+//! The queue (`broker`) is served from the same tick, after the engine has decided, so what it
+//! admits is always judged by the state the brake has just left the machine in.
 
 use crate::act::{self, ActError, FrozenState, Killed, Recovered, State};
+use crate::broker::{self, Broker};
 use crate::engine::{Action, Engine, Policy};
 use crate::jobs::{self, Inspector, Job, Rules};
 use crate::recorder::{Recorder, describe};
@@ -45,6 +49,8 @@ pub struct Location {
     pub log_dir: PathBuf,
     /// Log every decision and send no signals.
     pub dry_run: bool,
+    /// Where `membrake exec` asks for its turn. None: no queue is served.
+    pub socket: Option<PathBuf>,
 }
 
 pub struct RunOptions {
@@ -117,6 +123,8 @@ pub struct Runner {
     inspector: Inspector,
     /// Events of the tick in progress, written after all of its signals are sent.
     events: Vec<Event>,
+    /// The admission queue, if one is served.
+    queue: Option<Broker>,
 }
 
 /// Runs the loop on the readings of `source` (the kernel, except in tests).
@@ -242,6 +250,21 @@ fn run_loop<S: SignalSource>(
     let mut r = Runner::new(opts, state, rec);
     let start = r.start_line(protection);
     r.rec.event(wall, "start", &start);
+    if let Some(socket) = &location.socket {
+        // Without a queue the brake is unchanged and every `membrake exec` runs at once.
+        match Broker::start(broker::Options {
+            socket: socket.clone(),
+            state_dir: location.state_dir.clone(),
+            dry_run: location.dry_run,
+        }) {
+            Ok(queue) => r.serve_queue(queue),
+            Err(e) => r.rec.event(
+                signals::wall(),
+                "warn",
+                &format!("not serving the queue (clients run at once): {e}"),
+            ),
+        }
+    }
     r.rec.sync_events();
 
     let mut unreadable_since: Option<f64> = None;
@@ -300,7 +323,13 @@ impl Runner {
             outside: Vec::new(),
             inspector: Inspector::new(),
             events: Vec::new(),
+            queue: None,
         }
+    }
+
+    /// Serves the admission queue from this runner's tick.
+    pub fn serve_queue(&mut self, queue: Broker) {
+        self.queue = Some(queue);
     }
 
     fn start_line(&self, protection: &str) -> String {
@@ -354,6 +383,13 @@ impl Runner {
         }
         self.check_frozen(s);
         self.retry_unresolved(s);
+        // Anything frozen, recorded or not yet confirmed resumed, holds the queue.
+        let frozen = !self.engine.frozen().is_empty() || self.has_records();
+        if let Some(queue) = self.queue.as_mut() {
+            for (kind, text) in queue.tick(s, step.tight, frozen) {
+                self.events.push(Event::note(s.wall, kind, text));
+            }
+        }
         // All signals of this tick are sent. Now say so.
         self.log_events();
         if let Err(e) = self.rec.sample(s, &step, shown.as_deref()) {
@@ -627,7 +663,7 @@ enum Done {
 // ---------------------------------------------------------------------------------------
 // status
 
-fn age(seconds: f64) -> String {
+pub(crate) fn age(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     match s {
         0..=119 => format!("{s}s"),
@@ -636,7 +672,7 @@ fn age(seconds: f64) -> String {
     }
 }
 
-fn gb(bytes: u64) -> String {
+pub(crate) fn gb(bytes: u64) -> String {
     format!("{:.1}GB", bytes as f64 / (1u64 << 30) as f64)
 }
 
@@ -747,6 +783,7 @@ pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), St
             );
         }
     }
+    print_queue(state_dir, s.wall);
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
@@ -755,6 +792,71 @@ pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), St
         );
     }
     Ok(())
+}
+
+/// Whether process `pid` exists (a process of another user does).
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    let sent = unsafe { libc::kill(pid, 0) } == 0;
+    sent || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The queue as the daemon last wrote it: the learned cap, the memory in use, who is waiting
+/// and what is running.
+fn print_queue(state_dir: &Path, wall: f64) {
+    println!();
+    let queue = match broker::read_queue(state_dir) {
+        Ok(Some(queue)) => queue,
+        Ok(None) => {
+            println!(
+                "queue       not served: no queue state in {}",
+                state_dir.display()
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "queue       unknown: cannot read {}: {e}",
+                state_dir.display()
+            );
+            return;
+        }
+    };
+    if !alive(queue.daemon) {
+        println!(
+            "queue       not served: the daemon that wrote the queue state (pid {}) has exited",
+            queue.daemon
+        );
+        return;
+    }
+    println!(
+        "queue       cap {} of {} RAM, {} in use; {} running, {} waiting",
+        gb(queue.cap),
+        gb(queue.ram),
+        gb(queue.used),
+        queue.running.len(),
+        queue.waiting.len()
+    );
+    for r in &queue.running {
+        println!(
+            "  running   group {:<7} session {:<7} peak {:>7}  for {}  {}",
+            r.pgid,
+            r.session,
+            gb(r.peak),
+            age(wall - r.since),
+            r.label
+        );
+    }
+    for w in &queue.waiting {
+        println!(
+            "  waiting   #{:<3} session {:<7} needs {:>7}  for {}  {}",
+            w.position,
+            w.session,
+            gb(w.need),
+            age(wall - w.since),
+            w.label
+        );
+    }
 }
 
 pub fn own_pgid() -> i32 {

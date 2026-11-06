@@ -682,7 +682,7 @@ type SetJetsamExt = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, i16, i32,
 
 /// Looks a private libSystem symbol up at run time, so a macOS without it degrades to a
 /// logged failure instead of a binary that will not launch.
-fn private_symbol(name: &std::ffi::CStr) -> Option<*mut libc::c_void> {
+pub(crate) fn private_symbol(name: &std::ffi::CStr) -> Option<*mut libc::c_void> {
     // SAFETY: dlsym with RTLD_DEFAULT and a NUL-terminated name.
     let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
     (!p.is_null()).then_some(p)

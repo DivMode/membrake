@@ -6,6 +6,7 @@
 //! frozen.
 
 use membrake::act::State;
+use membrake::broker::{self, Broker};
 use membrake::engine::{Engine, Policy};
 use membrake::jobs::{self, Rules};
 use membrake::recorder::Recorder;
@@ -176,5 +177,65 @@ fn steady_loop_with_a_frozen_group_does_not_allocate() {
         "the warm loop allocated {allocated} times in 200 samples with a frozen group"
     );
     drop(sleeper);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With the queue served and nobody in it, a sample still allocates nothing: the queue's
+/// part of the tick (the scheduler's step, the measuring, the status file) reuses what it has.
+#[test]
+fn steady_loop_with_the_queue_and_no_clients_does_not_allocate() {
+    let dir =
+        std::env::temp_dir().join(format!("membrake-test-{}-alloc-queue", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let state_dir = dir.join("state");
+    let opts = RunOptions {
+        policy: Policy::default(),
+        rules: Rules::new(&[], &[], vec![], vec![], unsafe { libc::getpgrp() }).unwrap(),
+        term_seconds: 1.0,
+        on_event: None,
+    };
+    let mut runner = Runner::new(
+        opts,
+        Some(State::open(&state_dir).unwrap()),
+        Recorder::open(&dir.join("log")).unwrap(),
+    );
+    runner.serve_queue(
+        Broker::start(broker::Options {
+            socket: dir.join("q.sock"),
+            state_dir: state_dir.clone(),
+            dry_run: false,
+        })
+        .unwrap(),
+    );
+    let mut time = 1000.0;
+    let mut tick = || {
+        let mut s = signals::read().expect("live signals");
+        time += 1.0;
+        s.time = time;
+        s.segments = 0.1;
+        s.pages = 0.1;
+        s.level = 80;
+        s.pressure = Pressure::Normal;
+        s.headroom = s.ram * 4;
+        runner.tick(&s);
+    };
+    // The first samples bring the queue's start-up notes and its first status file.
+    for _ in 0..20 {
+        tick();
+    }
+    assert!(
+        state_dir.join("queue.tsv").exists(),
+        "the queue's part of the tick ran"
+    );
+    let before = ALLOCATIONS.with(Cell::get);
+    for _ in 0..200 {
+        tick();
+    }
+    let allocated = ALLOCATIONS.with(Cell::get) - before;
+    assert_eq!(
+        allocated, 0,
+        "the warm loop allocated {allocated} times in 200 samples with the queue served"
+    );
+    drop(runner);
     let _ = std::fs::remove_dir_all(&dir);
 }

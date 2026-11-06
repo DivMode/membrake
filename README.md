@@ -214,9 +214,10 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/dev.membrake.plist
 ## Usage
 
 ```sh
-membrake status                # live signals, frozen jobs, the next candidates
+membrake status                # live signals, frozen jobs, the queue, the next candidates
 membrake run --dry-run         # watch decisions without sending any signal
 membrake run                   # the daemon
+membrake exec -- bun run test  # start a command when there is memory for it
 membrake replay samples.tsv    # run a recording back through the policy
 ```
 
@@ -231,7 +232,8 @@ membrake replay samples.tsv    # run a recording back through the policy
 | `--max-freeze-minutes M` | `15` | Kill a job frozen this long while memory is still tight |
 | `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` (none at the cliff) |
 | `--on-event CMD` | — | Run on every freeze, resume and kill, with `MEMBRAKE_*` variables |
-| `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded |
+| `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded, and the queue's `queue.tsv` and `sizes.tsv` |
+| `--socket PATH` | `/var/run/membrake.sock` | Where [`membrake exec`](#queue-membrake-exec) asks for its turn (mode 0666) |
 | `--log-dir DIR` | `/var/log/membrake` | `samples.tsv` and `events.log` (dry runs default to a `dry-run` subdirectory) |
 | `--dry-run` | off | Decide and log, send nothing |
 
@@ -243,6 +245,112 @@ crunch, not a recording of a real machine, so you can run it yourself.
 `--on-event` runs a command with `MEMBRAKE_EVENT`, `MEMBRAKE_PGID`,
 `MEMBRAKE_BYTES`, `MEMBRAKE_COMMAND` and `MEMBRAKE_UID`, so you can notify
 yourself or message the coding agent whose job was frozen.
+
+## Queue (`membrake exec`)
+
+The brake deals with memory that has already run short. The queue keeps heavy
+commands from starting into a machine that has no room for them, so the brake
+has less to do. Run a heavy command (a type-check, a test run, a build) as
+`membrake exec -- <command>`: the daemon starts it when there is memory headroom
+for it. Admission is by **memory, not by a fixed count**, so the Mac uses its
+memory fully and does not swap. A fixed count wastes a 96 GB machine on small
+jobs and still swaps on big ones.
+
+```sh
+membrake exec -- bun run test
+membrake exec --label "web types" -- tsc -p apps/web
+```
+
+The command runs as it would anywhere else, in a process group of its own, below
+interactive apps (`nice` 10, utility QoS), with its output and its exit code
+(128 plus the signal if it died of one; 127 and 126 for a command that is not
+found or cannot be run, as in a shell). `SIGINT`, `SIGTERM` and `SIGHUP` sent to
+`membrake exec` go to the command. Meanwhile `membrake exec` prints one line to
+stderr whenever its place in the queue changes:
+
+```text
+membrake: queued for memory (position 2, needs 1.0 GB)
+```
+
+### When a command starts
+
+Requests wait in order, and the next one starts only when **all** of this holds:
+
+- memory is not tight (the brake's own test), and the brake holds no frozen job:
+  the queue and the brake are one ordered system;
+- at least 3 s have passed since the last start, because a started job takes
+  seconds to show in the numbers;
+- `used + need < cap`. `used` is the memory the kernel does not count as
+  available (RAM × (100 − `kern.memorystatus_level`) / 100), averaged over the
+  last 5 s. `need` is the peak this kind of command was seen to reach before, or,
+  for a command nothing is known about, `min(1 GiB, cap / 5)`.
+
+If nothing admitted is running and nothing is frozen, the next command starts
+even when it does not fit, so one big job is never stuck behind a busy machine.
+Never while memory is tight.
+
+The `cap` is learned, as in Buck2: it starts at 70% of RAM, and whenever memory
+is tight it becomes the memory in use averaged over the last 15 s, which is what
+the machine could hold when it ran short. A cap learned too low would stay low
+for good, so after 60 s without pressure, while a request waits only for the cap,
+it rises by 5% of RAM, at most to 90%, and again every 60 s.
+
+Between agents the queue takes turns: the next request is the oldest one of the
+session with the fewest commands running, so one agent's backlog does not starve
+another's single command. A session is the nearest ancestor of `membrake exec`
+that is an agent CLI (`claude`, `codex`), else its parent process.
+
+Sizes are learned per command signature, the program plus up to two plain
+arguments (`bun run test`, `tsc web`). The daemon measures the peak footprint of
+each admitted command's process group and keeps a moving average in
+`sizes.tsv` in the state directory, for up to 1000 signatures.
+
+`membrake status` shows the queue: the learned cap and the memory in use, who
+waits (place, session, label, need) and what runs.
+
+### It never blocks work
+
+If the socket is missing or refuses, the daemon sends an error, hangs up or does
+not answer within 10 s, `membrake exec` prints one line and runs the command at
+once:
+
+```text
+membrake: queue unavailable (no daemon is listening on /var/run/membrake.sock); running now
+```
+
+A closed connection gives up a place at any time: kill a waiting `membrake exec`
+and the next one moves up. Inside an admitted command (`MEMBRAKE_ADMITTED` is
+set) `membrake exec` runs its command directly, so a heavy command's heavy
+children do not queue behind it. `membrake run --dry-run` admits every client at
+once and logs what the queue would have decided.
+
+### Using it from an agent
+
+Tell your agent to run heavy commands as `membrake exec -- <command>`. A queued
+command can wait for minutes while memory recovers, so where the agent's shell
+tool has a timeout, start the command in the background and read its output when
+it is done:
+
+```sh
+membrake exec -- bun run test > /tmp/test.log 2>&1 &
+```
+
+Commands that read from the terminal do not belong in the queue: the command
+runs in a process group of its own.
+
+### Trust model
+
+The daemon listens on `/var/run/membrake.sock` (`--socket PATH`), mode 0666, so
+that any local user can ask for a turn. That is a **single-user Mac** trust
+model: any local user can take a place in the line, and so can hold it. What the
+daemon trusts is only what the kernel says about the other end (its pid and uid).
+Every string a client sends is made printable and bounded, at most 64 clients are
+served at once, and the daemon only measures the groups of admitted commands, it
+never signals them. Do not use it on a Mac that other people log in to.
+
+The scheduler is ported from the design of
+[Buck2](https://github.com/facebook/buck2)'s local resource control (Apache
+License 2.0, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 ## Limitations
 
@@ -261,8 +369,9 @@ yourself or message the coding agent whose job was frozen.
 membrake stands on [oomguard](https://github.com/trentshaines/oomguard)'s
 research into what actually crashes a Mac out of memory, and on
 [earlyoom-rs-mac](https://github.com/haydenflinner/earlyoom-rs-mac)'s macOS
-system-call groundwork. Both are MIT licensed; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+system-call groundwork. Both are MIT licensed. The queue is ported from the
+design of [Buck2](https://github.com/facebook/buck2)'s scheduler, which is
+Apache 2.0 licensed. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 

@@ -15,17 +15,31 @@ use std::ops::Deref;
 /// of jobs that are already eligible; it does not lift this floor.)
 pub const FIRST_USER_UID: u32 = 500;
 
-/// Always protected, whatever `--never` says: the agent CLIs themselves, terminal
-/// multiplexers and terminals. A POSIX extended regex matched against each member's process
-/// name and executable path and against the leader's command line:
-/// - the names, including the Nix-wrapped `.tmux-wrapped` style;
+/// The agent CLIs, as a POSIX extended regex matched against a process name, executable path
+/// or full command line. Written once, as a macro, so `ALWAYS_NEVER` and `AGENT_CLI` cannot
+/// drift apart (`concat!` takes literals, not constants):
+/// - the names;
 /// - Claude Code by install directory, because its process name is its version string, and
 ///   by package name when it runs under node;
 /// - a `codex` binary, including one run via node (`node /path/to/codex ...`).
+macro_rules! agent_cli {
+    () => {
+        r"^(claude|codex)$|/\.local/share/claude/|@anthropic-ai/claude-code|/codex( |$)"
+    };
+}
+
+/// The agent CLIs. A queue session is the nearest ancestor of a client that matches this.
+pub const AGENT_CLI: &str = agent_cli!();
+
+/// Always protected, whatever `--never` says: the agent CLIs themselves (`AGENT_CLI`),
+/// terminal multiplexers and terminals, including the Nix-wrapped `.tmux-wrapped` style.
 ///
 /// Matched against every member's complete command line, not only the leader's, so an agent
 /// hosted by an interpreter (`node /path/to/codex ...`) protects the shell-led group it runs in.
-pub const ALWAYS_NEVER: &str = r"^(claude|codex|tmux|herdr|zellij|screen|ghostty|alacritty|kitty|wezterm|wezterm-gui|\.(herdr|tmux|zellij)-wrapped)$|/\.(herdr|tmux|zellij)-wrapped$|/\.local/share/claude/|@anthropic-ai/claude-code|/codex( |$)";
+pub const ALWAYS_NEVER: &str = concat!(
+    agent_cli!(),
+    r"|^(tmux|herdr|zellij|screen|ghostty|alacritty|kitty|wezterm|wezterm-gui|\.(herdr|tmux|zellij)-wrapped)$|/\.(herdr|tmux|zellij)-wrapped$"
+);
 
 const COMMAND_CHARS: usize = 200;
 
@@ -297,6 +311,7 @@ impl Rules {
 #[derive(Clone, Copy, Debug)]
 pub struct Seen {
     pub pid: i32,
+    pub ppid: i32,
     pub pgid: i32,
     pub uid: u32,
     pub start_us: u64,
@@ -380,6 +395,7 @@ fn bsd_info_raw(pid: i32) -> Probe<libc::proc_bsdinfo> {
 fn seen_from(pid: i32, info: &libc::proc_bsdinfo) -> Seen {
     Seen {
         pid,
+        ppid: info.pbi_ppid as i32,
         pgid: info.pbi_pgid as i32,
         uid: info.pbi_uid,
         start_us: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
@@ -774,6 +790,50 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
         }
     }
     jobs
+}
+
+/// How many generations up the process tree `session_of` looks.
+const SESSION_DEPTH: usize = 32;
+
+/// Whether `p` is an agent CLI: `agent` matches its name, its executable path or its complete
+/// arguments, the three places `Rules::classify` looks.
+fn is_agent(agent: &Regex, p: &Proc) -> bool {
+    agent.is_match(&p.name)
+        || matches!(exe_path(p.pid), Probe::Found(exe) if agent.is_match(&exe))
+        || matches!(args_line(p.pid), Probe::Found(command) if agent.is_match(&command))
+}
+
+/// The queue session of the process `pid`: its nearest ancestor that is an agent CLI
+/// (`agent` is `AGENT_CLI`), or else its parent. One agent's commands share a session, so the
+/// queue can take turns between agents. An ancestor that cannot be read (another user's, to a
+/// normal user) is judged by what can be read, which is at least its name.
+pub fn session_of(agent: &Regex, pid: i32) -> i32 {
+    let Some(client) = bsd_info(pid) else {
+        return pid;
+    };
+    let mut at = client.ppid;
+    for _ in 0..SESSION_DEPTH {
+        if at <= 1 {
+            break;
+        }
+        let Some(p) = bsd_info(at) else {
+            break;
+        };
+        if is_agent(agent, &p) {
+            return at;
+        }
+        at = p.ppid;
+    }
+    client.ppid
+}
+
+/// The summed footprint of the live members of group `pgid`, or None if it is gone or the
+/// kernel could not list it. Allocation-free once `insp` is warm.
+pub fn group_footprint(insp: &mut Inspector, pgid: i32) -> Option<u64> {
+    match insp.look(pgid) {
+        Look::Present => Some(insp.members().iter().map(|m| footprint(m.pid)).sum()),
+        Look::Absent | Look::Unknown(_) => None,
+    }
 }
 
 /// Why group `pgid` must not be killed right now, or None if the full rules still allow it.
@@ -1233,6 +1293,57 @@ mod tests {
             read_group(1, &mut Inspector::new()),
             Read::Unreadable(_)
         ));
+    }
+
+    /// A queue session is the nearest ancestor that is an agent CLI, however many other
+    /// processes lie between, and the parent when there is none. The agent here is a shell
+    /// running a script called `codex`; between it and the process asking there is an
+    /// ordinary shell.
+    #[test]
+    fn a_session_is_the_nearest_agent_ancestor_else_the_parent() {
+        let dir = crate::testutil::scratch("session");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let agent = dir.join("codex");
+        std::fs::write(
+            &agent,
+            "#!/bin/sh\nsh -c 'sleep 300 & echo $! > \"$0\"; wait' \"$1\"\n",
+        )
+        .unwrap();
+        let mut host = Command::new("/bin/sh")
+            .arg(&agent)
+            .arg(&pid_file)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let asking = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the script never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let agents = Regex::new(AGENT_CLI).unwrap();
+        assert_eq!(session_of(&agents, asking), host.id() as i32, "the agent");
+        let nobody = Regex::new("^no process is called this$").unwrap();
+        let parent = bsd_info(asking).unwrap().ppid;
+        assert_ne!(parent, host.id() as i32, "an ordinary shell lies between");
+        assert_eq!(session_of(&nobody, asking), parent, "else the parent");
+        assert_eq!(
+            session_of(&agents, i32::MAX),
+            i32::MAX,
+            "a process that is gone"
+        );
+
+        // SAFETY: signalling the process the script started, which this test owns.
+        unsafe { libc::kill(asking, libc::SIGKILL) };
+        let _ = host.kill();
+        let _ = host.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A process that exited is told apart from one that cannot be read, and a group nobody

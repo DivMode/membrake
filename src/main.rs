@@ -1,9 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use membrake::engine::Policy;
+use membrake::exec;
 use membrake::jobs::{self, Rules};
 use membrake::recorder;
 use membrake::runner::{self, Location, RunOptions};
 use membrake::source::{Live, Scripted};
+use membrake::wire::DEFAULT_SOCKET;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
@@ -36,6 +39,7 @@ Examples:
   membrake status                          live signals, frozen jobs, next candidates
   membrake run --dry-run                   log every decision, send no signals
   sudo membrake run --protect-user ci      what the LaunchDaemon runs
+  membrake exec -- bun run test            start it when there is memory for it
   membrake replay /var/log/membrake/samples.tsv";
 
 #[derive(Subcommand)]
@@ -45,6 +49,9 @@ enum Command {
     /// Samples once a second. Frozen jobs are recorded in the state directory first, and are
     /// resumed when membrake starts and when it receives SIGTERM, SIGINT or SIGHUP. Run as
     /// root to act on other users' jobs; only one instance may run at a time.
+    ///
+    /// Also serves the queue: `membrake exec` asks for its turn on the socket (--socket) and
+    /// the daemon starts each command when there is memory for it.
     Run(RunArgs),
     /// Show the live signals, the frozen jobs and the next candidates
     ///
@@ -54,6 +61,15 @@ enum Command {
     ///
     /// Nothing is signalled. The candidate jobs are the ones recorded in the file.
     Replay(ReplayArgs),
+    /// Run a command when there is memory for it
+    ///
+    /// Asks the daemon (`membrake run`) for a turn, waits for the go-ahead, runs the command
+    /// below interactive apps (nice 10, utility QoS) in a process group of its own, and exits
+    /// with its exit code (128 plus the signal if it died of one). The daemon starts a command
+    /// when the memory in use plus what it is expected to need stays under a cap it learns,
+    /// never while memory is tight or a job is frozen. If the daemon cannot be reached the
+    /// command runs at once. Inside a command that was admitted, it runs directly.
+    Exec(ExecArgs),
 }
 
 /// Policy knobs shared by every command.
@@ -117,6 +133,12 @@ struct RunArgs {
     /// MEMBRAKE_PGID, MEMBRAKE_BYTES, MEMBRAKE_COMMAND and MEMBRAKE_UID set
     #[arg(long, value_name = "CMD")]
     on_event: Option<String>,
+    /// Where `membrake exec` asks for its turn; any local user may [default:
+    /// /var/run/membrake.sock]
+    // The default is applied in `execute`, not here: a simulated run has none, so that it can
+    // never reach for the live daemon's socket.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
     /// TEST ONLY, hidden from `--help`. Take the readings from this file (the samples.tsv
     /// format, one row per tick; see `source::Scripted`) instead of the kernel. The process
     /// table is still scanned and real groups are still signalled, so it also needs
@@ -135,6 +157,20 @@ struct RunArgs {
     /// and no others.
     #[arg(long, value_name = "REGEX", hide = true, requires = "simulate")]
     simulate_only: Option<String>,
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// What the queue shows for this command [default: the command and its first two plain
+    /// arguments]
+    #[arg(long, value_name = "LABEL")]
+    label: Option<String>,
+    /// The daemon's socket
+    #[arg(long, value_name = "PATH", default_value = DEFAULT_SOCKET)]
+    socket: PathBuf,
+    /// The command and its arguments, after `--`
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    command: Vec<OsString>,
 }
 
 #[derive(Args)]
@@ -190,8 +226,8 @@ fn rules(args: &RuleArgs) -> Result<Rules, String> {
     )
 }
 
-fn execute(cli: Cli) -> Result<(), String> {
-    match cli.command {
+fn execute(cli: Cli) -> Result<ExitCode, String> {
+    let done: Result<(), String> = match cli.command {
         Command::Run(a) => {
             let RunArgs {
                 policy: policy_args,
@@ -201,6 +237,7 @@ fn execute(cli: Cli) -> Result<(), String> {
                 state_dir,
                 log_dir,
                 on_event,
+                socket,
                 simulate,
                 simulate_only,
             } = a;
@@ -214,6 +251,9 @@ fn execute(cli: Cli) -> Result<(), String> {
                     PathBuf::from(if dry_run { DRY_RUN_LOG_DIR } else { LOG_DIR })
                 }),
                 dry_run,
+                // A simulated run never reaches for the live daemon's socket.
+                socket: socket
+                    .or_else(|| simulate.is_none().then(|| PathBuf::from(DEFAULT_SOCKET))),
             };
             let configure = move || -> Result<RunOptions, String> {
                 if !term_seconds.is_finite() || term_seconds < 0.0 {
@@ -251,12 +291,20 @@ fn execute(cli: Cli) -> Result<(), String> {
             .map(|_| ())
             .map_err(|e| format!("{}: {e}", a.file.display()))
         }
-    }
+        Command::Exec(a) => {
+            return Ok(ExitCode::from(exec::run(exec::Args {
+                label: a.label,
+                socket: a.socket,
+                command: a.command,
+            }) as u8));
+        }
+    };
+    done.map(|()| ExitCode::SUCCESS)
 }
 
 fn main() -> ExitCode {
     match execute(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             // Not eprintln!: it panics when stderr is closed.
             let _ = writeln!(std::io::stderr(), "membrake: {e}");
