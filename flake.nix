@@ -23,11 +23,15 @@
             fileset = pkgs.lib.fileset.unions [
               ./Cargo.toml
               ./Cargo.lock
+              # tests/readme_hook.rs runs the example hook out of the README.
+              ./README.md
               ./src
               ./tests
             ];
           };
           cargoLock.lockFile = ./Cargo.lock;
+          # The same test runs the hook, which needs jq.
+          nativeCheckInputs = [ pkgs.jq ];
           meta = {
             description = cargoToml.package.description;
             license = pkgs.lib.licenses.mit;

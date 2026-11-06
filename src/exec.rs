@@ -2,8 +2,10 @@
 //! the command, and reports how it ended.
 //!
 //! The client never stands between a command and the machine for longer than the daemon says.
-//! If the socket is missing or refuses, or the daemon sends an error, hangs up or stops
-//! answering, it says so on one line of stderr and runs the command at once. A command
+//! If the socket is missing or refuses, or the daemon sends an error, hangs up, does not answer
+//! the request within `FIRST_ANSWER`, or says nothing at all for `wire::SILENCE` after that (it
+//! tells every client that waits where it stands at least every `wire::KEEP_ALIVE`), it says so
+//! on one line of stderr and runs the command at once. A command
 //! started by one that was already admitted (`MEMBRAKE_ADMITTED` is set) is run directly, so
 //! the heavy commands a heavy command starts do not queue behind it.
 //!
@@ -29,7 +31,9 @@ use std::time::{Duration, Instant};
 /// queue was unavailable). A `membrake exec` inside such a command runs its command directly.
 pub const ADMITTED: &str = "MEMBRAKE_ADMITTED";
 /// How long the daemon has to answer a request at all. Waiting for a turn takes as long as it
-/// takes, but a daemon that never says even where the request stands is broken.
+/// takes, but a daemon that never says even where the request stands is broken. After the
+/// first answer the limit is `wire::SILENCE` between lines, which the daemon's keep-alive
+/// (`wire::KEEP_ALIVE`) never lets a running daemon reach.
 const FIRST_ANSWER: Duration = Duration::from_secs(10);
 /// How often a waiting client looks up from the socket to see whether it was signalled.
 const LOOK_UP: Duration = Duration::from_millis(250);
@@ -130,7 +134,9 @@ fn connect_error(socket: &Path, e: &io::Error) -> String {
     }
 }
 
-/// Asks for a turn and waits for `GO`. Prints a line whenever the position changes.
+/// Asks for a turn and waits for `GO`. Prints a line whenever the position changes. Gives up on
+/// a daemon that says nothing for too long: `FIRST_ANSWER` for the first line, `wire::SILENCE`
+/// after each line.
 fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStream, Stopped> {
     let mut stream =
         UnixStream::connect(socket).map_err(|e| Stopped::Unavailable(connect_error(socket, &e)))?;
@@ -144,6 +150,9 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
         .map_err(|e| Stopped::Unavailable(e.to_string()))?;
 
     let asked = Instant::now();
+    let silence = wire::timing().silence;
+    // When the daemon last said anything.
+    let mut heard = asked;
     let mut told = false;
     let mut position: Option<(usize, u64)> = None;
     let mut shown = None;
@@ -154,6 +163,7 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
             return Err(Stopped::Signalled(sig));
         }
         while let Some(line) = wire::take_line(&mut input) {
+            heard = Instant::now();
             match Reply::parse(&line) {
                 Some(Reply::Go) => return Ok(stream),
                 Some(Reply::Queued {
@@ -174,8 +184,11 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
             shown = Some(now);
             say(&queued_line(now, need));
         }
-        if !told && asked.elapsed() > FIRST_ANSWER {
+        if !told && heard.elapsed() > FIRST_ANSWER {
             return Err(Stopped::Unavailable("the daemon did not answer".into()));
+        }
+        if told && heard.elapsed() > silence {
+            return Err(Stopped::Unavailable("the daemon stopped answering".into()));
         }
         if input.len() > wire::MAX_LINE {
             return Err(Stopped::Unavailable(UNEXPECTED.into()));

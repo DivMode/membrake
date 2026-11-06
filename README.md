@@ -152,14 +152,19 @@ or killed, and is continued if it was frozen.
 
 ### Built to be trusted
 
-- Every `SIGSTOP` is written to disk **before** it is sent, the one that starts
-  a kill included, and completed right after it: a stopped process cannot fork,
-  so the group is looked at again and every member it has then is recorded. If
-  that second write fails the group stays stopped and the complete record stays in
-  memory, written again on every sample, and the shutdown and the panic recovery
-  resume the group from it. If membrake stops, crashes, panics or restarts, it
-  resumes every job it stopped before doing anything else, and it resumes
-  everything if it ever loses sight of memory for a minute.
+- A process that is not on disk is never stopped. `SIGSTOP` goes to each member of a
+  job by its own pid, after its pid and start time are written to the state file and
+  flushed, the first stop of a kill included; the group is then looked at again, and
+  a member that was born while the others were being stopped is written down, then
+  stopped, and so on until a look finds none (at most 16 passes; a group that is
+  still growing after that keeps what is stopped recorded and is not chased any
+  further). So a crash at any moment leaves every stopped process in the file, and the
+  next run resumes it from the file alone. If a write fails, the members that could
+  not be written down are not stopped, and are written down and stopped on a later
+  sample. If membrake stops, crashes, panics or restarts, it resumes every job it
+  stopped before doing anything else, and it resumes everything if it ever loses
+  sight of memory for a minute. After a panic the records the loop still held are
+  continued first, from memory, whatever state the state directory is in.
 - A job's record is dropped only once the job is confirmed gone or `SIGCONT`
   has been sent. A resume that fails, or a job that cannot be inspected, leaves
   the record and is tried again on every sample until it works.
@@ -174,8 +179,10 @@ or killed, and is continued if it was frozen.
   the record stays, nothing is signalled, and it is looked at again on every
   sample, because the stopped members may be the ones membrake stopped.
   `SIGKILL` goes to each member by its own pid after its start time is read
-  again. macOS has no `pidfd`, so a few microseconds between that last look and
-  the signal remain.
+  again, and so does `SIGSTOP`. macOS has no `pidfd`, so a few microseconds between
+  that last look and the signal remain, and a member that forks in the moment its
+  `SIGSTOP` takes to take effect is found by the next look, while one that forks after
+  the last look is neither recorded nor stopped.
 - A flag that no longer parses, or an account that was deleted, stops the daemon
   only after it has resumed what a previous run froze.
 - All of a sample's signals go out before anything is logged. Everything the
@@ -212,8 +219,11 @@ or killed, and is continued if it was frozen.
   with no grace like any emergency kill. The daemon lifts itself out of jetsam
   band 0 so macOS can't kill the guard first.
 - The queue never blocks work and is never in the way of the brake. If the daemon
-  is missing, refuses, hangs up or does not answer within 10 s, `membrake exec`
-  runs the command at once. The daemon only ever measures the groups of admitted
+  is missing, refuses, sends an error, hangs up, does not answer the request within
+  10 s, or says nothing at all for 30 s after that, `membrake exec` runs the command
+  at once. A running daemon tells every waiting client where it stands at least
+  every 5 s, whether or not that changed, so only a daemon that has stopped
+  answering is ever given up on. The daemon only ever measures the groups of admitted
   commands and never signals them, and what a client says about its command is
   checked against the kernel: the group's leader must be a child of the process
   that connected (still that process, by its pid and start time), of the same user,
@@ -383,9 +393,16 @@ waits (place, session, label, need) and what runs.
 
 ### It never blocks work
 
-If the socket is missing or refuses, the daemon sends an error, hangs up or does
-not answer within 10 s, `membrake exec` prints one line and runs the command at
-once:
+If the socket is missing or refuses, the daemon sends an error, hangs up, does not
+answer the request within 10 s, or says nothing at all for 30 s after that,
+`membrake exec` prints one line and runs the command at once. While a client waits
+for its turn the daemon tells it where it stands at least every 5 s, whether or not
+that changed, so 30 s of silence is a daemon that has stopped answering, not a long
+wait; waiting for a turn is never a reason to give up, however long it takes. Those
+lines come from the daemon's socket thread, a thread of its own: they show that the
+daemon is up, not that its sampling loop is making progress, so a daemon whose
+sampling hung while the socket thread lived would keep its clients waiting. The line
+reads:
 
 ```text
 membrake: queue unavailable (no daemon is listening on /var/run/membrake.sock); running now
@@ -452,13 +469,19 @@ heavy commands that do not go through the queue. A minimal one
 # Refuse heavy commands that skip the memory queue. Exit 2 blocks the command and
 # shows the message to Claude.
 heavy='(tsc|tsgo|tsgolint|vitest|jest|xcodebuild|cargo (build|test|clippy)|swift (build|test)|(bun|pnpm|npm|yarn) (test|run (test|check|typecheck|verify|build)(:[^ ]*)?))'
-via='((npx|bunx|bun x|pnpm exec|pnpm dlx|yarn exec|yarn dlx|npm exec)( -[^ ]*)* )?'
+# A package runner's options: a flag, or a flag that takes the next word as its value.
+valued='(-p|-F|-C|--package|--filter|--dir|--workspace|--prefix|--call)'
+opts="( (-[^ ]*|$valued [^ ]+))*"
+via="((npx|bunx|bun x|(pnpm|yarn|npm)$opts (exec|dlx))$opts )?"
 cmd=$(jq -r '.tool_input.command // empty')
 # Quoted text is not a command: replace each quoted string with _ (the first quote
-# of either kind starts one; a line end inside it does not end it). Then cut the
-# command into segments at ; & | ( ) and line ends.
+# of either kind starts one; a backslash inside double quotes escapes the next
+# character; a line end inside it does not end it). Then cut the command into
+# segments at ; & | ( ) and line ends.
+single="'[^']*'"
+double='"([^"\\]|\\.)*"'
 segments=$(printf '%s' "$cmd" | tr '\n' '\001' |
-  sed -E "s/'[^']*'|\"[^\"]*\"/_/g" | tr ';&|()\001' '\n\n\n\n\n\n')
+  sed -E "s/$single|$double/_/g" | tr ';&|()\001' '\n\n\n\n\n\n')
 printf '%s\n' "$segments" | while IFS= read -r segment; do
   set -f; set -- $segment; set +f   # words; extra whitespace is gone
   while [ $# -gt 0 ]; do            # leading VAR=value assignments are not the program
@@ -497,7 +520,9 @@ and register it in `~/.claude/settings.json`:
 The hook judges each segment of the command on its own. It refuses a segment whose
 program, after any leading `VAR=value` assignments, is one of the listed tools,
 alone or through `npx`, `bunx`, `pnpm exec`, `yarn dlx` or `npm exec`, with
-a path in front of it if there is one; a segment that starts with `membrake exec` or
+a path in front of it if there is one, and with the runner's options, including those
+that take the next word as their value (`npx --package typescript tsc`,
+`pnpm --filter web exec vitest`); a segment that starts with `membrake exec` or
 `cpu-lock run` is passed, and so is whatever follows it in that segment. So
 `CI=1 pnpm test` and `cd app && tsc -p .` are refused, `membrake exec -- tsc -p .` and
 `echo 'tsc -p .'` are not, and `membrake exec -- tsc && vitest run` is, for its second
@@ -506,9 +531,10 @@ half.
 This is a heuristic for ordinary invocations, not a parser, and it stops habits and
 mistakes, not a determined workaround. It does not look inside quotes, so
 `bash -c 'tsc -p .'` gets through, and a quote that does not pair up can hide the
-command after it. It does not know wrappers other than the ones above (`env`, `time`,
-`nice`), tools reached through a script (`./check.sh`), or tools it was not given
-(`cargo check`, `bun run lint`). Extend the list to your own tools.
+command after it (a backslash inside double quotes escapes the next character, so
+`echo "a \"quoted; tsc -p .\""` is one string). It does not know wrappers other
+than the ones above (`env`, `time`, `nice`), tools reached through a script
+(`./check.sh`), or tools it was not given (`cargo check`, `bun run lint`). Extend the list to your own tools.
 
 ### Codex
 

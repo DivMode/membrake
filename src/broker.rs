@@ -743,6 +743,8 @@ struct Conn {
     id: Option<Id>,
     /// The last position and need it was told.
     told: Option<(usize, u64)>,
+    /// When it was last told, whether or not that changed anything.
+    told_at: Instant,
     /// When it was told to go (wall-clock seconds), if it has been: the command it starts
     /// cannot have started before.
     go_at: Option<f64>,
@@ -825,6 +827,8 @@ struct Ctx<'a> {
     /// None in a dry run, which writes no file.
     files: Option<Spool<FileWork>>,
     dry_run: bool,
+    /// A waiting client is told where it stands at least this often.
+    keep_alive: Duration,
 }
 
 impl Ctx<'_> {
@@ -939,8 +943,13 @@ impl Ctx<'_> {
             };
             if let Some(w) = view.waiting.iter().find(|w| w.id == id) {
                 let standing = (w.position, w.need);
-                if !self.dry_run && conn.told != Some(standing) {
+                // Said again when nothing changed: a client that hears nothing for a while
+                // takes the daemon to be gone and runs its command.
+                if !self.dry_run
+                    && (conn.told != Some(standing) || conn.told_at.elapsed() >= self.keep_alive)
+                {
                     conn.told = Some(standing);
+                    conn.told_at = Instant::now();
                     conn.say(&Reply::Queued {
                         position: w.position,
                         need: w.need,
@@ -972,6 +981,7 @@ fn serve(
         agent: Regex::new(AGENT_CLI).ok(),
         files,
         dry_run,
+        keep_alive: wire::timing().keep_alive,
     };
     let mut conns: Vec<Conn> = Vec::new();
     let mut view = Snapshot::default();
@@ -1082,6 +1092,7 @@ fn accept_some(
                     output: Vec::new(),
                     id: None,
                     told: None,
+                    told_at: Instant::now(),
                     go_at: None,
                     started: false,
                     closing: false,
@@ -1624,12 +1635,14 @@ mod tests {
     /// says STARTED: the connection can outlive the process (inherited, or passed on) and the
     /// pid can be reissued, and a child of the process that has it then is not the client's
     /// command. A pid cannot be made to be reissued on demand, so the connection here carries
-    /// a start time that is not the one this process has: the pid has gone to another process
-    /// since. The command is a real child of this process, in a group of its own, that
-    /// started after the go-ahead, and what the same connection says with the start time the
-    /// kernel gave is accepted.
+    /// a start time that is not the one this process has, as if the pid had gone to another
+    /// process since. This shows the comparison of the start time noted at accept with the
+    /// pid's start time now, and that `STARTED` is refused when they differ; it is not a real
+    /// reissue of a pid. The command is a real child of this process, in a group of its own,
+    /// that started after the go-ahead, and what the same connection says with the start time
+    /// the kernel gave is accepted.
     #[test]
-    fn started_from_a_connection_whose_pid_belongs_to_another_process_now_is_refused() {
+    fn started_is_refused_when_the_pids_start_time_is_not_the_one_noted_at_accept() {
         let dir = scratch("peer-lifetime");
         fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("q.sock");
@@ -1676,6 +1689,7 @@ mod tests {
             agent: None,
             files: None,
             dry_run: false,
+            keep_alive: wire::KEEP_ALIVE,
         };
         let conn = |start_us: u64| Conn {
             stream: stream.try_clone().unwrap(),
@@ -1688,6 +1702,7 @@ mod tests {
             output: Vec::new(),
             id: Some(id),
             told: None,
+            told_at: Instant::now(),
             go_at: Some(go_at),
             started: false,
             closing: false,
@@ -1886,8 +1901,24 @@ mod tests {
         answered.recv_timeout(Duration::from_secs(10)).unwrap();
 
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        // Two idle seconds, each a chance to write it.
-        thread::sleep(Duration::from_millis(2500));
+        // The disk is back. A snapshot of the other file makes the thread try everything it
+        // still has to write, and it says when it is done: the sizes are written, and had it
+        // kept the status snapshot, that would be too.
+        let mut table = Sizes::default();
+        table.record("tsc web", 3 << 30);
+        assert!(
+            files
+                .offer(FileWork::Sizes(Arc::new(table.clone())))
+                .is_ok()
+        );
+        let (done, answered) = mpsc::channel();
+        files.try_send(FileWork::Done(done)).unwrap();
+        answered.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(SIZES_FILE)).unwrap(),
+            table.render(),
+            "the thread did try to write"
+        );
         assert!(!dir.join(QUEUE_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
     }

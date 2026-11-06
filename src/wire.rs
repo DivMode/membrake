@@ -5,10 +5,14 @@
 //! client -> daemon   REQUEST  v1  <label>  <signature>
 //!                    STARTED  <pgid>
 //!                    DONE     <exit code>
-//! daemon -> client   QUEUED   <position>  <need in bytes>    (whenever either changes)
+//! daemon -> client   QUEUED   <position>  <need in bytes>    (whenever either changes, and
+//!                                                             at least every `KEEP_ALIVE`)
 //!                    GO
 //!                    ERROR    <text>
 //! ```
+//!
+//! A client that is waiting is told where it stands at least every `KEEP_ALIVE`, whether or not
+//! that changed, and takes a daemon that says nothing for `SILENCE` to have stopped answering.
 //!
 //! Nothing a client sends is trusted: the daemon sanitizes every string and bounds every line.
 //! `STARTED` is accepted once, after `GO`, and only for the group of a command that this client
@@ -16,6 +20,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
+use std::time::Duration;
 
 /// Where the daemon listens and `membrake exec` connects, unless told otherwise.
 pub const DEFAULT_SOCKET: &str = "/var/run/membrake.sock";
@@ -25,6 +30,36 @@ pub const VERSION: &str = "v1";
 pub const MAX_LINE: usize = 1024;
 pub const MAX_LABEL: usize = 80;
 pub const MAX_SIGNATURE: usize = 80;
+/// The longest a client that has been answered waits for the next line, of any kind, before it
+/// takes the daemon to have stopped answering and runs its command.
+pub const SILENCE: Duration = Duration::from_secs(30);
+/// How often at least the daemon tells a waiting client where it stands: a sixth of `SILENCE`
+/// (5 s), so five lines in a row have to be lost for a client to give up on a daemon that is
+/// running.
+pub const KEEP_ALIVE: Duration = Duration::from_secs(SILENCE.as_secs() / 6);
+
+/// The two times above, as this process uses them.
+pub struct Timing {
+    pub keep_alive: Duration,
+    pub silence: Duration,
+}
+
+/// The times of the keep-alive, normally `KEEP_ALIVE` and `SILENCE`. Test only:
+/// `MEMBRAKE_TEST_SILENCE_MS` shortens `SILENCE` to that many milliseconds (at least 6) and
+/// `KEEP_ALIVE` to a sixth of it, in the daemon and the client that read it, so that a test of
+/// the silence rule does not take 30 s. It is not a setting for anyone else: it is not in the
+/// README, and nothing sets it in a real run.
+pub fn timing() -> Timing {
+    let silence = std::env::var("MEMBRAKE_TEST_SILENCE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|&ms| ms >= 6)
+        .map_or(SILENCE, Duration::from_millis);
+    Timing {
+        keep_alive: silence / 6,
+        silence,
+    }
+}
 
 /// Printable ASCII only, at most `max` characters: everything else becomes `?`. The text
 /// ends up in one line of a log, a TSV file and a terminal, whoever sent it.
@@ -233,6 +268,14 @@ mod tests {
             assert!(Message::parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(Reply::parse("QUEUED\t1"), None);
+    }
+
+    /// The README promises these two numbers; a running daemon never lets a client reach its
+    /// silence limit because five lines in a row would have to be lost.
+    #[test]
+    fn the_keep_alive_and_the_silence_limit_are_what_the_readme_says() {
+        assert_eq!(SILENCE, Duration::from_secs(30));
+        assert_eq!(KEEP_ALIVE, Duration::from_secs(5));
     }
 
     #[test]

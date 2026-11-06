@@ -3,8 +3,9 @@
 //! stdin, exit code 2 meaning "refused". The README documents a script people paste into
 //! their own setup, so what it says is the contract: if the script is wrong the README is.
 //!
-//! Needs `jq`, as the hook does. Without it (or without README.md, which the nix source does
-//! not include) the test says so and passes.
+//! Needs `jq`, as the hook does, and README.md: the nix build has both (`flake.nix` lists the
+//! README in its source and `jq` among the check inputs), and a test that cannot run fails,
+//! it does not pass.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -72,14 +73,11 @@ const PASSED: Option<i32> = Some(0);
 
 #[test]
 fn the_example_hook_refuses_heavy_commands_that_skip_the_queue_and_nothing_else() {
-    if Command::new("jq").arg("--version").output().is_err() {
-        println!("skipped: jq is not installed, and the hook needs it");
-        return;
-    }
-    let Some(hook) = hook_in_readme() else {
-        println!("skipped: README.md is not part of this source tree");
-        return;
-    };
+    assert!(
+        Command::new("jq").arg("--version").output().is_ok(),
+        "jq is not installed, and the hook needs it"
+    );
+    let hook = hook_in_readme().expect("README.md is part of this source tree");
     let dir = std::env::temp_dir().join(format!("membrake-test-{}-hook", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("membrake-queue.sh");
@@ -100,6 +98,9 @@ fn the_example_hook_refuses_heavy_commands_that_skip_the_queue_and_nothing_else(
         // Quoted text, and commands that only mention a tool.
         ("echo 'tsc -p .'", PASSED),
         ("echo \"it's\" && tsc -p .", REFUSED),
+        // A backslash inside double quotes escapes the next character, a quote included.
+        ("echo \"a \\\"quoted; tsc -p .\\\"\"", PASSED),
+        ("echo \"a \\\"quoted\\\"\"; tsc -p .", REFUSED),
         ("git commit -m \"fix\ntsc crash\"", PASSED),
         ("git status", PASSED),
         ("rg tsc src", PASSED),
@@ -134,6 +135,14 @@ fn the_example_hook_refuses_heavy_commands_that_skip_the_queue_and_nothing_else(
         ("pnpm dlx tsc", REFUSED),
         ("yarn dlx tsgolint", REFUSED),
         ("npm exec -- vitest run", REFUSED),
+        // Options of the runner that take their value as the next word.
+        ("npx --package typescript tsc -p .", REFUSED),
+        ("npx -p typescript tsc", REFUSED),
+        ("pnpm --filter web exec vitest", REFUSED),
+        ("pnpm dlx --package x vitest", REFUSED),
+        ("npx -y --package typescript --package x tsc", REFUSED),
+        ("npx --package typescript prettier --check .", PASSED),
+        ("pnpm --filter web exec prettier .", PASSED),
         ("./node_modules/.bin/tsc -p .", REFUSED),
         // Tools that are not heavy, or not on the list.
         ("cargo fmt --check", PASSED),
