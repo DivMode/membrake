@@ -5,7 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 description = "A memory brake and queue for macOS: queues heavy dev and coding-agent jobs until there is memory for them, freezes runaway ones before the compressor runs out, and kills only at the cliff"
 license = "MIT"
-keywords = ["macos", "memory", "oom", "daemon", "launchd"]
+repository = "https://github.com/DivMode/membrake"
+homepage = "https://github.com/DivMode/membrake"
+readme = "README.md"
+keywords = ["macos", "memory", "oom", "queue", "daemon"]
+exclude = ["assets/demo.gif", "assets/demo.tape", ".github/"]
 categories = ["command-line-utilities", "os::macos-apis"]
 
 [dependencies]
