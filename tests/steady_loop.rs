@@ -314,7 +314,9 @@ fn steady_loop_with_one_client_waiting_and_one_running_does_not_allocate() {
         .unwrap(),
     );
     let mut time = 1000.0;
-    // Memory is calm, or tight enough to hold a request (nothing the brake acts on).
+    // Memory is calm, or tight enough to hold a request (nothing the brake acts on). Returns
+    // on how many samples so far the queue's work was done: a sample on which the socket
+    // thread had the queue leaves it for the next, and costs the queue nothing.
     let mut tick = |level: i32| {
         let mut s = signals::read().expect("live signals");
         time += 1.0;
@@ -325,6 +327,7 @@ fn steady_loop_with_one_client_waiting_and_one_running_does_not_allocate() {
         s.pressure = Pressure::Normal;
         s.headroom = s.ram * 4;
         runner.tick(&s);
+        runner.queue().map_or(0, Broker::scheduled)
     };
     let status = || broker::read_queue(&state_dir).ok().flatten();
     let until = |what: &str, tick: &mut dyn FnMut(), done: &mut dyn FnMut() -> bool| {
@@ -340,23 +343,35 @@ fn steady_loop_with_one_client_waiting_and_one_running_does_not_allocate() {
     let running = Client::spawn(&socket);
     until(
         "the command to run and be measured",
-        &mut || tick(80),
+        &mut || {
+            tick(80);
+        },
         &mut || status().is_some_and(|q| q.running.iter().any(|r| r.pgid > 1 && r.peak > 0)),
     );
     // ...and, with memory tight, the next client is held.
     let waiting = Client::spawn(&socket);
-    until("the second client to wait", &mut || tick(35), &mut || {
-        status().is_some_and(|q| q.waiting.len() == 1)
-    });
+    until(
+        "the second client to wait",
+        &mut || {
+            tick(35);
+        },
+        &mut || status().is_some_and(|q| q.waiting.len() == 1),
+    );
     // Warm: the measured peak has stopped moving, so the status file has stopped changing.
     let mut still = 0;
     let mut last = status().map(|q| q.running[0].peak);
-    until("the measured size to settle", &mut || tick(35), &mut || {
-        let now = status().map(|q| q.running[0].peak);
-        still = if now == last { still + 1 } else { 0 };
-        last = now;
-        still >= 50
-    });
+    until(
+        "the measured size to settle",
+        &mut || {
+            tick(35);
+        },
+        &mut || {
+            let now = status().map(|q| q.running[0].peak);
+            still = if now == last { still + 1 } else { 0 };
+            last = now;
+            still >= 50
+        },
+    );
 
     // The instrument must be able to see an allocation, or a zero below means nothing.
     let probe = ALLOCATIONS.with(Cell::get);
@@ -365,11 +380,27 @@ fn steady_loop_with_one_client_waiting_and_one_running_does_not_allocate() {
         ALLOCATIONS.with(Cell::get) > probe,
         "the counting allocator is not counting"
     );
+    // Measured over 200 samples on which the queue's work was done, however many samples
+    // that takes: a sample that skipped it (the socket thread had the queue) proves nothing
+    // about the work, and is not one of the 200.
+    let first = tick(35);
     let before = ALLOCATIONS.with(Cell::get);
-    for _ in 0..200 {
-        tick(35);
+    let (mut scheduled, mut samples) = (first, 0u32);
+    while scheduled - first < 200 {
+        samples += 1;
+        assert!(
+            samples < 5000,
+            "the queue's work was done on only {} samples of {samples}",
+            scheduled - first
+        );
+        scheduled = tick(35);
     }
     let allocated = ALLOCATIONS.with(Cell::get) - before;
+    assert_eq!(
+        scheduled - first,
+        200,
+        "200 samples of the queue's work were measured"
+    );
     let queue = status().expect("a status file");
     assert!(
         queue.running.len() == 1 && queue.waiting.len() == 1,

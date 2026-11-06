@@ -44,6 +44,27 @@ impl<T: Send + 'static> Spool<T> {
         name: &str,
         capacity: usize,
         mut work: impl FnMut(T) + Send + 'static,
+        lost: impl FnMut(u64) + Send + 'static,
+    ) -> io::Result<Spool<T>> {
+        Spool::spawn_idling(
+            name,
+            capacity,
+            move |item| {
+                if let Some(item) = item {
+                    work(item);
+                }
+            },
+            lost,
+        )
+    }
+
+    /// `spawn`, for a thread with something of its own to do when nothing is offered, such as
+    /// writing again what could not be written: `work` is called with None each time a second
+    /// goes by with the queue empty.
+    pub fn spawn_idling(
+        name: &str,
+        capacity: usize,
+        mut work: impl FnMut(Option<T>) + Send + 'static,
         mut lost: impl FnMut(u64) + Send + 'static,
     ) -> io::Result<Spool<T>> {
         let (queue, inbox) = mpsc::sync_channel(capacity);
@@ -60,12 +81,15 @@ impl<T: Send + 'static> Spool<T> {
                         report(&counter, &mut lost);
                         match inbox.recv_timeout(Duration::from_secs(1)) {
                             Ok(item) => item,
-                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Timeout) => {
+                                work(None);
+                                continue;
+                            }
                             Err(RecvTimeoutError::Disconnected) => break,
                         }
                     }
                 };
-                work(item);
+                work(Some(item));
             }
             report(&counter, &mut lost);
         })?;

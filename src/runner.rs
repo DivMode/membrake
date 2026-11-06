@@ -32,15 +32,87 @@ const WARN_EVERY: f64 = 60.0;
 const FAILSAFE_AFTER: f64 = 60.0;
 /// A SIGSTOP takes a moment to show in the process table; do not judge a fresh freeze.
 const STOP_GRACE: f64 = 2.0;
-/// The least time frozen work holds the queue after memory last was tight; see `tick`.
-const HOLD_MIN: f64 = 120.0;
+/// How long, in total, a record membrake cannot resolve may hold the queue; see `Holds`.
+const UNRESOLVED_HOLD: f64 = 300.0;
 
-/// Whether `held` frozen jobs or records hold the queue, `calm` seconds after memory was
-/// last tight: for as long as resuming them all could take (five calm samples, then one
-/// per settle period), and at least `HOLD_MIN`.
-fn queue_held(held: usize, calm: f64, settle: f64) -> bool {
-    let resume_window = (settle * (held as f64 + 2.0) + 5.0).max(HOLD_MIN);
-    held > 0 && calm <= resume_window
+/// A record that cannot be resolved: membrake cannot tell whether its group is still the
+/// recorded one, or cannot continue it, or has not got all of it on disk.
+struct Unresolved {
+    pgid: i32,
+    /// Seconds it was unresolved, over all the times it was.
+    total: f64,
+    /// When it was last seen unresolved, if that was on the latest sample. The time since
+    /// then counts; a sample on which it was not unresolved ends the span, not the total.
+    last_seen: Option<f64>,
+    /// It has used up `UNRESOLVED_HOLD`, and that was said.
+    spent: bool,
+}
+
+/// What holds the admission queue back: frozen work, so that it resumes before new work
+/// starts.
+///
+/// A frozen job the engine tracks and whose last check read it stopped holds the queue until
+/// it is resumed or killed, however long the engine takes to get to it (one job per settle
+/// period, and only after memory has been calm for a while). That is no one's mistake, so it
+/// has no timeout; a window computed from the number of jobs left, which shrinks as they are
+/// resumed, released the queue before the last of twenty came back.
+///
+/// A record membrake cannot resolve is different: a group it can no longer inspect, a
+/// SIGCONT that keeps failing, a record not completely on disk. It is kept and tried again on
+/// every sample, but it holds the queue for `UNRESOLVED_HOLD` seconds in total, over all the
+/// times it was unresolved. How long memory has been calm, or tight again, does not come into
+/// it: a sample of pressure every few minutes must not renew a hold that has failed.
+struct Holds {
+    unresolved: Vec<Unresolved>,
+}
+
+impl Holds {
+    /// Whether the queue is held at `now`. `healthy`: a frozen job is tracked and as far as
+    /// anyone knows stopped. `stuck`: the records that are unresolved on this sample.
+    /// `exists` says which records there still are; `spent` is called, once ever for each,
+    /// with the record whose hold has run out.
+    fn update(
+        &mut self,
+        now: f64,
+        healthy: bool,
+        stuck: impl Iterator<Item = i32>,
+        exists: impl Fn(i32) -> bool,
+        mut spent: impl FnMut(i32),
+    ) -> bool {
+        let mut held = healthy;
+        for pgid in stuck {
+            let at = self
+                .unresolved
+                .iter()
+                .position(|u| u.pgid == pgid)
+                .unwrap_or_else(|| {
+                    self.unresolved.push(Unresolved {
+                        pgid,
+                        total: 0.0,
+                        last_seen: None,
+                        spent: false,
+                    });
+                    self.unresolved.len() - 1
+                });
+            let u = &mut self.unresolved[at];
+            if let Some(since) = u.last_seen {
+                u.total += (now - since).max(0.0);
+            }
+            u.last_seen = Some(now);
+            if u.total < UNRESOLVED_HOLD {
+                held = true;
+            } else if !std::mem::replace(&mut u.spent, true) {
+                spent(pgid);
+            }
+        }
+        self.unresolved.retain_mut(|u| {
+            if u.last_seen != Some(now) {
+                u.last_seen = None;
+            }
+            exists(u.pgid)
+        });
+        held
+    }
 }
 
 /// Consecutive checks a frozen job must look continued before membrake believes it. A
@@ -129,8 +201,11 @@ pub struct Runner {
     last_unresolved: f64,
     /// Frozen groups seen not fully stopped, and on how many consecutive checks.
     outside: Vec<(i32, u32)>,
-    /// When memory was last tight (uptime): how long frozen work may hold the queue.
-    last_tight: f64,
+    /// Frozen groups whose last check could not tell what became of them.
+    unknown: Vec<i32>,
+    /// What keeps the admission queue waiting, and whether it does as of the last sample.
+    holds: Holds,
+    held: bool,
     /// Buffers for looking at the frozen groups, allocated once.
     inspector: Inspector,
     /// Events of the tick in progress, written after all of its signals are sent.
@@ -332,7 +407,11 @@ impl Runner {
             state,
             last_unresolved: f64::NEG_INFINITY,
             outside: Vec::new(),
-            last_tight: f64::NEG_INFINITY,
+            unknown: Vec::new(),
+            holds: Holds {
+                unresolved: Vec::new(),
+            },
+            held: false,
             inspector: Inspector::new(),
             events: Vec::new(),
             queue: None,
@@ -367,6 +446,61 @@ impl Runner {
         self.state.as_ref().is_some_and(|s| !s.records().is_empty())
     }
 
+    /// Whether frozen work held the admission queue back on the last sample.
+    pub fn queue_held(&self) -> bool {
+        self.held
+    }
+
+    /// The admission queue, if one is served.
+    pub fn queue(&self) -> Option<&Broker> {
+        self.queue.as_ref()
+    }
+
+    /// Decides whether frozen work holds the queue (see `Holds`) and says when a record
+    /// has used up its hold.
+    fn update_hold(&mut self, s: &Signals) {
+        let (records, pending) = match &self.state {
+            Some(state) => (state.records(), state.pending()),
+            None => (&[][..], &[][..]),
+        };
+        let engine = &self.engine;
+        let tracked = |pgid: i32| engine.frozen().iter().any(|f| f.job.pgid == pgid);
+        self.unknown.retain(|&pgid| tracked(pgid));
+        let unknown = &self.unknown;
+        let unresolved = |pgid: i32| unknown.contains(&pgid) || pending.contains(&pgid);
+        let healthy = engine.frozen().iter().any(|f| !unresolved(f.job.pgid));
+        // A record the engine is not tracking is one a resume or a kill could not finish.
+        let stuck = records
+            .iter()
+            .map(|r| r.pgid)
+            .filter(|&pgid| !tracked(pgid) || unresolved(pgid));
+        let events = &mut self.events;
+        self.held = self.holds.update(
+            s.time,
+            healthy,
+            stuck,
+            |pgid| records.iter().any(|r| r.pgid == pgid),
+            |pgid| {
+                let text = format!(
+                    "group {pgid} has been unresolved for {UNRESOLVED_HOLD} s; it stays recorded and is tried again on every sample, but no longer holds the queue"
+                );
+                events.push(Event::note(s.wall, "warn", text));
+            },
+        );
+    }
+
+    /// Writes again the records of stopped groups that are not completely on disk, with
+    /// everything the groups hold now.
+    fn complete_records(&mut self, s: &Signals) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        for pgid in state.finish_pending(&mut self.inspector) {
+            let text = format!("group {pgid}: every member is recorded now (a retry)");
+            self.events.push(Event::note(s.wall, "warn", text));
+        }
+    }
+
     /// One sample: ask the engine, send every signal that leads to, and only then describe
     /// them. Allocation-free when there is nothing to do, frozen jobs included.
     pub fn tick(&mut self, s: &Signals) {
@@ -385,25 +519,12 @@ impl Runner {
         for action in &step.actions {
             self.perform(action, s, scanned);
         }
+        self.complete_records(s);
         self.check_frozen(s);
         self.retry_unresolved(s);
-        // Anything frozen, recorded or not yet confirmed resumed, holds the queue, so frozen
-        // work resumes before new work starts. But only for as long as resuming could take:
-        // memory calm for five samples, then one job per settle period. A record still there
-        // after that, with memory calm the whole time, is one membrake cannot resume (a
-        // group it can no longer recognise, a SIGCONT that keeps failing); it is kept and
-        // retried, but it must not hold every `membrake exec` on the machine forever.
-        if step.tight {
-            self.last_tight = s.time;
-        }
-        let held = self
-            .engine
-            .frozen()
-            .len()
-            .max(self.state.as_ref().map_or(0, |st| st.records().len()));
-        let frozen = queue_held(held, s.time - self.last_tight, self.opts.policy.settle);
+        self.update_hold(s);
         if let Some(queue) = self.queue.as_mut() {
-            for (kind, text) in queue.tick(s, step.tight, frozen) {
+            for (kind, text) in queue.tick(s, step.tight, self.held) {
                 self.events.push(Event::note(s.wall, kind, text));
             }
         }
@@ -481,6 +602,7 @@ impl Runner {
             }
         };
         let still_recorded = state.record(job.pgid).is_some();
+        let unrecorded = state.pending().contains(&job.pgid);
         let (kind, text) = describe(action);
         let pgid = job.pgid;
         match outcome {
@@ -497,6 +619,12 @@ impl Runner {
                     text,
                     hook: Some(job.clone()),
                 });
+                if unrecorded {
+                    let text = format!(
+                        "group {pgid} is stopped, but its record could not be completed on disk; it is kept in memory and written again on every sample"
+                    );
+                    self.events.push(Event::note(signals::wall(), "warn", text));
+                }
                 if matches!(done, Done::Survivors) {
                     let text = format!(
                         "group {pgid} still has processes after SIGKILL; it stays recorded and is continued until it is gone"
@@ -543,7 +671,15 @@ impl Runner {
             let Some(rec) = state.record(pgid) else {
                 continue;
             };
-            match act::frozen_state(rec, &mut self.inspector) {
+            let found = act::frozen_state(rec, &mut self.inspector);
+            if matches!(found, FrozenState::Unknown) {
+                if !self.unknown.contains(&pgid) {
+                    self.unknown.push(pgid);
+                }
+            } else {
+                self.unknown.retain(|&g| g != pgid);
+            }
+            match found {
                 FrozenState::Stopped => self.outside.retain(|&(g, _)| g != pgid),
                 FrozenState::ResumedOutside => {
                     let seen = match self.outside.iter_mut().find(|(g, _)| *g == pgid) {
@@ -913,31 +1049,134 @@ mod tests {
         }
     }
 
-    /// A runner whose engine has, through the real freeze path, frozen `job` at engine time
-    /// 101 (two tight samples).
-    /// Frozen work holds the queue while it could still be resumed, and no longer: a record
-    /// membrake cannot resume must not hold every `membrake exec` forever.
-    #[test]
-    fn frozen_work_holds_the_queue_only_while_it_could_still_be_resumed() {
-        assert!(!queue_held(0, 0.0, 10.0), "nothing frozen holds nothing");
-        assert!(queue_held(1, 0.0, 10.0), "frozen while tight holds");
-        assert!(
-            queue_held(1, 119.0, 10.0),
-            "at least HOLD_MIN after the last tight sample"
-        );
-        assert!(
-            !queue_held(1, 121.0, 10.0),
-            "a stuck record stops holding after that"
-        );
-        // Twenty frozen jobs take 20 settle periods to resume: they hold for that long.
-        assert!(queue_held(20, 200.0, 10.0));
-        assert!(!queue_held(20, 230.0, 10.0));
-        assert!(
-            !queue_held(1, f64::INFINITY, 10.0),
-            "never tight: nothing to wait for"
-        );
+    /// A job the engine can be handed; nothing of it exists.
+    fn fake_job(pgid: i32) -> Job {
+        Job {
+            pgid,
+            leader_pid: pgid,
+            start_us: 1_000 + u64::try_from(pgid).unwrap(),
+            uid: 501,
+            bytes: 4 << 30,
+            procs: 1,
+            prefer: false,
+            protected: false,
+            stopped: false,
+            command: format!("job-{pgid}"),
+        }
     }
 
+    /// Frozen work holds the queue until it is resumed, however long that takes. Twenty jobs
+    /// frozen together come back one per settle period, after five calm samples: the last
+    /// at about 195 s. The queue stays held at every sample until then, and not after. (A
+    /// window worked out from the number of jobs left, as it was, ran out with six still
+    /// frozen, at about 120 s.)
+    #[test]
+    fn twenty_frozen_jobs_hold_the_queue_until_the_last_is_resumed() {
+        let dir = scratch("hold-twenty");
+        let opts = RunOptions {
+            policy: Policy::default(),
+            rules: Rules::new(&[], &[], vec![], vec![], 0).unwrap(),
+            term_seconds: 1.0,
+            on_event: None,
+        };
+        let state = State::open(&dir.join("state")).unwrap();
+        let mut r = Runner::new(opts, Some(state), Recorder::new(&dir.join("log")));
+        let jobs: Vec<Job> = (1..=20).map(|i| fake_job(900 + i)).collect();
+
+        // The cliff in view: every job is frozen at once.
+        for time in [0.0, 1.0] {
+            let s = Signals {
+                segments: 0.86,
+                ..signals_at(time)
+            };
+            r.engine.step(&s, || jobs.clone());
+            r.update_hold(&s);
+        }
+        assert_eq!(r.engine.frozen().len(), 20);
+        assert!(r.queue_held());
+
+        let mut last_resume = 0.0;
+        for time in 2..400 {
+            let s = calm_at(f64::from(time));
+            let step = r.engine.step(&s, Vec::new);
+            if step
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Resume { .. }))
+            {
+                last_resume = s.time;
+            }
+            r.update_hold(&s);
+            assert_eq!(
+                r.queue_held(),
+                !r.engine.frozen().is_empty(),
+                "at {time} s, with {} jobs still frozen",
+                r.engine.frozen().len()
+            );
+        }
+        assert!(last_resume > 190.0, "the last resume was at {last_resume}");
+        assert!(r.engine.frozen().is_empty() && !r.queue_held());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record membrake cannot resolve (here: its group cannot be looked at, whatever it is
+    /// asked) holds the queue for 300 s in total and no longer, and a sample of pressure
+    /// every 110 s does not renew the hold: it stays recorded and retried, and the end of
+    /// its hold is said once. (Measured from the last tight sample, as it was, a hold
+    /// renewed every 110 s was never over.)
+    #[test]
+    fn a_record_that_cannot_be_resolved_stops_holding_the_queue_after_300_seconds_of_it() {
+        let dir = scratch("hold-stuck");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut r = runner_with_frozen(&dir, &job);
+        assert!(sleeper.settles(true));
+        fault::arm(&fault::LIST, 1_000_000);
+
+        // One second apart from engine time 102. Tight, with the compressor quiet (nothing for
+        // the brake to do), on every 110th sample.
+        let mut first_free = None;
+        for i in 0..450u32 {
+            let time = 102.0 + f64::from(i);
+            let s = if i % 110 == 109 {
+                Signals {
+                    segments: 0.1,
+                    ..signals_at(time)
+                }
+            } else {
+                calm_at(time)
+            };
+            r.tick(&s);
+            match first_free {
+                None if !r.queue_held() => first_free = Some(i),
+                None => {}
+                Some(_) => assert!(!r.queue_held(), "held again at sample {i}"),
+            }
+        }
+        // The first sample it could not be looked at is 103 s (the freeze is 2 s old, and is
+        // not looked at before); 300 s later its hold has run out.
+        assert_eq!(
+            first_free,
+            Some(301),
+            "300 s after the first sample it was unresolved"
+        );
+        assert!(r.has_records(), "and it is still recorded");
+        let said = events(&mut r, &dir);
+        assert_eq!(
+            said.matches("no longer holds the queue").count(),
+            1,
+            "{said}"
+        );
+
+        // It is still tried on every sample: once it can be looked at, it is resumed.
+        fault::arm(&fault::LIST, 0);
+        r.tick(&calm_at(600.0));
+        assert!(sleeper.settles(false) && !r.has_records());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A runner whose engine has, through the real freeze path, frozen `job` at engine time
+    /// 101 (two tight samples).
     fn runner_with_frozen(dir: &Path, job: &Job) -> Runner {
         let opts = RunOptions {
             policy: Policy::default(),

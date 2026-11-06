@@ -9,8 +9,9 @@
 <h1 align="center">membrake</h1>
 
 <p align="center">
-  <b>A memory brake for macOS.</b><br>
-  Freezes runaway dev and coding-agent jobs before your Mac freezes. Kills only at the cliff.
+  <b>A memory brake and queue for macOS.</b><br>
+  Queues heavy dev and coding-agent jobs until there is memory for them, freezes runaway ones
+  before your Mac freezes, and kills only at the cliff.
 </p>
 
 <p align="center">
@@ -21,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img alt="membrake status, then a replay of a simulated crunch: four agent type-checks are frozen while a CI shard keeps running, resumed one at a time when memory recovers, and a runaway release build is frozen before it reaches the kill line" src="assets/demo.gif" width="85%">
+  <img alt="membrake status, then a replay of a simulated crunch, which shows the brake: four agent type-checks are frozen while a CI shard keeps running, resumed one at a time when memory recovers, and a runaway release build is frozen before it reaches the kill line. The queue, which keeps such jobs waiting until there is memory for them, is described below" src="assets/demo.gif" width="85%">
 </p>
 
 ---
@@ -66,9 +67,22 @@ help:
 
 ## How it works
 
-membrake is a small daemon that samples the kernel once a second and acts on
-**jobs**: process groups, which is how shells and coding agents start every
-command. A type-check, a test run or a build, with all its workers, is one job.
+membrake is a small daemon that samples the kernel once a second. It is a queue
+and a brake, working from the same view of memory:
+
+- **The queue** keeps heavy commands from starting into a Mac that has no room for
+  them. Run a type-check, a test run or a build as `membrake exec -- <command>`
+  and it waits in line until there is memory for it, then starts. Admission is by
+  memory, not by a fixed count. See [Queue](#queue-membrake-exec).
+- **The brake** deals with memory that runs short all the same: it freezes runaway
+  jobs before the Mac freezes, and kills only at the cliff.
+
+They are one ordered system: while the brake holds a frozen job the queue admits
+nothing, so frozen work comes back before new work starts.
+
+Both act on **jobs**: process groups, which is how shells and coding agents start
+every command. A type-check, a test run or a build, with all its workers, is one
+job. The rest of this section is the brake.
 
 ```mermaid
 stateDiagram-v2
@@ -139,19 +153,24 @@ or killed, and is continued if it was frozen.
 ### Built to be trusted
 
 - Every `SIGSTOP` is written to disk **before** it is sent, the one that starts
-  a kill included. If membrake stops, crashes, panics or restarts, it resumes
-  every job it stopped before doing anything else, and it resumes everything if
-  it ever loses sight of memory for a minute.
+  a kill included, and completed right after it: a stopped process cannot fork,
+  so the group is looked at again and every member it has then is recorded. If
+  that second write fails the group stays stopped and the complete record stays in
+  memory, written again on every sample, and the shutdown and the panic recovery
+  resume the group from it. If membrake stops, crashes, panics or restarts, it
+  resumes every job it stopped before doing anything else, and it resumes
+  everything if it ever loses sight of memory for a minute.
 - A job's record is dropped only once the job is confirmed gone or `SIGCONT`
   has been sent. A resume that fails, or a job that cannot be inspected, leaves
   the record and is tried again on every sample until it works.
 - Before every signal it looks at the group again and checks it is still the
   one it chose: the leader's pid and start time; or, if the leader is gone, a
-  process the freeze was sent to (the record lists every member's pid and start
-  time, so a child forked after the scan is found too), a member older than the
-  scan, or a child of a recorded process. A recycled process group has none of
-  these and a running one is never signalled. A group that none of this
-  recognises but in which a member is stopped is not treated as gone either:
+  process the stop was sent to (the record lists every member's pid and start
+  time, the ones born between the scan and the stop included) or a member older
+  than the scan. Whose child a process is does not count: a process that left the
+  group can start a new one that is given the old group's pid. A recycled process
+  group has none of these and a running one is never signalled. A group that none
+  of this recognises but in which a member is stopped is not treated as gone either:
   the record stays, nothing is signalled, and it is looked at again on every
   sample, because the stopped members may be the ones membrake stopped.
   `SIGKILL` goes to each member by its own pid after its start time is read
@@ -165,13 +184,16 @@ or killed, and is continued if it was frozen.
   the queue's `queue.tsv` and `sizes.tsv` to a third. If a disk stalls what does
   not fit is dropped and counted, and the count is logged when the thread
   catches up, so a stuck file never delays a freeze, a kill, a sample or a
-  client, and holds up only the thread that writes it. The sampling thread writes
-  one file itself: the state file that lists the frozen jobs, flushed to disk
-  before a `SIGSTOP` and when a record is dropped, which is what lets a restart
-  resume them. The queue's socket thread writes none. (At start-up the daemon
-  reads `sizes.tsv`; at shutdown it removes the socket.) Events are copied to
-  stdout only when it is a terminal: under launchd stdout is a file that
-  `newsyslog` cannot rotate, and `events.log` has them all.
+  client, and holds up only the thread that writes it. A queue file that could
+  not be written is not forgotten: the thread keeps the latest snapshot and
+  writes it again every 5 s, and whenever it is given a newer one, until a write
+  works. The sampling thread writes one file itself: the state file that lists
+  the frozen jobs, flushed to disk before a `SIGSTOP` and when a record is
+  dropped, which is what lets a restart resume them. The queue's socket thread
+  writes none. (At start-up the daemon reads `sizes.tsv`; at shutdown it removes
+  the socket.) Events are copied to stdout only when it is a terminal: under
+  launchd stdout is a file that `newsyslog` cannot rotate, and `events.log` has
+  them all.
 - Timers run on awake time, so a lid-close never makes a job look "frozen too
   long".
 - `--dry-run` logs every decision and sends no signals.
@@ -184,23 +206,40 @@ or killed, and is continued if it was frozen.
   The sampling thread never waits for the queue's socket thread: it only tries
   the lock they share, and leaves the queue's share of a sample for the next one
   if the socket thread has it. A job frozen past the limit while memory is still
-  tight is killed on the first sample it is overdue, whatever the settle period
-  and however often new jobs are being frozen (unless an emergency arm kills
-  another job on that very sample, and then the sample after). The daemon lifts
-  itself out of jetsam band 0 so macOS can't kill the guard first.
+  tight is killed on the first sample it is overdue, whatever the settle period,
+  however often new jobs are being frozen, and even when an emergency arm fires on
+  that sample: the emergency's kill is then the overdue job, ahead of any other,
+  with no grace like any emergency kill. The daemon lifts itself out of jetsam
+  band 0 so macOS can't kill the guard first.
+- The queue never blocks work and is never in the way of the brake. If the daemon
+  is missing, refuses, hangs up or does not answer within 10 s, `membrake exec`
+  runs the command at once. The daemon only ever measures the groups of admitted
+  commands and never signals them, and what a client says about its command is
+  checked against the kernel: the group's leader must be a child of the process
+  that connected (still that process, by its pid and start time), of the same user,
+  started after the go-ahead. Frozen work holds the queue until the brake has
+  resumed or killed it, however long that takes; a record membrake cannot resolve
+  holds it for 300 s in total, and then stays recorded and retried without holding
+  anyone.
 - Samples and events are recorded (a stalled disk drops what does not fit, and
   the log says how many), and `membrake replay` runs a recording back through
   the policy, which is how the policy is tested.
 
 ## Compared with
 
-| | Freezes before killing | Acts on whole jobs | Watches the compressor | Protects CI and apps | Language |
-|---|:-:|:-:|:-:|:-:|---|
-| **membrake** | ✅ | ✅ | ✅ | ✅ | Rust |
-| [oomguard](https://github.com/trentshaines/oomguard) | ❌ (stops only to kill) | ✅ | ✅ | ⚠️ (terminals by name) | Swift |
-| [earlyoom-rs-mac](https://github.com/haydenflinner/earlyoom-rs-mac) | ❌ | ❌ (largest process) | ❌ (pressure level) | ❌ | Rust |
-| [macos-oom-guard](https://github.com/fl4p/macos-oom-guard) | ❌ | ⚠️ (after a respawn) | ❌ (`memorystatus_level`) | ✅ | Python |
-| Fixed concurrency queue (`sem`, slots) | — | — | ❌ | — | — |
+| | Queues new jobs by memory | Freezes before killing | Acts on whole jobs | Watches the compressor | Protects CI and apps | Language |
+|---|:-:|:-:|:-:|:-:|:-:|---|
+| **membrake** | ✅ | ✅ | ✅ | ✅ | ✅ | Rust |
+| [oomguard](https://github.com/trentshaines/oomguard) | ❌ | ❌ (stops only to kill) | ✅ | ✅ | ⚠️ (terminals by name) | Swift |
+| [earlyoom-rs-mac](https://github.com/haydenflinner/earlyoom-rs-mac) | ❌ | ❌ | ❌ (largest process) | ❌ (pressure level) | ❌ | Rust |
+| [macos-oom-guard](https://github.com/fl4p/macos-oom-guard) | ❌ | ❌ | ⚠️ (after a respawn) | ❌ (`memorystatus_level`) | ✅ | Python |
+| Fixed concurrency queue (`sem`, slots) | ⚠️ (by count, not by memory) | — | — | ❌ | — | — |
+| [Buck2](https://github.com/facebook/buck2) (a build system) | ✅ (its own builds only) | — | — | — | — | Rust |
+
+None of the Mac memory tools above queues new jobs by memory; they act once memory
+has run short. Buck2 does, inside its own builds (its local resource control, which
+membrake's queue is ported from); it knows nothing of the commands you start
+outside it.
 
 ## Install
 
@@ -259,7 +298,8 @@ membrake replay samples.tsv    # run a recording back through the policy
 | `--dry-run` | off | Decide and log, send nothing |
 
 The demo above is `membrake replay assets/simulated-crunch.tsv`: a simulated
-crunch, not a recording of a real machine, so you can run it yourself.
+crunch, not a recording of a real machine, so you can run it yourself. It shows
+the brake; the queue is `membrake exec`, below.
 
 ### Telling your agent
 
@@ -297,8 +337,13 @@ membrake: queued for memory (position 2, needs 1.0 GB)
 
 Requests wait in order, and the next one starts only when **all** of this holds:
 
-- memory is not tight (the brake's own test), and the brake holds no frozen job:
-  the queue and the brake are one ordered system;
+- memory is not tight (the brake's own test), and the brake holds no frozen job
+  (from the moment it freezes one until it has resumed or killed it, however long
+  that takes): the queue and the brake are one ordered system. The exception is
+  a record membrake cannot resolve, such as a group it can no longer inspect or
+  a `SIGCONT` that keeps failing. It stays recorded and is retried on every sample,
+  but it holds the queue for 300 s in total, however often memory is tight again
+  meanwhile, and the daemon logs once when it stops;
 - at least 3 s have passed since the last start, because a started job takes
   seconds to show in the numbers;
 - `used + need < cap`. `used` is the memory the kernel does not count as
@@ -326,8 +371,10 @@ arguments (`bun run test`, `tsc web`). The daemon measures the peak footprint of
 each admitted command's process group and keeps a moving average in
 `sizes.tsv` in the state directory, for up to 1000 signatures. The client says
 which group its command runs as, once, after it was told to go; the daemon
-accepts it only if the group's leader is a child of that client, of the same
-user, started after the go-ahead, and measures only that process's group. Any
+accepts it only if the group's leader is a child of that client (the process that
+connected: the daemon noted its pid and start time when it accepted the
+connection, and a pid that has since gone to another process is not it), of the
+same user, started after the go-ahead, and measures only that process's group. Any
 other group, or a second report, is an error and a closed connection, and
 nothing is learned from it.
 
@@ -398,20 +445,37 @@ waiting for.
 
 To hold Claude Code to it rather than ask, add a `PreToolUse` hook that refuses
 heavy commands that do not go through the queue. A minimal one
-(`~/.claude/hooks/membrake-queue.sh`, executable; needs `jq`):
+(`~/.claude/hooks/membrake-queue.sh`, executable; POSIX `sh` and `jq`):
 
 ```sh
 #!/bin/sh
-# Refuse heavy commands that skip the memory queue. Exit 2 blocks the command
-# and shows the message to Claude.
+# Refuse heavy commands that skip the memory queue. Exit 2 blocks the command and
+# shows the message to Claude.
+heavy='(tsc|tsgo|tsgolint|vitest|jest|xcodebuild|cargo (build|test|clippy)|swift (build|test)|(bun|pnpm|npm|yarn) (test|run (test|check|typecheck|verify|build)(:[^ ]*)?))'
+via='((npx|bunx|bun x|pnpm exec|pnpm dlx|yarn exec|yarn dlx|npm exec)( -[^ ]*)* )?'
 cmd=$(jq -r '.tool_input.command // empty')
-case "$cmd" in
-  *"membrake exec"*) exit 0 ;;
-esac
-if printf '%s\n' "$cmd" | grep -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(tsc|tsgo|tsgolint|vitest|jest|xcodebuild|cargo (build|test|clippy)|swift (build|test)|(bun|pnpm|npm|yarn) (test|run (test|check|typecheck|build|verify)))([[:space:]]|$)'; then
+# Quoted text is not a command: replace each quoted string with _ (the first quote
+# of either kind starts one; a line end inside it does not end it). Then cut the
+# command into segments at ; & | ( ) and line ends.
+segments=$(printf '%s' "$cmd" | tr '\n' '\001' |
+  sed -E "s/'[^']*'|\"[^\"]*\"/_/g" | tr ';&|()\001' '\n\n\n\n\n\n')
+printf '%s\n' "$segments" | while IFS= read -r segment; do
+  set -f; set -- $segment; set +f   # words; extra whitespace is gone
+  while [ $# -gt 0 ]; do            # leading VAR=value assignments are not the program
+    case $1 in [A-Za-z_]*=*) shift ;; *) break ;; esac
+  done
+  [ $# -gt 0 ] || continue
+  line="$*"
+  case $line in
+    "membrake exec"|"membrake exec "*|"cpu-lock run"|"cpu-lock run "*) continue ;;
+  esac
+  if printf '%s\n' "$line" | grep -Eq "^$via([^ ]*/)?$heavy( |\$)"; then
+    exit 1
+  fi
+done || {
   echo "Heavy command outside the memory queue: run it as membrake exec --label \"<what>\" -- <command> (in the background if it may wait)." >&2
   exit 2
-fi
+}
 exit 0
 ```
 
@@ -430,8 +494,21 @@ and register it in `~/.claude/settings.json`:
 }
 ```
 
-A pattern match like this stops habits and mistakes, not a determined
-workaround. Extend the list to your own tools.
+The hook judges each segment of the command on its own. It refuses a segment whose
+program, after any leading `VAR=value` assignments, is one of the listed tools,
+alone or through `npx`, `bunx`, `pnpm exec`, `yarn dlx` or `npm exec`, with
+a path in front of it if there is one; a segment that starts with `membrake exec` or
+`cpu-lock run` is passed, and so is whatever follows it in that segment. So
+`CI=1 pnpm test` and `cd app && tsc -p .` are refused, `membrake exec -- tsc -p .` and
+`echo 'tsc -p .'` are not, and `membrake exec -- tsc && vitest run` is, for its second
+half.
+
+This is a heuristic for ordinary invocations, not a parser, and it stops habits and
+mistakes, not a determined workaround. It does not look inside quotes, so
+`bash -c 'tsc -p .'` gets through, and a quote that does not pair up can hide the
+command after it. It does not know wrappers other than the ones above (`env`, `time`,
+`nice`), tools reached through a script (`./check.sh`), or tools it was not given
+(`cargo check`, `bun run lint`). Extend the list to your own tools.
 
 ### Codex
 
