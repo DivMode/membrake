@@ -81,7 +81,7 @@ fn sleep_length(left: f64) -> f64 {
 pub fn lock_instance(dir: &Path) -> Result<fs::File, String> {
     fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(0o755)
         .create(dir)
         .map_err(|e| format!("cannot create the state directory {}: {e}", dir.display()))?;
     let path = dir.join(LOCK_FILE);
@@ -187,11 +187,13 @@ pub struct State {
 }
 
 impl State {
-    /// Creates the directory (private to its owner) and loads what a previous run left.
+    /// Creates the directory (readable by every user, so `membrake status` can list frozen
+    /// jobs; it holds only group ids and command lines, which `ps` already shows to all)
+    /// and loads what a previous run left.
     pub fn open(dir: &Path) -> io::Result<State> {
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(0o755)
             .create(dir)?;
         let (records, unparsed) = read_state(dir)?;
         Ok(State {
@@ -227,7 +229,7 @@ impl State {
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
+            .mode(0o644)
             .open(&tmp)?;
         for r in &self.records {
             file.write_all(r.line().as_bytes())?;
