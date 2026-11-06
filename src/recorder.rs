@@ -2,16 +2,18 @@
 //! size-capped with one rotated generation. `replay` reads the TSV back through the engine.
 //!
 //! Nothing here can stop the brake: every write is best effort, and a file that cannot be
-//! opened or reopened is retried on the next write. Events never wait for anything: they are
-//! handed to a logger thread over a bounded queue, and when it is full (the disk is stuck, a
-//! terminal is not being read) the event is dropped and counted, and the count is written when
-//! the logger catches up. The logger thread also does every fsync. What the sampling thread
-//! still does itself is one small append per sample to `samples.tsv`. A gap in the samples
-//! means membrake itself was not running.
+//! opened or reopened is retried on the next write. The sampling thread does no file work
+//! at all. Events go to a logger thread and samples to a thread of their own, each over a
+//! bounded queue; when it is full (the disk is stuck, a terminal is not being read) the event
+//! or sample is dropped and counted, and the count is written when the thread catches up. The
+//! two are separate so that a file that blocks holds up only itself, and each thread does its
+//! own fsyncs. A gap in the samples means membrake itself was not running, or that the disk
+//! was too far behind to take them.
 
 use crate::engine::{Action, Engine, Policy, Step};
 use crate::jobs::{Job, one_line};
 use crate::signals::{self, Pressure, Signals};
+use crate::spool::Spool;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -26,9 +28,15 @@ pub const SAMPLES_FILE: &str = "samples.tsv";
 pub const EVENTS_FILE: &str = "events.log";
 const SAMPLES_CAP: u64 = 32 << 20;
 const EVENTS_CAP: u64 = 8 << 20;
-const SYNC_EVERY: f64 = 10.0;
+const SYNC_EVERY: Duration = Duration::from_secs(10);
+/// A problem with the samples file is said on stderr at most this often.
+const WARN_EVERY: Duration = Duration::from_secs(60);
 /// Events that may wait for the logger thread. Past this they are dropped.
 const EVENT_QUEUE: usize = 256;
+/// Samples that may wait for the sample thread, and so the number of row buffers there are:
+/// at one a second, a disk that stalls for four minutes costs no sample. Past this a sample
+/// is dropped.
+const SAMPLE_QUEUE: usize = 256;
 
 /// `time` is the wall clock (for people); `uptime` is the engine's clock, which `replay`
 /// uses. The next seven columns are the raw readings `replay` feeds the engine; `occupancy`,
@@ -118,11 +126,6 @@ impl Log {
     fn sync(&self) -> io::Result<()> {
         self.file.as_ref().map_or(Ok(()), File::sync_data)
     }
-
-    /// Another descriptor for the same open file, for a thread that syncs it.
-    fn duplicate(&self) -> Option<File> {
-        self.file.as_ref().and_then(|f| f.try_clone().ok())
-    }
 }
 
 fn ends_with_newline(path: &Path, len: u64) -> io::Result<bool> {
@@ -137,9 +140,6 @@ fn ends_with_newline(path: &Path, len: u64) -> io::Result<bool> {
 enum Message {
     /// One finished line of the event log.
     Event(String),
-    /// Sync the samples file too. A duplicate of its descriptor, so the sampling thread
-    /// never waits for the disk.
-    SyncSamples(File),
     /// Answer once everything sent before this has been written and synced.
     Flush(mpsc::Sender<()>),
 }
@@ -174,16 +174,23 @@ fn write_line(events: &mut Log, mirror: bool, line: &str) {
     let _ = events.append(line.as_bytes());
 }
 
+/// An event as a finished line of the event log.
+fn event_line(wall: f64, kind: &str, text: &str) -> String {
+    let mut line = String::new();
+    timestamp(&mut line, wall);
+    let _ = writeln!(line, " {kind} {}", one_line(text, 1000));
+    line
+}
+
 /// The queue is empty: say how many events were dropped while it was full, and make what has
 /// been written durable.
 fn idle(events: &mut Log, dropped: &AtomicU64, mirror: bool, unsynced: &mut bool) {
     let lost = dropped.swap(0, Ordering::Relaxed);
     if lost > 0 {
-        let mut line = String::new();
-        timestamp(&mut line, signals::wall());
-        let _ = writeln!(
-            line,
-            " warn {lost} log event(s) were dropped while the log was not keeping up"
+        let line = event_line(
+            signals::wall(),
+            "warn",
+            &format!("{lost} log event(s) were dropped while the log was not keeping up"),
         );
         write_line(events, mirror, &line);
         *unsynced = true;
@@ -214,9 +221,6 @@ fn log_events(inbox: &Receiver<Message>, mut events: Log, dropped: &AtomicU64, m
                 write_line(&mut events, mirror, &line);
                 unsynced = true;
             }
-            Message::SyncSamples(samples) => {
-                let _ = samples.sync_data();
-            }
             Message::Flush(done) => {
                 idle(&mut events, dropped, mirror, &mut unsynced);
                 let _ = done.send(());
@@ -226,23 +230,114 @@ fn log_events(inbox: &Receiver<Message>, mut events: Log, dropped: &AtomicU64, m
     idle(&mut events, dropped, mirror, &mut unsynced);
 }
 
+/// What the sampling thread says to the thread that writes the samples file.
+enum SampleMsg {
+    /// One finished row. The buffer goes back to the sampling thread once it is written.
+    Line(String),
+    /// Make what has been written durable, around the events queued so far.
+    Sync,
+    /// Answer once everything sent before this has been written and synced.
+    Flush(mpsc::Sender<()>),
+}
+
+/// Starts the thread that writes the samples file. `events` is where it reports what it
+/// drops, and `give_back` where the row buffers go when they are written.
+fn spawn_samples(
+    mut samples: Log,
+    events: Option<SyncSender<Message>>,
+    give_back: SyncSender<String>,
+) -> io::Result<Spool<SampleMsg>> {
+    let (mut last_sync, mut last_warned) = (Instant::now(), None::<Instant>);
+    Spool::spawn(
+        "membrake-samples",
+        SAMPLE_QUEUE,
+        move |row| match row {
+            SampleMsg::Line(mut line) => {
+                if let Err(e) = samples.append(line.as_bytes())
+                    && last_warned.is_none_or(|at| at.elapsed() >= WARN_EVERY)
+                {
+                    last_warned = Some(Instant::now());
+                    // Not eprintln!: that panics when stderr is closed.
+                    let _ = writeln!(io::stderr(), "membrake: cannot record the sample: {e}");
+                }
+                line.clear();
+                let _ = give_back.try_send(line);
+                if last_sync.elapsed() >= SYNC_EVERY {
+                    last_sync = Instant::now();
+                    let _ = samples.sync();
+                }
+            }
+            SampleMsg::Sync => {
+                let _ = samples.sync();
+            }
+            SampleMsg::Flush(done) => {
+                let _ = samples.sync();
+                let _ = done.send(());
+            }
+        },
+        move |lost| {
+            if let Some(events) = &events {
+                let text = format!(
+                    "{lost} sample(s) were dropped while the samples file was not keeping up"
+                );
+                let _ = events.try_send(Message::Event(event_line(signals::wall(), "warn", &text)));
+            }
+        },
+    )
+}
+
 pub struct Recorder {
-    samples: Log,
+    dir: PathBuf,
+    /// None if the thread could not be started: samples are then lost.
+    samples: Option<Spool<SampleMsg>>,
+    /// Row buffers the samples thread has written and handed back, so that a sample takes
+    /// one without allocating.
+    free: Receiver<String>,
+    /// The buffer the next row is formatted into; empty (no capacity) while the last one is
+    /// with the samples thread.
+    line: String,
     /// None if the thread could not be started: events are then lost.
     logger: Option<Logger>,
-    line: String,
-    last_sync: f64,
     /// Events have been queued since the last `sync_events`.
     dirty: bool,
 }
 
+/// How a message fared on its way into a queue.
+enum Sent {
+    Queued,
+    /// The thread has ended: there is nothing to wait for.
+    Gone,
+    /// There was no room before the deadline.
+    Full,
+}
+
+/// Puts `message` into a queue, waiting for room until `deadline`.
+fn send_by<T>(
+    mut try_send: impl FnMut(T) -> Result<(), TrySendError<T>>,
+    mut message: T,
+    deadline: Instant,
+) -> Sent {
+    loop {
+        match try_send(message) {
+            Ok(()) => return Sent::Queued,
+            Err(TrySendError::Full(m)) => message = m,
+            Err(TrySendError::Disconnected(_)) => return Sent::Gone,
+        }
+        if Instant::now() >= deadline {
+            return Sent::Full;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 impl Recorder {
-    /// Never fails: the files open on first use (see `ensure_open` to learn of a problem).
+    /// Never fails: the files open on first use, on the threads that write them (see
+    /// `ensure_open` to learn of a problem with the directory).
     pub fn new(dir: &Path) -> Recorder {
         Recorder::with_caps(dir, SAMPLES_CAP, EVENTS_CAP)
     }
 
-    /// `new`, then open the samples file now so a problem is reported at start-up.
+    /// `new`, then check the directory now so a problem is reported at start-up.
     pub fn open(dir: &Path) -> io::Result<Recorder> {
         let mut rec = Recorder::new(dir);
         rec.ensure_open()?;
@@ -253,37 +348,59 @@ impl Recorder {
         // Events go to stdout only on a terminal. Under launchd stdout is a file that
         // newsyslog cannot rotate while launchd holds it open, and the event log has them all.
         let mirror = io::stdout().is_terminal();
+        let logger = Logger::spawn(Log::new(dir.join(EVENTS_FILE), events_cap, ""), mirror).ok();
+        // One buffer is the recorder's own; the rest wait to be taken.
+        let (give_back, free) = mpsc::sync_channel(SAMPLE_QUEUE + 1);
+        for _ in 1..SAMPLE_QUEUE {
+            let _ = give_back.try_send(String::with_capacity(1024));
+        }
+        let samples = spawn_samples(
+            Log::new(dir.join(SAMPLES_FILE), samples_cap, HEADER),
+            logger.as_ref().map(|l| l.queue.clone()),
+            give_back,
+        )
+        .ok();
         Recorder {
-            samples: Log::new(dir.join(SAMPLES_FILE), samples_cap, HEADER),
-            logger: Logger::spawn(Log::new(dir.join(EVENTS_FILE), events_cap, ""), mirror).ok(),
+            dir: dir.to_path_buf(),
+            samples,
+            free,
             line: String::with_capacity(1024),
-            last_sync: 0.0,
+            logger,
             dirty: false,
         }
     }
 
-    /// Tries to open the samples file (the event log opens on the logger thread, which this
-    /// must not wait for).
+    /// Checks that the directory exists, or can be made. (The files themselves are opened by
+    /// the threads that write them: opening one can block.)
     pub fn ensure_open(&mut self) -> io::Result<()> {
-        self.samples.ensure_open()
+        fs::create_dir_all(&self.dir)
     }
 
-    /// Appends one sample. `jobs` is the candidate list the engine was shown, if it asked
-    /// for one (`Some(&[])` records a scan that found nothing). Allocation-free once the
-    /// line buffer has grown to fit.
-    pub fn sample(&mut self, s: &Signals, step: &Step, jobs: Option<&[Job]>) -> io::Result<()> {
-        format_row(&mut self.line, s, step, jobs);
-        self.samples.append(self.line.as_bytes())?;
-        if s.time - self.last_sync >= SYNC_EVERY {
-            self.last_sync = s.time;
-            self.sync_samples();
+    /// Hands one sample to the thread that writes the samples file. `jobs` is the candidate
+    /// list the engine was shown, if it asked for one (`Some(&[])` records a scan that found
+    /// nothing). Never waits, and allocation-free once the row buffers have grown to fit: if
+    /// the thread has fallen `SAMPLE_QUEUE` samples behind, this one is dropped and counted.
+    pub fn sample(&mut self, s: &Signals, step: &Step, jobs: Option<&[Job]>) {
+        let Some(samples) = &self.samples else {
+            return;
+        };
+        if self.line.capacity() == 0 {
+            match self.free.try_recv() {
+                Ok(line) => self.line = line,
+                Err(_) => return samples.count_dropped(),
+            }
         }
-        Ok(())
+        format_row(&mut self.line, s, step, jobs);
+        if let Err(SampleMsg::Line(line)) =
+            samples.offer(SampleMsg::Line(std::mem::take(&mut self.line)))
+        {
+            self.line = line;
+        }
     }
 
     fn sync_samples(&self) {
-        if let (Some(logger), Some(file)) = (&self.logger, self.samples.duplicate()) {
-            let _ = logger.queue.try_send(Message::SyncSamples(file));
+        if let Some(samples) = &self.samples {
+            let _ = samples.try_send(SampleMsg::Sync);
         }
     }
 
@@ -294,10 +411,10 @@ impl Recorder {
         let Some(logger) = &self.logger else {
             return;
         };
-        let mut line = String::new();
-        timestamp(&mut line, wall);
-        let _ = writeln!(line, " {kind} {}", one_line(text, 1000));
-        match logger.queue.try_send(Message::Event(line)) {
+        match logger
+            .queue
+            .try_send(Message::Event(event_line(wall, kind, text)))
+        {
             Ok(()) => self.dirty = true,
             Err(TrySendError::Full(_)) => {
                 logger.dropped.fetch_add(1, Ordering::Relaxed);
@@ -306,8 +423,8 @@ impl Recorder {
         }
     }
 
-    /// Asks the logger thread to flush the samples around any events queued since the last
-    /// call. Never waits.
+    /// Asks the samples thread to make the samples around any events queued since the last
+    /// call durable. Never waits.
     pub fn sync_events(&mut self) {
         if self.dirty {
             self.dirty = false;
@@ -315,30 +432,41 @@ impl Recorder {
         }
     }
 
-    /// Waits up to `timeout` for the logger thread to write and sync everything queued so far.
-    /// False if it had not by then (its disk or terminal is stuck). For shutdown and tests;
+    /// Waits up to `timeout` for both threads to write and sync everything queued so far.
+    /// False if they had not by then (a disk or terminal is stuck). For shutdown and tests;
     /// the sampling loop never calls this.
     pub fn flush(&self, timeout: Duration) -> bool {
-        let Some(logger) = &self.logger else {
-            return true;
-        };
         let deadline = Instant::now() + timeout;
         let (done, answer) = mpsc::channel();
-        let mut message = Message::Flush(done);
-        loop {
-            match logger.queue.try_send(message) {
-                Ok(()) => break,
-                Err(TrySendError::Full(m)) => message = m,
-                Err(TrySendError::Disconnected(_)) => return true,
+        let mut waiting = 0;
+        if let Some(logger) = &self.logger {
+            match send_by(
+                |m| logger.queue.try_send(m),
+                Message::Flush(done.clone()),
+                deadline,
+            ) {
+                Sent::Queued => waiting += 1,
+                Sent::Gone => {}
+                Sent::Full => return false,
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(5));
         }
-        answer
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .is_ok()
+        if let Some(samples) = &self.samples {
+            match send_by(
+                |m| samples.try_send(m),
+                SampleMsg::Flush(done.clone()),
+                deadline,
+            ) {
+                Sent::Queued => waiting += 1,
+                Sent::Gone => {}
+                Sent::Full => return false,
+            }
+        }
+        drop(done);
+        (0..waiting).all(|_| {
+            answer
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_ok()
+        })
     }
 }
 
@@ -732,10 +860,13 @@ mod tests {
         for i in 0..4 {
             let s = signals(i, 0.65, 35);
             let step = engine.step(&s, || jobs.to_vec());
-            rec.sample(&s, &step, (i == 1).then_some(&jobs[..]))
-                .unwrap();
+            rec.sample(&s, &step, (i == 1).then_some(&jobs[..]));
             written.push(s);
         }
+        assert!(
+            rec.flush(Duration::from_secs(5)),
+            "the sample thread answers"
+        );
         let text = fs::read_to_string(dir.join(SAMPLES_FILE)).unwrap();
         assert!(text.starts_with(HEADER));
         let rows: Vec<Row> = text
@@ -833,8 +964,12 @@ mod tests {
         for i in 0..3 {
             let s = signals(i, 0.10, 80);
             let step = engine.step(&s, Vec::new);
-            rec.sample(&s, &step, None).unwrap();
+            rec.sample(&s, &step, None);
         }
+        assert!(
+            rec.flush(Duration::from_secs(5)),
+            "the sample thread answers"
+        );
         let mut text = fs::read_to_string(dir.join(SAMPLES_FILE)).unwrap();
         text.push_str("1700000003.000\t5003.000\t0.10"); // cut off mid-line, no newline
         let mut out = Vec::new();
@@ -856,7 +991,10 @@ mod tests {
         for i in 0..20 {
             let s = signals(i, 0.1, 80);
             let step = engine.step(&s, Vec::new);
-            rec.sample(&s, &step, None).unwrap();
+            rec.sample(&s, &step, None);
+            // One at a time: a burst would be dropped, as it should be, when the thread
+            // is behind, and this is about what is written.
+            assert!(rec.flush(Duration::from_secs(5)));
         }
         let main = fs::read_to_string(dir.join(SAMPLES_FILE)).unwrap();
         let old = fs::read_to_string(dir.join(format!("{SAMPLES_FILE}.1"))).unwrap();
@@ -958,6 +1096,67 @@ mod tests {
             1000,
             "{written} written, {reported} dropped"
         );
+    }
+
+    /// The samples file is written by a thread of its own, so one that stops accepting
+    /// writes (here a named pipe nobody reads) never makes the caller wait, nor holds up the
+    /// event log. Samples are queued up to a limit and dropped past it; the count is said in
+    /// the event log, and what was written and what was dropped add up to what was recorded.
+    #[test]
+    fn a_stuck_samples_file_never_blocks_the_caller_and_the_drops_are_reported() {
+        let dir = scratch("stuck-samples");
+        fs::create_dir_all(&dir).unwrap();
+        let samples = dir.join(SAMPLES_FILE);
+        mkfifo(&samples);
+        let mut rec = Recorder::new(&dir);
+        let mut engine = Engine::new(Policy::default());
+
+        let started = Instant::now();
+        for i in 0..1000 {
+            let s = signals(i, 0.1, 80);
+            let step = engine.step(&s, Vec::new);
+            rec.sample(&s, &step, None);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "1000 samples took {:?} with nobody reading the file",
+            started.elapsed()
+        );
+        // The event log is a file of its own: it works while the samples file does not.
+        rec.event(1_700_000_000.0, "warn", "still logging");
+        let events = dir.join(EVENTS_FILE);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(&events).is_ok_and(|t| t.contains("still logging")) {
+            assert!(Instant::now() < deadline, "the event log was held up");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Space returns: a reader appears. It reads until the writer closes the pipe.
+        let reader = thread::spawn(move || fs::read_to_string(samples).unwrap());
+        assert!(rec.flush(Duration::from_secs(10)), "the thread catches up");
+        let written = {
+            let mut text = String::new();
+            // The writer holds the pipe open until the recorder is dropped.
+            drop(rec);
+            text.push_str(&reader.join().unwrap());
+            text
+        };
+        let rows = written.lines().filter(|l| !l.starts_with("time\t")).count();
+        let said = fs::read_to_string(&events).unwrap();
+        let reported: usize = said
+            .lines()
+            .filter(|l| l.contains("sample(s) were dropped"))
+            .map(|l| {
+                let (_, rest) = l.split_once(" warn ").unwrap();
+                rest.split(' ').next().unwrap().parse::<usize>().unwrap()
+            })
+            .sum();
+        assert!(reported > 0, "samples were dropped and the drop was said");
+        assert!(
+            rows >= SAMPLE_QUEUE - 1,
+            "the queue's worth was kept: {rows}"
+        );
+        assert_eq!(rows + reported, 1000, "{rows} written, {reported} dropped");
     }
 
     /// A rotation that fails (here the `.1` name is taken by a directory) loses lines but

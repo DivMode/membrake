@@ -129,10 +129,12 @@ stateDiagram-v2
   never frozen, killed only if nothing else is left. This only ranks jobs that
   are eligible already; it does not make a system account's jobs eligible.
 
-Eligibility is checked again on the group as it is, just before a kill, not
-only when it was scanned. A job that has become ineligible since (it was
-continued and started an agent, say) is left alone, and continued if it was
-frozen.
+Eligibility is checked again on the group as it is, not only when it was
+scanned: after the record of a stop is written and just before the `SIGSTOP`,
+whether it starts a freeze or a kill, and before every later pass of signals
+(`SIGTERM`, each round of `SIGKILL`). A job that has become ineligible since (it
+started an agent, say, or a helper from another user joined it) is not stopped
+or killed, and is continued if it was frozen.
 
 ### Built to be trusted
 
@@ -144,19 +146,30 @@ frozen.
   has been sent. A resume that fails, or a job that cannot be inspected, leaves
   the record and is tried again on every sample until it works.
 - Before every signal it looks at the group again and checks it is still the
-  one it chose (the leader's pid and start time, or, if the leader is gone, a
-  member older than the scan), so a recycled process group is never signalled.
+  one it chose: the leader's pid and start time; or, if the leader is gone, a
+  process the freeze was sent to (the record lists every member's pid and start
+  time, so a child forked after the scan is found too), a member older than the
+  scan, or a child of a recorded process. A recycled process group has none of
+  these and a running one is never signalled. A group that none of this
+  recognises but in which a member is stopped is not treated as gone either:
+  the record stays, nothing is signalled, and it is looked at again on every
+  sample, because the stopped members may be the ones membrake stopped.
   `SIGKILL` goes to each member by its own pid after its start time is read
   again. macOS has no `pidfd`, so a few microseconds between that last look and
   the signal remain.
 - A flag that no longer parses, or an account that was deleted, stops the daemon
   only after it has resumed what a previous run froze.
-- All of a sample's signals go out before anything is logged. Events go to a
-  logger thread over a bounded queue; if the disk stalls they are dropped and
-  counted, and the count is logged when it recovers, so a stuck log never delays
-  a freeze or a kill. (The sampling thread still appends one small row to
-  `samples.tsv` per sample, and flushes the state file before a `SIGSTOP`, by
-  design; every `fsync` of a log is on the logger thread.) Events are copied to
+- All of a sample's signals go out before anything is logged. Everything the
+  daemon writes for people goes through a bounded queue to a thread of its own:
+  events to a logger thread, `samples.tsv` to a thread that writes samples, and
+  the queue's `queue.tsv` and `sizes.tsv` to a third. If a disk stalls what does
+  not fit is dropped and counted, and the count is logged when the thread
+  catches up, so a stuck file never delays a freeze, a kill, a sample or a
+  client, and holds up only the thread that writes it. The sampling thread writes
+  one file itself: the state file that lists the frozen jobs, flushed to disk
+  before a `SIGSTOP` and when a record is dropped, which is what lets a restart
+  resume them. The queue's socket thread writes none. (At start-up the daemon
+  reads `sizes.tsv`; at shutdown it removes the socket.) Events are copied to
   stdout only when it is a terminal: under launchd stdout is a file that
   `newsyslog` cannot rotate, and `events.log` has them all.
 - Timers run on awake time, so a lid-close never makes a job look "frozen too
@@ -164,12 +177,20 @@ frozen.
 - `--dry-run` logs every decision and sends no signals.
 - One kill in flight at a time, then a settle period before the next decision.
 - The quiet sampling path (read the kernel, decide, look at each frozen job,
-  record) does not allocate once it is warm; tests prove it with no job and
-  with a frozen, recorded one. Acting does allocate (scanning the process table,
-  signalling, logging an event). The daemon lifts itself out of jetsam band 0 so
-  macOS can't kill the guard first.
-- Every sample and event is recorded, and `membrake replay` runs a recording
-  back through the policy, which is how the policy is tested.
+  record, serve the queue) does not allocate once it is warm; tests prove it
+  with no job, with a frozen, recorded one, and with the queue serving one
+  running command and one waiting client. Acting does allocate (scanning the
+  process table, signalling, logging an event, writing a changed status file).
+  The sampling thread never waits for the queue's socket thread: it only tries
+  the lock they share, and leaves the queue's share of a sample for the next one
+  if the socket thread has it. A job frozen past the limit while memory is still
+  tight is killed on the first sample it is overdue, whatever the settle period
+  and however often new jobs are being frozen (unless an emergency arm kills
+  another job on that very sample, and then the sample after). The daemon lifts
+  itself out of jetsam band 0 so macOS can't kill the guard first.
+- Samples and events are recorded (a stalled disk drops what does not fit, and
+  the log says how many), and `membrake replay` runs a recording back through
+  the policy, which is how the policy is tested.
 
 ## Compared with
 
@@ -214,9 +235,10 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/dev.membrake.plist
 ## Usage
 
 ```sh
-membrake status                # live signals, frozen jobs, the next candidates
+membrake status                # live signals, frozen jobs, the queue, the next candidates
 membrake run --dry-run         # watch decisions without sending any signal
 membrake run                   # the daemon
+membrake exec -- bun run test  # start a command when there is memory for it
 membrake replay samples.tsv    # run a recording back through the policy
 ```
 
@@ -231,7 +253,8 @@ membrake replay samples.tsv    # run a recording back through the policy
 | `--max-freeze-minutes M` | `15` | Kill a job frozen this long while memory is still tight |
 | `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` (none at the cliff) |
 | `--on-event CMD` | — | Run on every freeze, resume and kill, with `MEMBRAKE_*` variables |
-| `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded |
+| `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded, and the queue's `queue.tsv` and `sizes.tsv` |
+| `--socket PATH` | `/var/run/membrake.sock` | Where [`membrake exec`](#queue-membrake-exec) asks for its turn (mode 0666) |
 | `--log-dir DIR` | `/var/log/membrake` | `samples.tsv` and `events.log` (dry runs default to a `dry-run` subdirectory) |
 | `--dry-run` | off | Decide and log, send nothing |
 
@@ -244,9 +267,233 @@ crunch, not a recording of a real machine, so you can run it yourself.
 `MEMBRAKE_BYTES`, `MEMBRAKE_COMMAND` and `MEMBRAKE_UID`, so you can notify
 yourself or message the coding agent whose job was frozen.
 
+## Queue (`membrake exec`)
+
+The brake deals with memory that has already run short. The queue keeps heavy
+commands from starting into a machine that has no room for them, so the brake
+has less to do. Run a heavy command (a type-check, a test run, a build) as
+`membrake exec -- <command>`: the daemon starts it when there is memory headroom
+for it. Admission is by **memory, not by a fixed count**, so the Mac uses its
+memory fully and does not swap. A fixed count wastes a 96 GB machine on small
+jobs and still swaps on big ones.
+
+```sh
+membrake exec -- bun run test
+membrake exec --label "web types" -- tsc -p apps/web
+```
+
+The command runs as it would anywhere else, in a process group of its own, below
+interactive apps (`nice` 10, utility QoS), with its output and its exit code
+(128 plus the signal if it died of one; 127 and 126 for a command that is not
+found or cannot be run, as in a shell). `SIGINT`, `SIGTERM` and `SIGHUP` sent to
+`membrake exec` go to the command. Meanwhile `membrake exec` prints one line to
+stderr whenever its place in the queue changes:
+
+```text
+membrake: queued for memory (position 2, needs 1.0 GB)
+```
+
+### When a command starts
+
+Requests wait in order, and the next one starts only when **all** of this holds:
+
+- memory is not tight (the brake's own test), and the brake holds no frozen job:
+  the queue and the brake are one ordered system;
+- at least 3 s have passed since the last start, because a started job takes
+  seconds to show in the numbers;
+- `used + need < cap`. `used` is the memory the kernel does not count as
+  available (RAM × (100 − `kern.memorystatus_level`) / 100), averaged over the
+  last 5 s. `need` is the peak this kind of command was seen to reach before, or,
+  for a command nothing is known about, `min(1 GiB, cap / 5)`.
+
+If nothing admitted is running and nothing is frozen, the next command starts
+even when it does not fit, so one big job is never stuck behind a busy machine.
+Never while memory is tight.
+
+The `cap` is learned, as in Buck2: it starts at 70% of RAM, and whenever memory
+is tight it becomes the memory in use averaged over the last 15 s, which is what
+the machine could hold when it ran short. A cap learned too low would stay low
+for good, so after 60 s without pressure, while a request waits only for the cap,
+it rises by 5% of RAM, at most to 90%, and again every 60 s.
+
+Between agents the queue takes turns: the next request is the oldest one of the
+session with the fewest commands running, so one agent's backlog does not starve
+another's single command. A session is the nearest ancestor of `membrake exec`
+that is an agent CLI (`claude`, `codex`), else its parent process.
+
+Sizes are learned per command signature, the program plus up to two plain
+arguments (`bun run test`, `tsc web`). The daemon measures the peak footprint of
+each admitted command's process group and keeps a moving average in
+`sizes.tsv` in the state directory, for up to 1000 signatures. The client says
+which group its command runs as, once, after it was told to go; the daemon
+accepts it only if the group's leader is a child of that client, of the same
+user, started after the go-ahead, and measures only that process's group. Any
+other group, or a second report, is an error and a closed connection, and
+nothing is learned from it.
+
+`membrake status` shows the queue: the learned cap and the memory in use, who
+waits (place, session, label, need) and what runs.
+
+### It never blocks work
+
+If the socket is missing or refuses, the daemon sends an error, hangs up or does
+not answer within 10 s, `membrake exec` prints one line and runs the command at
+once:
+
+```text
+membrake: queue unavailable (no daemon is listening on /var/run/membrake.sock); running now
+```
+
+A closed connection gives up a place at any time: kill a waiting `membrake exec`
+and the next one moves up. Inside an admitted command (`MEMBRAKE_ADMITTED` is
+set) `membrake exec` runs its command directly, so a heavy command's heavy
+children do not queue behind it. `membrake run --dry-run` admits every client at
+once and logs what the queue would have decided.
+
+### Trust model
+
+The daemon listens on `/var/run/membrake.sock` (`--socket PATH`), mode 0666, so
+that any local user can ask for a turn. That is a **single-user Mac** trust
+model: any local user can take a place in the line, and so can hold it. What the
+daemon trusts is only what the kernel says about the other end (its pid and uid).
+Every string a client sends is made printable and bounded, at most 64 clients are
+served at once (a connection past that is told so and hung up on, so its command
+runs at once, and a flood of them cannot keep the daemon from the clients it
+has), and the daemon only measures the groups of admitted commands, it never
+signals them. Do not use it on a Mac that other people log in to.
+
+The scheduler is ported from the design of
+[Buck2](https://github.com/facebook/buck2)'s local resource control (Apache
+License 2.0, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
+## Using membrake with coding agents
+
+membrake works on its own: the brake freezes whatever grows too big, with no
+change to how anything is started. The queue works when heavy commands go
+through `membrake exec`, so the agents have to be told, and ideally held to it.
+
+**What to route through the queue:** commands that take gigabytes or minutes:
+type-checks (`tsc`, `tsgo`), linters that type-check (`tsgolint`), test runners
+(`vitest`, `jest`, `cargo test`, `bun test`), builds (`cargo build`,
+`xcodebuild`, `swift build`) and gate or verify scripts. Not `git`, `ls`, `rg`
+or a quick script: they would only wait for nothing.
+
+### Claude Code
+
+Put the rule where Claude Code reads it, in `CLAUDE.md` (the repository's, or
+`~/.claude/CLAUDE.md` for every project):
+
+```markdown
+## Heavy commands
+
+Run type-checks, test suites, builds and gate scripts through the memory queue:
+`membrake exec --label "<repo>: <what>" -- <command>`. It starts the command at
+once when the Mac has room and waits when it does not. Start long ones with the
+Bash tool's `run_in_background`, so the tool's timeout cannot kill a command
+that is still waiting for its turn. If a command seems stuck, run
+`membrake status` first: it may be queued or frozen for memory and will
+continue on its own. Do not kill and rerun it; that adds back the memory it is
+waiting for.
+```
+
+To hold Claude Code to it rather than ask, add a `PreToolUse` hook that refuses
+heavy commands that do not go through the queue. A minimal one
+(`~/.claude/hooks/membrake-queue.sh`, executable; needs `jq`):
+
+```sh
+#!/bin/sh
+# Refuse heavy commands that skip the memory queue. Exit 2 blocks the command
+# and shows the message to Claude.
+cmd=$(jq -r '.tool_input.command // empty')
+case "$cmd" in
+  *"membrake exec"*) exit 0 ;;
+esac
+if printf '%s\n' "$cmd" | grep -Eq '(^[[:space:]]*|[;&|][[:space:]]*)(tsc|tsgo|tsgolint|vitest|jest|xcodebuild|cargo (build|test|clippy)|swift (build|test)|(bun|pnpm|npm|yarn) (test|run (test|check|typecheck|build|verify)))([[:space:]]|$)'; then
+  echo "Heavy command outside the memory queue: run it as membrake exec --label \"<what>\" -- <command> (in the background if it may wait)." >&2
+  exit 2
+fi
+exit 0
+```
+
+and register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "~/.claude/hooks/membrake-queue.sh" }]
+      }
+    ]
+  }
+}
+```
+
+A pattern match like this stops habits and mistakes, not a determined
+workaround. Extend the list to your own tools.
+
+### Codex
+
+Codex reads `AGENTS.md`. Add the same rule there, with Codex's own way of
+running a long command in the background:
+
+```markdown
+## Heavy commands
+
+Run type-checks, test suites, builds and gate scripts as
+`membrake exec --label "<repo>: <what>" -- <command>`. It waits for memory when
+the Mac is full. If a command seems stuck, check `membrake status` before
+killing or rerunning it.
+```
+
+### Other agents and scripts
+
+Any tool that runs shell commands can use the same line. Inside a command that
+is already admitted, nested `membrake exec` calls run straight away
+(`MEMBRAKE_ADMITTED` is set), so a script that is queued as a whole does not
+queue each of its steps again:
+
+```sh
+membrake exec --label "full check" -- ./scripts/verify.sh
+```
+
+### CI runners on the same Mac
+
+Self-hosted runners have a fixed number of slots, so they are not queued. Give
+their account to the brake as `--protect-user NAME`: their jobs are never
+frozen and are killed only when nothing else is left. To keep the CPU fair as
+well, run the runners at a higher priority than agent work and below your apps
+(agent work under `membrake exec` runs at utility QoS and `nice` 10).
+
+### People in a terminal
+
+`membrake exec` works the same at a prompt. It prints nothing unless it has to
+wait more than 2 s; then it says where it is in line:
+
+```text
+membrake: queued for memory (position 2, needs 3.1 GB)
+```
+
+`Ctrl-C` while waiting gives up the place; nothing ran. A command that reads
+from the terminal does not belong in the queue, because it runs in a process
+group of its own.
+
+### When a command seems stuck
+
+```sh
+membrake status
+```
+
+shows the queue (who waits, for how much memory, and what runs) and every
+frozen job. A queued or frozen command continues on its own when memory
+recovers. Killing and rerunning it puts its memory back on a machine that is
+already short. The daemon's decisions are in `/var/log/membrake/events.log`.
+
 ## Limitations
 
-- **macOS on Apple Silicon only**, and the thresholds are first estimates.
+- **macOS only.** It is built and tested on Apple Silicon; the Intel build
+  evaluates but has not been run. The thresholds are first estimates.
   Watch `events.log` and `samples.tsv` and tell us what you see.
 - **A job in your own terminal** that membrake freezes is reported as
   `suspended` by your shell. When membrake resumes it, it carries on in the
@@ -261,8 +508,9 @@ yourself or message the coding agent whose job was frozen.
 membrake stands on [oomguard](https://github.com/trentshaines/oomguard)'s
 research into what actually crashes a Mac out of memory, and on
 [earlyoom-rs-mac](https://github.com/haydenflinner/earlyoom-rs-mac)'s macOS
-system-call groundwork. Both are MIT licensed; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+system-call groundwork. Both are MIT licensed. The queue is ported from the
+design of [Buck2](https://github.com/facebook/buck2)'s scheduler, which is
+Apache 2.0 licensed. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 

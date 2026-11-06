@@ -9,8 +9,12 @@
 //! Another orders the state file: a job is dropped from it only once it is confirmed gone or
 //! continued. A resume that fails, or a group that cannot be inspected, leaves the record, and
 //! every sample tries again.
+//!
+//! The queue (`broker`) is served from the same tick, after the engine has decided, so what it
+//! admits is always judged by the state the brake has just left the machine in.
 
 use crate::act::{self, ActError, FrozenState, Killed, Recovered, State};
+use crate::broker::{self, Broker};
 use crate::engine::{Action, Engine, Policy};
 use crate::jobs::{self, Inspector, Job, Rules};
 use crate::recorder::{Recorder, describe};
@@ -28,6 +32,17 @@ const WARN_EVERY: f64 = 60.0;
 const FAILSAFE_AFTER: f64 = 60.0;
 /// A SIGSTOP takes a moment to show in the process table; do not judge a fresh freeze.
 const STOP_GRACE: f64 = 2.0;
+/// The least time frozen work holds the queue after memory last was tight; see `tick`.
+const HOLD_MIN: f64 = 120.0;
+
+/// Whether `held` frozen jobs or records hold the queue, `calm` seconds after memory was
+/// last tight: for as long as resuming them all could take (five calm samples, then one
+/// per settle period), and at least `HOLD_MIN`.
+fn queue_held(held: usize, calm: f64, settle: f64) -> bool {
+    let resume_window = (settle * (held as f64 + 2.0) + 5.0).max(HOLD_MIN);
+    held > 0 && calm <= resume_window
+}
+
 /// Consecutive checks a frozen job must look continued before membrake believes it. A
 /// member blocked in the kernel (a page fault served from swap, while memory is tight)
 /// only reaches the stopped state when the wait ends, which can take seconds; on
@@ -45,6 +60,8 @@ pub struct Location {
     pub log_dir: PathBuf,
     /// Log every decision and send no signals.
     pub dry_run: bool,
+    /// Where `membrake exec` asks for its turn. None: no queue is served.
+    pub socket: Option<PathBuf>,
 }
 
 pub struct RunOptions {
@@ -109,14 +126,17 @@ pub struct Runner {
     rec: Recorder,
     /// None in a dry run: nothing is frozen, so nothing is recorded.
     state: Option<State>,
-    last_stderr: f64,
     last_unresolved: f64,
     /// Frozen groups seen not fully stopped, and on how many consecutive checks.
     outside: Vec<(i32, u32)>,
+    /// When memory was last tight (uptime): how long frozen work may hold the queue.
+    last_tight: f64,
     /// Buffers for looking at the frozen groups, allocated once.
     inspector: Inspector,
     /// Events of the tick in progress, written after all of its signals are sent.
     events: Vec<Event>,
+    /// The admission queue, if one is served.
+    queue: Option<Broker>,
 }
 
 /// Runs the loop on the readings of `source` (the kernel, except in tests).
@@ -242,6 +262,21 @@ fn run_loop<S: SignalSource>(
     let mut r = Runner::new(opts, state, rec);
     let start = r.start_line(protection);
     r.rec.event(wall, "start", &start);
+    if let Some(socket) = &location.socket {
+        // Without a queue the brake is unchanged and every `membrake exec` runs at once.
+        match Broker::start(broker::Options {
+            socket: socket.clone(),
+            state_dir: location.state_dir.clone(),
+            dry_run: location.dry_run,
+        }) {
+            Ok(queue) => r.serve_queue(queue),
+            Err(e) => r.rec.event(
+                signals::wall(),
+                "warn",
+                &format!("not serving the queue (clients run at once): {e}"),
+            ),
+        }
+    }
     r.rec.sync_events();
 
     let mut unreadable_since: Option<f64> = None;
@@ -295,12 +330,18 @@ impl Runner {
             engine,
             rec,
             state,
-            last_stderr: f64::NEG_INFINITY,
             last_unresolved: f64::NEG_INFINITY,
             outside: Vec::new(),
+            last_tight: f64::NEG_INFINITY,
             inspector: Inspector::new(),
             events: Vec::new(),
+            queue: None,
         }
+    }
+
+    /// Serves the admission queue from this runner's tick.
+    pub fn serve_queue(&mut self, queue: Broker) {
+        self.queue = Some(queue);
     }
 
     fn start_line(&self, protection: &str) -> String {
@@ -319,14 +360,6 @@ impl Runner {
             p.freeze_occupancy * 100.0,
             p.kill_occupancy_now * 100.0,
         )
-    }
-
-    /// Say something on stderr, rarely: it is for problems with the logs themselves.
-    fn warn_stderr(&mut self, now: f64, message: &str) {
-        if now - self.last_stderr >= WARN_EVERY {
-            self.last_stderr = now;
-            stderr_line(message);
-        }
     }
 
     /// Whether any frozen job is still recorded.
@@ -354,11 +387,29 @@ impl Runner {
         }
         self.check_frozen(s);
         self.retry_unresolved(s);
+        // Anything frozen, recorded or not yet confirmed resumed, holds the queue, so frozen
+        // work resumes before new work starts. But only for as long as resuming could take:
+        // memory calm for five samples, then one job per settle period. A record still there
+        // after that, with memory calm the whole time, is one membrake cannot resume (a
+        // group it can no longer recognise, a SIGCONT that keeps failing); it is kept and
+        // retried, but it must not hold every `membrake exec` on the machine forever.
+        if step.tight {
+            self.last_tight = s.time;
+        }
+        let held = self
+            .engine
+            .frozen()
+            .len()
+            .max(self.state.as_ref().map_or(0, |st| st.records().len()));
+        let frozen = queue_held(held, s.time - self.last_tight, self.opts.policy.settle);
+        if let Some(queue) = self.queue.as_mut() {
+            for (kind, text) in queue.tick(s, step.tight, frozen) {
+                self.events.push(Event::note(s.wall, kind, text));
+            }
+        }
         // All signals of this tick are sent. Now say so.
         self.log_events();
-        if let Err(e) = self.rec.sample(s, &step, shown.as_deref()) {
-            self.warn_stderr(s.time, &format!("cannot record the sample: {e}"));
-        }
+        self.rec.sample(s, &step, shown.as_deref());
         self.rec.sync_events();
     }
 
@@ -400,15 +451,18 @@ impl Runner {
             self.events.push(Event::note(s.wall, kind, text));
             return;
         };
+        // Judged again on the group itself, as it is now, after the record is written and
+        // before anything is sent.
+        let rules = &self.opts.rules;
+        let mut allowed = || jobs::spared(rules, job.pgid);
         // Each arm yields how the job came out of it (a kill can time out waiting for the
         // group to exit, or be refused because the group is no longer eligible).
         let outcome: Result<Done, ActError> = match action {
-            Action::Freeze { .. } => act::freeze(state, job, scanned).map(|()| Done::Complete),
+            Action::Freeze { .. } => {
+                act::freeze(state, job, scanned, &mut allowed).map(|()| Done::Complete)
+            }
             Action::Resume { .. } => act::resume(state, job.pgid).map(|()| Done::Complete),
             _ => {
-                let rules = &self.opts.rules;
-                // Judged again on the group itself, as it is now, before anything is sent.
-                let mut allowed = || jobs::spared(rules, job.pgid);
                 let result = act::kill(
                     state,
                     job,
@@ -627,7 +681,7 @@ enum Done {
 // ---------------------------------------------------------------------------------------
 // status
 
-fn age(seconds: f64) -> String {
+pub(crate) fn age(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     match s {
         0..=119 => format!("{s}s"),
@@ -636,7 +690,7 @@ fn age(seconds: f64) -> String {
     }
 }
 
-fn gb(bytes: u64) -> String {
+pub(crate) fn gb(bytes: u64) -> String {
     format!("{:.1}GB", bytes as f64 / (1u64 << 30) as f64)
 }
 
@@ -747,6 +801,7 @@ pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), St
             );
         }
     }
+    print_queue(state_dir, s.wall);
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
@@ -755,6 +810,71 @@ pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), St
         );
     }
     Ok(())
+}
+
+/// Whether process `pid` exists (a process of another user does).
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    let sent = unsafe { libc::kill(pid, 0) } == 0;
+    sent || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The queue as the daemon last wrote it: the learned cap, the memory in use, who is waiting
+/// and what is running.
+fn print_queue(state_dir: &Path, wall: f64) {
+    println!();
+    let queue = match broker::read_queue(state_dir) {
+        Ok(Some(queue)) => queue,
+        Ok(None) => {
+            println!(
+                "queue       not served: no queue state in {}",
+                state_dir.display()
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "queue       unknown: cannot read {}: {e}",
+                state_dir.display()
+            );
+            return;
+        }
+    };
+    if !alive(queue.daemon) {
+        println!(
+            "queue       not served: the daemon that wrote the queue state (pid {}) has exited",
+            queue.daemon
+        );
+        return;
+    }
+    println!(
+        "queue       cap {} of {} RAM, {} in use; {} running, {} waiting",
+        gb(queue.cap),
+        gb(queue.ram),
+        gb(queue.used),
+        queue.running.len(),
+        queue.waiting.len()
+    );
+    for r in &queue.running {
+        println!(
+            "  running   group {:<7} session {:<7} peak {:>7}  for {}  {}",
+            r.pgid,
+            r.session,
+            gb(r.peak),
+            age(wall - r.since),
+            r.label
+        );
+    }
+    for w in &queue.waiting {
+        println!(
+            "  waiting   #{:<3} session {:<7} needs {:>7}  for {}  {}",
+            w.position,
+            w.session,
+            gb(w.need),
+            age(wall - w.since),
+            w.label
+        );
+    }
 }
 
 pub fn own_pgid() -> i32 {
@@ -795,6 +915,29 @@ mod tests {
 
     /// A runner whose engine has, through the real freeze path, frozen `job` at engine time
     /// 101 (two tight samples).
+    /// Frozen work holds the queue while it could still be resumed, and no longer: a record
+    /// membrake cannot resume must not hold every `membrake exec` forever.
+    #[test]
+    fn frozen_work_holds_the_queue_only_while_it_could_still_be_resumed() {
+        assert!(!queue_held(0, 0.0, 10.0), "nothing frozen holds nothing");
+        assert!(queue_held(1, 0.0, 10.0), "frozen while tight holds");
+        assert!(
+            queue_held(1, 119.0, 10.0),
+            "at least HOLD_MIN after the last tight sample"
+        );
+        assert!(
+            !queue_held(1, 121.0, 10.0),
+            "a stuck record stops holding after that"
+        );
+        // Twenty frozen jobs take 20 settle periods to resume: they hold for that long.
+        assert!(queue_held(20, 200.0, 10.0));
+        assert!(!queue_held(20, 230.0, 10.0));
+        assert!(
+            !queue_held(1, f64::INFINITY, 10.0),
+            "never tight: nothing to wait for"
+        );
+    }
+
     fn runner_with_frozen(dir: &Path, job: &Job) -> Runner {
         let opts = RunOptions {
             policy: Policy::default(),

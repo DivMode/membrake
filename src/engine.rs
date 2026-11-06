@@ -405,8 +405,10 @@ impl Engine {
         let kill_arms = self.fired(Tier::Kill, false);
         let freeze_arms = self.fired(Tier::Freeze, quiet);
         // Frozen past the limit while memory is still tight. Checked on its own, not behind
-        // the kill arms: while they keep firing it would never be reached.
-        let expired = (!quiet && tight)
+        // the kill arms, and not behind the settle period either: every freeze starts a new
+        // period, so jobs arriving every few seconds under urgent pressure would keep it
+        // running for ever and the overdue job would never be reached.
+        let expired = tight
             .then(|| {
                 self.frozen
                     .iter()
@@ -883,17 +885,16 @@ mod tests {
         assert_eq!(kills(&actions), vec![(13.0, 10, false)]);
     }
 
-    /// Urgent arms that keep firing must not hide a job frozen past the limit: new jobs keep
-    /// arriving, one per settle period, and each time the arm freezes the newcomer. The job
-    /// that has been frozen for more than 15 minutes is still killed, once the period allows.
-    #[test]
-    fn a_job_frozen_too_long_is_killed_even_while_urgent_arms_keep_firing() {
+    /// Runs 1000 s of urgent pressure with the one job, 10, frozen at t=1, and a new job
+    /// arriving every `every` seconds from t=2 (the engine freezes each at once); returns
+    /// (second, group, reason) of every kill.
+    fn urgent_pressure_with_newcomers(every: u32) -> Vec<(u32, i32, String)> {
         let mut e = Engine::new(Policy::default());
         let jobs_at = |t: u32, gone: &[i32]| -> Vec<Job> {
             let mut jobs = vec![job(10, 100, 8)];
             if t >= 2 {
                 jobs.extend(
-                    (0..=(t - 2) / 10)
+                    (0..=(t - 2) / every)
                         .map(|k| job(100 + i32::try_from(k).unwrap(), 1000 + u64::from(k), 4)),
                 );
             }
@@ -917,16 +918,34 @@ mod tests {
                 }
             }
         }
-        let overdue: Vec<_> = killed
+        killed
+    }
+
+    fn first_overdue(killed: &[(u32, i32, String)]) -> (u32, i32) {
+        killed
             .iter()
-            .filter(|(_, _, reason)| reason.contains("frozen for more than 15 minutes"))
-            .collect();
-        // The oldest comes first (the newcomers frozen after it come due one period later
-        // each), as soon as it is overdue and the settle period allows.
-        let (t, pgid, _) = overdue.first().expect("an overdue job is killed");
-        assert_eq!(*pgid, 10, "{killed:?}");
+            .find(|(_, _, reason)| reason.contains("frozen for more than 15 minutes"))
+            .map(|&(t, pgid, _)| (t, pgid))
+            .unwrap_or_else(|| panic!("an overdue job is killed: {killed:?}"))
+    }
+
+    /// Urgent arms that keep firing must not hide a job frozen past the limit: new jobs keep
+    /// arriving, one per settle period, and each time the arm freezes the newcomer. The job
+    /// that has been frozen for more than 15 minutes is still killed, as soon as it is overdue.
+    #[test]
+    fn a_job_frozen_too_long_is_killed_even_while_urgent_arms_keep_firing() {
+        let killed = urgent_pressure_with_newcomers(10);
         // Frozen at t=1: overdue after t=901.
-        assert!((902..=913).contains(t), "killed at t={t}");
+        assert_eq!(first_overdue(&killed), (902, 10), "{killed:?}");
+    }
+
+    /// Every freeze starts a settle period, so newcomers arriving more often than the period
+    /// is long keep it running for ever. They must not postpone the expiry of the job that is
+    /// overdue: it is killed on the first sample it is, settle period or not.
+    #[test]
+    fn newcomers_every_two_seconds_cannot_postpone_the_expiry_of_a_frozen_job() {
+        let killed = urgent_pressure_with_newcomers(2);
+        assert_eq!(first_overdue(&killed), (902, 10), "{killed:?}");
     }
 
     /// Jobs frozen together come back oldest first, so the newest, the likeliest runaway,
