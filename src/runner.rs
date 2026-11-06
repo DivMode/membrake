@@ -42,7 +42,8 @@ struct Unresolved {
     /// Seconds it was unresolved, over all the times it was.
     total: f64,
     /// When it was last seen unresolved, if that was on the latest sample. The time since
-    /// then counts; a sample on which it was not unresolved ends the span, not the total.
+    /// then counts, up to the sample on which it was not unresolved, which ends the span:
+    /// every interval that began unresolved is in the total.
     last_seen: Option<f64>,
     /// It has used up `UNRESOLVED_HOLD`, and that was said.
     spent: bool,
@@ -106,8 +107,12 @@ impl Holds {
             }
         }
         self.unresolved.retain_mut(|u| {
-            if u.last_seen != Some(now) {
-                u.last_seen = None;
+            // Unresolved when last seen, and not on this sample: that interval was unresolved
+            // too, and is the last of the span.
+            if u.last_seen != Some(now)
+                && let Some(since) = u.last_seen.take()
+            {
+                u.total += (now - since).max(0.0);
             }
             exists(u.pgid)
         });
@@ -160,14 +165,19 @@ pub fn guarded(
     }
     let outcome = match state_dir.map(act::recover_dir) {
         None => "nothing was frozen (dry run)".to_string(),
-        Some(Ok(report)) => {
-            let resumed = report
+        Some(recovery) => {
+            let resumed = recovery
+                .report
                 .iter()
                 .filter(|(_, o)| *o == Recovered::Resumed)
                 .count();
-            format!("resumed {resumed} frozen job(s)")
+            match recovery.problem {
+                None => format!("resumed {resumed} frozen job(s)"),
+                Some(e) => format!(
+                    "resumed {resumed} frozen job(s); the state file could not be read or updated: {e}"
+                ),
+            }
         }
-        Some(Err(e)) => format!("could not resume the frozen jobs: {e}"),
     };
     Err(format!("membrake panicked; {outcome}"))
 }
@@ -489,14 +499,16 @@ impl Runner {
         );
     }
 
-    /// Writes again the records of stopped groups that are not completely on disk, with
-    /// everything the groups hold now.
+    /// Takes up again the stopping of groups that are not completely recorded and stopped:
+    /// the members they have now are written down, and then stopped.
     fn complete_records(&mut self, s: &Signals) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        for pgid in state.finish_pending(&mut self.inspector) {
-            let text = format!("group {pgid}: every member is recorded now (a retry)");
+        let rules = &self.opts.rules;
+        for pgid in state.finish_pending(&mut self.inspector, &mut |pgid| jobs::spared(rules, pgid))
+        {
+            let text = format!("group {pgid}: every member is recorded and stopped now (a retry)");
             self.events.push(Event::note(s.wall, "warn", text));
         }
     }
@@ -621,7 +633,7 @@ impl Runner {
                 });
                 if unrecorded {
                     let text = format!(
-                        "group {pgid} is stopped, but its record could not be completed on disk; it is kept in memory and written again on every sample"
+                        "group {pgid} is stopped in part: a member could not be recorded on disk, so it was not stopped; it is tried again on every sample"
                     );
                     self.events.push(Event::note(signals::wall(), "warn", text));
                 }
@@ -1069,7 +1081,11 @@ mod tests {
     /// frozen together come back one per settle period, after five calm samples: the last
     /// at about 195 s. The queue stays held at every sample until then, and not after. (A
     /// window worked out from the number of jobs left, as it was, ran out with six still
-    /// frozen, at about 120 s.)
+    /// frozen, at about 120 s.) This drives the engine's decisions and `update_hold` on
+    /// jobs that do not exist, so it shows when the hold is on and off for the engine's
+    /// frozen set; it does not freeze a process, nor show the broker refusing to admit while
+    /// the hold is on (`queue_nothing_is_admitted_while_a_job_is_frozen` in `tests/daemon.rs`
+    /// does that for one job).
     #[test]
     fn twenty_frozen_jobs_hold_the_queue_until_the_last_is_resumed() {
         let dir = scratch("hold-twenty");
@@ -1173,6 +1189,40 @@ mod tests {
         r.tick(&calm_at(600.0));
         assert!(sleeper.settles(false) && !r.has_records());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record that is unresolved on every other sample is unresolved for as long as it is
+    /// looked at, and its hold runs out after 300 s of that: each unresolved sample counts
+    /// until the next one, whether that one is unresolved or not. (Counting only the time
+    /// between two unresolved samples left the total at zero for ever, and the queue held for
+    /// good.) Samples a second apart, unresolved on the even ones: the 300th second of
+    /// unresolved time is the one that starts at sample 598, so from sample 600 on it holds
+    /// nothing.
+    #[test]
+    fn an_unresolved_record_that_is_healthy_on_every_other_sample_still_uses_up_its_hold() {
+        let mut holds = Holds {
+            unresolved: Vec::new(),
+        };
+        let mut spent = Vec::new();
+        let mut first_free = None;
+        for second in 0..1000u32 {
+            let stuck = (second % 2 == 0).then_some(7);
+            let held = holds.update(
+                f64::from(second),
+                false,
+                stuck.into_iter(),
+                |_| true,
+                |pgid| spent.push(pgid),
+            );
+            if stuck.is_some() && !held && first_free.is_none() {
+                first_free = Some(second);
+            }
+            if stuck.is_some() && first_free.is_some() {
+                assert!(!held, "held again at sample {second}");
+            }
+        }
+        assert_eq!(first_free, Some(600));
+        assert_eq!(spent, [7], "said once");
     }
 
     /// A runner whose engine has, through the real freeze path, frozen `job` at engine time

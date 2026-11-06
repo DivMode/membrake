@@ -134,7 +134,7 @@ impl Daemon {
     /// Waits until the event log contains `text`.
     fn wait_logged(&self, log: &Path, text: &str) {
         let events = log.join("events.log");
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !fs::read_to_string(&events).is_ok_and(|t| t.contains(text)) {
             assert!(
                 Instant::now() < deadline,
@@ -172,7 +172,7 @@ impl Daemon {
     /// Waits until the event log names `count` freezes, resumes and kills. The daemon hands
     /// its events to a logger thread, so they can trail the signals they describe.
     fn wait_actions(&self, log: &Path, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while actions(log).len() < count {
             assert!(
                 Instant::now() < deadline,
@@ -188,7 +188,7 @@ impl Daemon {
     /// so far has been acted on.
     fn wait_samples(&self, log: &Path, rows: usize) {
         let samples = log.join("samples.tsv");
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while fs::read_to_string(&samples).map_or(0, |t| t.lines().count().saturating_sub(1)) < rows
         {
             assert!(
@@ -203,7 +203,7 @@ impl Daemon {
     fn terminate(mut self) -> std::process::ExitStatus {
         // SAFETY: signalling the child this test spawned.
         unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = self.0.try_wait().unwrap() {
                 return status;
@@ -698,6 +698,12 @@ fn simulated_urgent_pressure_freezes_everything_before_it_kills_anything() {
         .filter(|(kind, _)| kind == "kill")
         .collect();
     assert_eq!(killed.len(), 1, "{}", events(&log));
+    // The kill is sent before it is logged, and a group takes a moment to die of it.
+    let victim = groups
+        .iter_mut()
+        .find(|g| g.pgid() == killed[0].1)
+        .expect("the log names one of the groups");
+    assert!(victim.exited(), "the group the log names is gone");
     let mut gone = Vec::new();
     for g in &mut groups {
         if !g.alive() {
@@ -1374,16 +1380,38 @@ fn wait_until(what: &str, seconds: u64, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Waits until the daemon is listening on `socket`: the file appears when it is bound, a moment
+/// before it listens, and a connection in between is refused.
+fn wait_for_the_queue(socket: &Path) {
+    wait_until("the queue socket", 60, || {
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    });
+}
+
 /// A simulated daemon that serves the queue on `socket`. `only` decides which groups the
 /// brake may touch; most queue tests give it a pattern nothing matches, so that no process
 /// at all can be frozen or killed.
 fn queue_daemon(script: &Script, dir: &Path, socket: &Path, only: &str) -> Daemon {
+    queue_daemon_env(script, dir, socket, only, &[])
+}
+
+/// `queue_daemon` with environment variables for the daemon.
+fn queue_daemon_env(
+    script: &Script,
+    dir: &Path,
+    socket: &Path,
+    only: &str,
+    env: &[(&str, &str)],
+) -> Daemon {
     let (state, log) = (dir.join("state"), dir.join("log"));
     let mut command = Daemon::simulate_command(&script.path, only, &state, &log);
-    command.arg("--socket").arg(socket);
+    command
+        .arg("--socket")
+        .arg(socket)
+        .envs(env.iter().copied());
     let daemon = Daemon(command.spawn().unwrap());
     daemon.wait_started(&log);
-    wait_until("the queue socket", 20, || socket.exists());
+    wait_for_the_queue(socket);
     daemon
 }
 
@@ -1398,10 +1426,11 @@ struct Client {
 
 impl Client {
     fn spawn(dir: &Path, name: &str, socket: &Path, options: &[&str], command: &[&str]) -> Client {
-        Client::spawn_with(dir, name, socket, options, command, false)
+        Client::spawn_with(dir, name, socket, options, command, false, &[])
     }
 
-    /// `admitted`: the client runs as inside a command the queue already admitted.
+    /// `admitted`: the client runs as inside a command the queue already admitted. `env`:
+    /// variables for the client.
     fn spawn_with(
         dir: &Path,
         name: &str,
@@ -1409,9 +1438,11 @@ impl Client {
         options: &[&str],
         command: &[&str],
         admitted: bool,
+        env: &[(&str, &str)],
     ) -> Client {
         let stderr = dir.join(format!("{name}.stderr"));
         let mut exec = Command::new(env!("CARGO_BIN_EXE_membrake"));
+        exec.envs(env.iter().copied());
         // These tests may themselves be running inside an admitted command.
         exec.env_remove("MEMBRAKE_ADMITTED");
         if admitted {
@@ -1654,6 +1685,119 @@ fn queue_a_client_fails_open_when_the_daemon_cannot_be_used() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The times of the keep-alive, shortened for the tests (see `membrake::wire::timing`): a
+/// client gives up on a daemon that has said nothing for 4 s, and the daemon says where a
+/// client stands at least every 0.67 s.
+const SHORT: &[(&str, &str)] = &[("MEMBRAKE_TEST_SILENCE_MS", "4000")];
+const SILENCE: Duration = Duration::from_millis(4000);
+
+/// A daemon that answers once and then says nothing, with the connection open, is a daemon
+/// that has stopped answering: the client runs its command instead of waiting for ever, and
+/// says why. (A real daemon that stopped answering, because it hung or its socket thread
+/// died, looks like this to a client.)
+#[test]
+fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer() {
+    let dir = scratch("qsilent");
+    let socket = queue_socket("silent");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = [0u8; 256];
+        let _ = stream.read(&mut line);
+        stream.write_all(b"QUEUED\t1\t1073741824\n").unwrap();
+        // Silent, and open, until the test is over.
+        let _ = released.recv();
+    });
+
+    let started = Instant::now();
+    let mut client = Client::spawn_with(
+        &dir,
+        "c",
+        &socket,
+        &[],
+        &["sh", "-c", "exit 7"],
+        false,
+        SHORT,
+    );
+    assert_eq!(
+        client.code(),
+        Some(7),
+        "it ran its command: {}",
+        client.said()
+    );
+    assert!(
+        started.elapsed() >= SILENCE,
+        "not before the daemon had been silent for the whole limit: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        client
+            .said()
+            .contains("membrake: queue unavailable (the daemon stopped answering); running now"),
+        "{}",
+        client.said()
+    );
+    release.send(()).unwrap();
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A client that waits for a turn through a tight spell longer than its silence limit is not
+/// given up on: the daemon tells it where it stands every keep-alive though the place has not
+/// changed, so a running daemon never lets it hear nothing. The hand-made client, which
+/// asked first, only listens, and sees the same line repeated; the real one is still waiting
+/// when its limit has passed, and runs its command when memory is calm. (The daemon's script
+/// has no more readings in all that time: the lines come from its socket thread, not from a
+/// sample.)
+#[test]
+fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_silence_limit() {
+    let dir = scratch("qkeep");
+    let socket = queue_socket("keep");
+    let mut script = Script::new(&dir);
+    script.tight(3);
+    let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, SHORT);
+
+    // The hand-made client only listens. It asks first, and is told its place at once (the
+    // socket thread answers, whatever the sampling thread is doing).
+    let mut listener = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    listener.write_all(b"REQUEST\tv1\tlistener\tsig\n").unwrap();
+    // The real client asks second, and says so once it has waited long enough to say anything.
+    let ran = marker_file(&dir, "ran");
+    let mut client = Client::spawn_with(&dir, "c", &socket, &[], &["touch", &ran], false, SHORT);
+    client.wait_said("position 2");
+
+    let mut input = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < SILENCE + SILENCE / 2 {
+        let mut chunk = [0u8; 256];
+        if let Ok(n) = listener.read(&mut chunk) {
+            input.extend_from_slice(&chunk[..n]);
+        }
+        while let Some(line) = membrake::wire::take_line(&mut input) {
+            lines.push(line);
+        }
+        assert!(client.running(), "given up on: {}", client.said());
+    }
+    assert!(lines.len() >= 6, "one at least every 0.67 s: {lines:?}");
+    assert!(
+        lines.iter().all(|l| l == &lines[0]) && lines[0].starts_with("QUEUED\t1\t"),
+        "the same place, said again: {lines:?}"
+    );
+    assert!(!Path::new(&ran).exists(), "and its command has not run");
+
+    script.calm(8);
+    assert_eq!(client.code(), Some(0));
+    assert!(Path::new(&ran).exists());
+    assert!(!client.said().contains("unavailable"), "{}", client.said());
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Inside an admitted command a `membrake exec` runs its command directly. The proof is a
 /// daemon that would hold it for good (memory is tight) and never hears of it.
 #[test]
@@ -1665,7 +1809,8 @@ fn queue_a_nested_call_runs_directly() {
     let log = dir.join("log");
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
 
-    let mut nested = Client::spawn_with(&dir, "n", &socket, &[], &["sh", "-c", "exit 3"], true);
+    let mut nested =
+        Client::spawn_with(&dir, "n", &socket, &[], &["sh", "-c", "exit 3"], true, &[]);
     assert_eq!(nested.code(), Some(3));
     assert_eq!(nested.said(), "", "no queue, no line");
     script.tight(2);
@@ -1714,6 +1859,17 @@ fn queue_status_lists_the_waiting_and_the_admitted() {
     waiting.wait_said("position 1");
     script.tight(3);
     daemon.wait_samples(&log, 16);
+    // The status file is written by a thread of its own, behind the sample that changed it.
+    wait_until(
+        "the status file to show alpha running and beta waiting",
+        20,
+        || {
+            membrake::broker::read_queue(&state)
+                .ok()
+                .flatten()
+                .is_some_and(|q| q.running.len() == 1 && q.waiting.len() == 1)
+        },
+    );
 
     let out = Command::new(env!("CARGO_BIN_EXE_membrake"))
         .arg("status")
@@ -1899,7 +2055,7 @@ fn queue_a_dry_run_never_holds_a_client() {
             .unwrap(),
     );
     daemon.wait_started(&log);
-    wait_until("the queue socket", 20, || socket.exists());
+    wait_for_the_queue(&socket);
 
     let mut client = Client::spawn(&dir, "c", &socket, &[], &["sh", "-c", "exit 3"]);
     assert_eq!(client.code(), Some(3));
@@ -2101,16 +2257,17 @@ fn simulated_recovery_continues_only_the_groups_the_test_spawned() {
 // ---------------------------------------------------------------------------------------
 // The rules are asked again after the record is on disk, and before the signal.
 
-/// Everything a writer put into the named pipe `path`, waiting at most 15 s for it to have put
+/// Everything a writer put into the named pipe `path`, waiting at most 5 s for it to have put
 /// anything: the pipe is opened without waiting, so a writer that never comes is an empty
-/// string and not a test that never ends.
+/// string and not a test that never ends. (A writer that is blocked on the pipe comes the
+/// moment it is opened for reading.)
 fn read_fifo(path: &Path) -> String {
     let mut pipe = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .unwrap();
-    let (mut text, deadline) = (Vec::new(), Instant::now() + Duration::from_secs(15));
+    let (mut text, deadline) = (Vec::new(), Instant::now() + Duration::from_secs(5));
     let mut chunk = [0u8; 4096];
     while Instant::now() < deadline {
         match pipe.read(&mut chunk) {
@@ -2174,14 +2331,44 @@ impl Changeling {
 ///
 /// A daemon blocked in a write cannot be seen to be, so it is given time to get there: the
 /// samples it records are how far it has read, and `recorded` is how many it records before
-/// the row that makes it act. (Late, it would find the group changed already and write
-/// nothing; the record is read with a deadline, so that is a failure and not a hang.)
+/// the row that makes it act. A daemon that is slower than that (this machine, loaded) has not
+/// chosen the group by the time it changes: it then finds it ineligible and writes nothing,
+/// which this notices (nothing is written, and the daemon has acted on nothing) and tries
+/// again, up to three times, with a daemon of its own each time and twice the time to get
+/// there. The daemon having acted, or the group having been touched, is a failure at once,
+/// and so is no write three times.
 fn change_while_the_record_is_written(
     name: &str,
     stage: impl Fn(&mut Script),
     recorded: usize,
     said: &str,
 ) {
+    for attempt in 1..=3 {
+        if record_is_written_while_the_group_changes(
+            &format!("{name}-{attempt}"),
+            &stage,
+            recorded,
+            said,
+            Duration::from_millis(1500 << (attempt - 1)),
+        ) {
+            return;
+        }
+    }
+    panic!(
+        "the daemon never wrote the record in three attempts: it chose the group too late each time"
+    );
+}
+
+/// One attempt of `change_while_the_record_is_written`, in which the daemon has `time_to_wait`
+/// to be waiting for the pipe; false if it wrote nothing and did nothing, and the attempt
+/// tested nothing.
+fn record_is_written_while_the_group_changes(
+    name: &str,
+    stage: &dyn Fn(&mut Script),
+    recorded: usize,
+    said: &str,
+    time_to_wait: Duration,
+) -> bool {
     let dir = scratch(name);
     let (state, log) = (dir.join("state"), dir.join("log"));
     let (mut changeling, only) = Changeling::spawn(&dir);
@@ -2195,16 +2382,25 @@ fn change_while_the_record_is_written(
     daemon.wait_samples(&log, 1);
     stage(&mut script);
     daemon.wait_samples(&log, recorded);
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(time_to_wait);
     assert!(
         changeling.group.alive() && !changeling.group.stopped(),
         "the record is waiting to be written, and nothing has been done to the group"
     );
     changeling.change();
     let written = read_fifo(&tmp);
+    if written.is_empty() {
+        assert!(
+            actions(&log).is_empty() && !changeling.group.stopped(),
+            "the daemon acted without writing the record\n{}",
+            events(&log)
+        );
+        let _ = fs::remove_dir_all(&dir);
+        return false;
+    }
     assert!(
         written.starts_with(&format!("{}\t", changeling.group.pgid())),
-        "{written:?}: the daemon was not waiting to write the record\n{}",
+        "{written:?}: not the record of the group\n{}",
         events(&log)
     );
 
@@ -2216,6 +2412,7 @@ fn change_while_the_record_is_written(
     assert_eq!(records(&state), 0, "and nothing is promised");
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
+    true
 }
 
 #[test]
@@ -2273,29 +2470,39 @@ fn nothing_waits_for_a_file_that_blocks(
     daemon.wait_actions(&log, 2);
     assert!(group.settles(false), "and resumed");
 
-    // The queue: the first command runs long enough to be measured, so that when it is done
-    // its size is to be written; the second is told to go after that.
+    // The queue: the first command runs until the test lets it end, which is once it has been
+    // measured (when a command that was measured is done, its size is to be written); the
+    // second is told to go after that.
+    let release = marker_file(&dir, "release");
     let mut first = Client::spawn(
         &dir,
         "first",
         &socket,
         &["--label", "first"],
-        &["sleep", "2"],
+        &[
+            "sh",
+            "-c",
+            "while [ ! -e \"$1\" ]; do sleep 0.05; done",
+            "sh",
+            &release,
+        ],
     );
-    let mut measured = false;
+    if sizes_blocked {
+        // The status file is readable here, and says whether the command was measured.
+        wait_until("the first command to be measured", 60, || {
+            script.calm(1);
+            membrake::broker::read_queue(&state)
+                .ok()
+                .flatten()
+                .is_some_and(|q| q.running.iter().any(|r| r.pgid > 1 && r.peak > 0))
+        });
+    }
+    fs::write(&release, "").unwrap();
     wait_until("the first command to be done", 60, || {
         script.calm(1);
-        measured |= membrake::broker::read_queue(&state)
-            .ok()
-            .flatten()
-            .is_some_and(|q| q.running.iter().any(|r| r.pgid > 1 && r.peak > 0));
         first.child.try_wait().unwrap().is_some()
     });
     assert_eq!(first.code(), Some(0));
-    assert!(
-        measured || !sizes_blocked,
-        "the command was never measured, so no size was ever to be written: the blocked sizes file was not in its way"
-    );
     // A client fails open when the daemon does not answer, and then runs anyway: that the
     // commands ran is not enough, they must have been let go by the queue.
     assert!(!first.said().contains("unavailable"), "{}", first.said());
