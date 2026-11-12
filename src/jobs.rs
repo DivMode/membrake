@@ -640,6 +640,13 @@ impl Inspector {
         }
     }
 
+    /// The pids the kernel lists for group `pgid`, exited members (zombies) included, from one
+    /// `proc_listpgrppids` call. Err if the kernel could not say.
+    pub fn pids(&mut self, pgid: i32) -> Result<&[i32], String> {
+        let count = self.list(pgid)?;
+        Ok(&self.pids[..count])
+    }
+
     /// Lists group `pgid` and reads each member. Allocation-free once warm.
     pub fn look(&mut self, pgid: i32) -> Look {
         let count = match self.list(pgid) {

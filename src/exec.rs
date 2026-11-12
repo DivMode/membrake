@@ -15,8 +15,23 @@
 //! `taskpolicy -c utility nice -n 10` would run it. The exit code is the command's; a command
 //! that dies of a signal gives 128 plus the signal, and 127 and 126 are a command that is not
 //! found and one that cannot be run, as in a shell.
+//!
+//! When the command has exited, whatever it left running in that group is stopped if the job
+//! was interrupted (a signal was passed on to it, or the command died of one) or `--reap` was
+//! given: `SIGTERM` to the group, then `SIGKILL` if anything is left after `REAP_GRACE`, until
+//! the group is empty or `KILL_WAIT` has passed. Without either, one line on stderr says the
+//! group still has processes and they are left alone. The group is the one this process
+//! created when it started the command, never one it looked up; its number stays the command's
+//! throughout, because the command is reaped only afterwards (see "What the command leaves
+//! running"). Whether anything is left is read from one kernel list of the group's pids (see
+//! `listed`), so a member that forks and exits cannot hide its child; a group that keeps forking
+//! faster than it is stopped may still outlast `KILL_WAIT`, and is then reported. A process that
+//! left the group (`setsid`, `setpgid`) is not followed. Stopping a
+//! job's leftovers is this, so that scripts and agents never search the process table for them
+//! (nix-config issue 270: on 2026-11-11 such a search reached every process group).
 
 use crate::act::private_symbol;
+use crate::jobs;
 use crate::wire::{self, Message, Reply};
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -25,7 +40,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 /// Set in the environment of every command the queue let through (or that ran because the
@@ -53,6 +68,9 @@ pub struct Args {
     pub label: Option<String>,
     pub socket: PathBuf,
     pub command: Vec<OsString>,
+    /// Stop what the command leaves running in its group when it ends, even when nothing
+    /// interrupted it.
+    pub reap: bool,
 }
 
 /// Best-effort stderr line. Not `eprintln!`, which panics when stderr is closed.
@@ -67,12 +85,15 @@ fn say(message: &str) {
 static PENDING: AtomicI32 = AtomicI32::new(0);
 /// The command's process group, once it runs.
 static GROUP: AtomicI32 = AtomicI32::new(0);
+/// Set once a signal has been passed on to the command's group: the job was interrupted.
+static FORWARDED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(sig: libc::c_int) {
     let group = GROUP.load(Ordering::SeqCst);
     if group > 0 {
         // SAFETY: killpg is async-signal-safe.
         unsafe { libc::killpg(group, sig) };
+        FORWARDED.store(true, Ordering::SeqCst);
     } else {
         PENDING.store(sig, Ordering::SeqCst);
     }
@@ -365,8 +386,35 @@ fn spawn(command: &[OsString]) -> Result<i32, NotRun> {
     outcome
 }
 
-/// Waits for the command and gives its exit code.
-fn wait_for(pid: i32) -> i32 {
+/// Waits until the command has exited, and leaves it unreaped: a zombie keeps its pid, and so
+/// its group's number, until `release` collects it. Says whether a signal ended it.
+fn wait_for_exit(pid: i32) -> Result<bool, String> {
+    loop {
+        // SAFETY: zeroed siginfo is a valid out-parameter.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` outlives the call.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(matches!(info.si_code, libc::CLD_KILLED | libc::CLD_DUMPED));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e.to_string());
+        }
+    }
+}
+
+/// Collects the command, and with it the hold on its group's number, and gives its exit code.
+/// The group is unpublished first, so no signal handler sends to the number after this.
+fn release(pid: i32) -> i32 {
+    GROUP.store(0, Ordering::SeqCst);
     let mut status = 0;
     loop {
         // SAFETY: `status` is a valid out-parameter.
@@ -391,8 +439,201 @@ fn wait_for(pid: i32) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// What the command leaves running
+//
+// The group's number cannot go to anyone else while this runs. The command's process, which
+// leads the group, is an unreaped zombie here (`wait_for_exit`), and XNU keeps a zombie in the
+// pid hash and in its process group until its parent reaps it: `forkproc` rejects a pid that
+// `phash_find_locked`, `pghash_exists_locked` or `session_find_locked` finds, and
+// `reap_child_locked` is where `phash_remove_locked` and `pgrp_leave_locked` happen
+// (bsd/kern/kern_fork.c, kern_exit.c). So no new process, and no new group, takes the number,
+// and every signal below, and every one the handler passes on meanwhile, reaches only the
+// command's group. `release` reaps it only afterwards, unpublishing the group first.
+
+/// How long the group's leftovers have between `SIGTERM` and `SIGKILL`.
+const REAP_GRACE: Duration = Duration::from_secs(10);
+/// How long `SIGKILL` is repeated, for members forked after a previous one went out.
+const KILL_WAIT: Duration = Duration::from_secs(2);
+/// How often the group is looked at while they stop.
+const REAP_LOOK: Duration = Duration::from_millis(100);
+
+/// What the kernel lists in the command's group besides the held leader.
+#[derive(Debug, PartialEq)]
+enum Listed {
+    /// Only the held leader: nothing else is in the group.
+    Leader,
+    /// This many other pids, live or exited and not yet reaped by their own parents.
+    Others(usize),
+    /// The kernel could not list the group.
+    Unknown,
+}
+
+/// The group as one `proc_listpgrppids` call lists it. XNU fills that list while holding
+/// `proc_list_lock` and includes exited members (zombies) (bsd/kern/proc_info.c,
+/// `PROC_PGRP_ONLY`), so a member that forks and exits cannot hide its child: the child is
+/// listed, and so is the member until its own parent reaps it. Nothing listed is filtered out
+/// afterwards; an exited member only delays "only the leader" until it is reaped, which is the
+/// safe side. The one limit is the kernel's own: it sizes the list before taking the lock, so a
+/// group that grows by more than about 20 processes in between could be listed short.
+fn listed(group: i32) -> Listed {
+    let mut inspector = jobs::Inspector::new();
+    match inspector.pids(group) {
+        Ok(pids) => match pids.iter().filter(|&&pid| pid != group).count() {
+            0 => Listed::Leader,
+            n => Listed::Others(n),
+        },
+        Err(_) => Listed::Unknown,
+    }
+}
+
+/// True when the group has a member this user may signal (`killpg` with signal 0). Only for the
+/// wording of the line that leaves a group alone.
+fn signallable(group: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing.
+    unsafe { libc::killpg(group, 0) == 0 }
+}
+
+/// Waits up to `limit` for the group to list only the leader, calling `each` before every
+/// wait. True if it did.
+fn emptied(group: i32, limit: Duration, mut each: impl FnMut()) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if listed(group) == Listed::Leader {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        each();
+        std::thread::sleep(REAP_LOOK);
+    }
+}
+
+fn signal_group(group: i32, sig: libc::c_int) {
+    // SAFETY: the command's group, its number held by the unreaped leader (see above).
+    unsafe { libc::killpg(group, sig) };
+}
+
+/// The signals passed on to the command (`install_signal_handlers`), as a set.
+fn passed_on() -> libc::sigset_t {
+    // SAFETY: an initialised, then filled, signal set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaddset(&mut set, sig);
+        }
+        set
+    }
+}
+
+/// Blocks the signals passed on to the command, on top of whatever is blocked already, and
+/// gives the mask as it was, for `restore_signals`.
+fn hold_signals() -> libc::sigset_t {
+    let set = passed_on();
+    // SAFETY: both sets are initialised; the kernel fills `old`.
+    unsafe {
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        old
+    }
+}
+
+/// Puts back the mask `hold_signals` found: a signal the caller had blocked stays blocked.
+fn restore_signals(old: &libc::sigset_t) {
+    // SAFETY: `old` came from `pthread_sigmask`.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, old, std::ptr::null_mut()) };
+}
+
+/// True when one of the signals passed on to the command is pending only because
+/// `hold_signals` blocked it: one the caller had blocked itself was never going to interrupt.
+fn signal_pending(before: &libc::sigset_t) -> bool {
+    // SAFETY: zeroed, then filled by the kernel.
+    unsafe {
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut pending);
+        [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .iter()
+            .any(|&sig| {
+                libc::sigismember(&pending, sig) == 1 && libc::sigismember(before, sig) == 0
+            })
+    }
+}
+
+/// Stops what is left in the command's group once the command has exited, or says it is there.
+/// `stop`: the job was interrupted, or `--reap` was given. When it left the group alone it
+/// returns with the signals passed on to the command blocked, and the mask to restore once the
+/// command is reaped (see `run_command`).
+fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
+    let first = listed(group);
+    if first == Listed::Leader {
+        return None;
+    }
+    // The decision to leave the group alone is made with the signals that would interrupt the
+    // job blocked, and one already pending counts: a signal cannot arrive between the decision
+    // and acting on it. If the group is left, they stay blocked until the command is reaped
+    // and the group unpublished (`release`), so none is passed on to it afterwards either.
+    if !stop {
+        let before = hold_signals();
+        if !FORWARDED.load(Ordering::SeqCst) && !signal_pending(&before) {
+            say(&if first == Listed::Unknown {
+                format!(
+                    "the command ended; its process group {group} could not be listed; left alone"
+                )
+            } else if signallable(group) {
+                format!(
+                    "the command ended, but its process group {group} still has processes \
+                     running; left alone (--reap stops them when the command ends)"
+                )
+            } else {
+                format!(
+                    "the command ended, but its process group {group} still lists processes \
+                     this user cannot signal, or that have exited; left alone"
+                )
+            });
+            return Some(before);
+        }
+        restore_signals(&before);
+    }
+    // Stopping always goes the whole way: whatever the group holds, or whether it can be read,
+    // it gets SIGTERM, then SIGKILL after the grace. Only "lists only the leader" ends it early.
+    signal_group(group, libc::SIGTERM);
+    if emptied(group, REAP_GRACE, || {}) {
+        say("stopped what the command left running in its process group (SIGTERM)");
+        return None;
+    }
+    // Again at every look: a member may fork after a SIGKILL has gone out to the others.
+    signal_group(group, libc::SIGKILL);
+    if emptied(group, KILL_WAIT, || signal_group(group, libc::SIGKILL)) {
+        say(&format!(
+            "stopped what the command left running in its process group (SIGTERM, then SIGKILL \
+             after {} s)",
+            REAP_GRACE.as_secs()
+        ));
+        return None;
+    }
+    say(&match listed(group) {
+        Listed::Others(n) => format!(
+            "after SIGTERM and {} s of SIGKILL the command's process group {group} still lists \
+             {n} other process(es); left",
+            KILL_WAIT.as_secs()
+        ),
+        Listed::Unknown => format!(
+            "after SIGTERM and SIGKILL the command's process group {group} could not be listed; \
+             whether anything is left is not known"
+        ),
+        Listed::Leader => format!(
+            "stopped what the command left running in its process group (SIGTERM, then SIGKILL \
+             after {} s)",
+            REAP_GRACE.as_secs()
+        ),
+    });
+    None
+}
+
 /// Runs the command to its end and reports it to the daemon, if there is one on the line.
-fn run_command(command: &[OsString], mut daemon: Option<UnixStream>) -> i32 {
+fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always: bool) -> i32 {
     let tell = |daemon: &mut Option<UnixStream>, message: Message| {
         if let Some(stream) = daemon.as_mut()
             && stream.write_all(message.line().as_bytes()).is_err()
@@ -415,9 +656,26 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>) -> i32 {
     if early != 0 {
         // SAFETY: signalling the group this process just started.
         unsafe { libc::killpg(pid, early) };
+        FORWARDED.store(true, Ordering::SeqCst);
     }
     tell(&mut daemon, Message::Started(pid));
-    let code = wait_for(pid);
+    let held: Option<libc::sigset_t> = match wait_for_exit(pid) {
+        Ok(signalled) => reap(
+            pid,
+            reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
+        ),
+        // Not known to have exited, so its group's number is not known to be held: the group
+        // is unpublished before anything else, and nothing is sent to it.
+        Err(why) => {
+            GROUP.store(0, Ordering::SeqCst);
+            say(&format!("cannot wait for the command: {why}"));
+            None
+        }
+    };
+    let code = release(pid);
+    if let Some(before) = held {
+        restore_signals(&before);
+    }
     tell(&mut daemon, Message::Done(code));
     code
 }
@@ -428,6 +686,7 @@ pub fn run(args: Args) -> i32 {
         label,
         socket,
         command,
+        reap: reap_always,
     } = args;
     if std::env::var_os(ADMITTED).is_some() {
         // Replaces this process: the command is as direct as it can be.
@@ -444,10 +703,10 @@ pub fn run(args: Args) -> i32 {
     let signature = wire::signature(&command);
     let label = wire::sanitize(label.as_deref().unwrap_or(&signature), wire::MAX_LABEL);
     match wait_for_turn(&socket, &label, &signature) {
-        Ok(stream) => run_command(&command, Some(stream)),
+        Ok(stream) => run_command(&command, Some(stream), reap_always),
         Err(Stopped::Unavailable(why)) => {
             say(&format!("queue unavailable ({why}); running now"));
-            run_command(&command, None)
+            run_command(&command, None, reap_always)
         }
         Err(Stopped::Signalled(sig)) => 128 + sig,
     }

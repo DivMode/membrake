@@ -171,6 +171,11 @@ struct ExecArgs {
     /// The daemon's socket
     #[arg(long, value_name = "PATH", default_value = DEFAULT_SOCKET)]
     socket: PathBuf,
+    /// When the command ends, stop what it left running in its process group (SIGTERM, then
+    /// SIGKILL after 10 s). Without it, that happens only when the command was interrupted;
+    /// otherwise one line says what is left. Not inside an admitted command, which runs directly
+    #[arg(long)]
+    reap: bool,
     /// The command and its arguments, after `--`
     #[arg(last = true, required = true, value_name = "COMMAND")]
     command: Vec<OsString>,
@@ -326,6 +331,7 @@ fn execute_as(cli: Cli, uid: u32, euid: u32) -> Result<ExitCode, String> {
                 label: a.label,
                 socket: a.socket,
                 command: a.command,
+                reap: a.reap,
             }) as u8));
         }
     };

@@ -349,6 +349,48 @@ stderr whenever its place in the queue changes:
 membrake: queued for memory (position 2, needs 1.0 GB)
 ```
 
+### Stopping a job and what it leaves
+
+`membrake exec` is the way to stop a job, so that nothing else has to search the
+process table for it: signal the one `membrake exec` process you started, by the
+pid you recorded when you started it, and `wait` for it. It passes the signal to
+the command's whole process group.
+
+When the command has exited, `membrake exec` looks at the group it created for it.
+If anything is still running there, and the job was interrupted (a signal was
+passed on, or the command died of one) or `--reap` was given, it sends the group
+`SIGTERM`, then `SIGKILL` if anything is left 10 s later, repeated for up to 2 s
+for anything forked meanwhile, and says in one line what happened, including
+anything still left. It counts as stopped only when one kernel list of the
+group's pids (`proc_listpgrppids`, taken under the kernel's process-list lock,
+exited members included) holds nothing but the command's own, so a member that
+forks and exits cannot hide its child. Stopping, once it starts, always goes the
+whole way, whatever it can or cannot read. A group that keeps forking faster than
+it is stopped may still outlast the 2 s of `SIGKILL`, and is then reported as
+left. A command that leaves nothing pays one such call. Otherwise it leaves them and says that the group still has
+processes: a command may start a server and mean to leave it up. `--reap` is for
+a test batch or a build that should leave nothing behind. A leftover that is
+stopped usually never gets that far: when the command exits its group is often
+orphaned, and macOS sends the stopped members of an orphaned group `SIGHUP` and
+`SIGCONT`. One that is not resumed, or that ignores `SIGHUP`, still gets
+`SIGKILL` after the grace, which stops a stopped process too. The decision to
+leave a group alone is made with `SIGINT`, `SIGTERM` and `SIGHUP` blocked, so one
+that arrives while it is being made counts as an interruption.
+
+It only ever signals the group it created for its command, whose number it got
+from starting it, never one it looked up. That number cannot go to anyone else
+meanwhile: the command's process leads the group, and `membrake exec` reaps it
+only after the cleanup, while macOS keeps an unreaped process in the pid table
+and in its group (XNU `forkproc` will not hand out a pid that a process or a
+group still holds; both are released only at reap). A process that left the
+group (`setsid`, `setpgid`, as some build daemons do) is not followed; such a
+process is meant to outlive the command. Inside an admitted command (below)
+`membrake exec` runs its command directly and has no group of its own, so it
+stops nothing there.
+
+This is the answer to nix-config issue 270: on 2026-11-11 a test script that searched
+the process table for its own leftovers reached every process group on the machine.
+
 ### When a command starts
 
 Requests wait in order, and the next one starts only when **all** of this holds:
