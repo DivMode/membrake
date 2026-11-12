@@ -356,20 +356,28 @@ process table for it: signal the one `membrake exec` process you started, by the
 pid you recorded when you started it, and `wait` for it. It passes the signal to
 the command's whole process group.
 
-When the command has ended, `membrake exec` looks at the group it created for it.
+When the command has exited, `membrake exec` looks at the group it created for it.
 If anything is still running there, and the job was interrupted (a signal was
 passed on, or the command died of one) or `--reap` was given, it sends the group
-`SIGTERM`, then `SIGKILL` if anything is left 10 s later, and says so in one line.
-Otherwise it leaves them and says that the group still has processes: a command
-may start a server and mean to leave it up. `--reap` is for a test batch or a
-build that should leave nothing behind.
+`SIGTERM`, then `SIGKILL` if anything is left 10 s later, repeated for up to 2 s
+for anything forked meanwhile, and says in one line what happened, including
+anything still left. Otherwise it leaves them and says that the group still has
+processes: a command may start a server and mean to leave it up. `--reap` is for
+a test batch or a build that should leave nothing behind. A leftover that is
+stopped is not a special case: once the command has exited its group is
+orphaned, and macOS sends a stopped member of an orphaned group `SIGHUP` and
+`SIGCONT`.
 
 It only ever signals the group it created for its command, whose number it got
-from starting it, never one it looked up. A process that left the group (`setsid`,
-`setpgid`, as some build daemons do) is not followed; such a process is meant to
-outlive the command. Before each signal it checks that no later process holds the
-group's number. Inside an admitted command (below) `membrake exec` runs its command
-directly and has no group of its own, so it stops nothing there.
+from starting it, never one it looked up. That number cannot go to anyone else
+meanwhile: the command's process leads the group, and `membrake exec` reaps it
+only after the cleanup, while macOS keeps an unreaped process in the pid table
+and in its group (XNU `forkproc` will not hand out a pid that a process or a
+group still holds; both are released only at reap). A process that left the
+group (`setsid`, `setpgid`, as some build daemons do) is not followed; such a
+process is meant to outlive the command. Inside an admitted command (below)
+`membrake exec` runs its command directly and has no group of its own, so it
+stops nothing there.
 
 This is the answer to nix-config issue 270: on 2026-11-11 a test script that searched
 the process table for its own leftovers reached every process group on the machine.

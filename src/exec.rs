@@ -16,14 +16,16 @@
 //! that dies of a signal gives 128 plus the signal, and 127 and 126 are a command that is not
 //! found and one that cannot be run, as in a shell.
 //!
-//! When the command has ended, whatever it left running in that group is stopped if the job
+//! When the command has exited, whatever it left running in that group is stopped if the job
 //! was interrupted (a signal was passed on to it, or the command died of one) or `--reap` was
-//! given: `SIGTERM` to the group, then `SIGKILL` if anything is left after `REAP_GRACE`. Without
-//! either, one line on stderr says the group still has processes and they are left alone. The
-//! group is the one this process created when it started the command, never one it looked up,
-//! and a process that left it (`setsid`, `setpgid`) is not followed: stopping a job's leftovers
-//! is this, so that scripts and agents never search the process table for them (nix-config
-//! issue 270: on 2026-11-11 such a search reached every process group on the machine).
+//! given: `SIGTERM` to the group, then `SIGKILL` if anything is left after `REAP_GRACE`, until
+//! the group is empty or `KILL_WAIT` has passed. Without either, one line on stderr says the
+//! group still has processes and they are left alone. The group is the one this process
+//! created when it started the command, never one it looked up; its number stays the command's
+//! throughout, because the command is reaped only afterwards (see "What the command leaves
+//! running"). A process that left the group (`setsid`, `setpgid`) is not followed. Stopping a
+//! job's leftovers is this, so that scripts and agents never search the process table for them
+//! (nix-config issue 270: on 2026-11-11 such a search reached every process group).
 
 use crate::act::private_symbol;
 use crate::jobs;
@@ -381,8 +383,35 @@ fn spawn(command: &[OsString]) -> Result<i32, NotRun> {
     outcome
 }
 
-/// Waits for the command and gives its exit code, and whether a signal ended it.
-fn wait_for(pid: i32) -> (i32, bool) {
+/// Waits until the command has exited, and leaves it unreaped: a zombie keeps its pid, and so
+/// its group's number, until `release` collects it. Says whether a signal ended it.
+fn wait_for_exit(pid: i32) -> Result<bool, String> {
+    loop {
+        // SAFETY: zeroed siginfo is a valid out-parameter.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` outlives the call.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return Ok(matches!(info.si_code, libc::CLD_KILLED | libc::CLD_DUMPED));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e.to_string());
+        }
+    }
+}
+
+/// Collects the command, and with it the hold on its group's number, and gives its exit code.
+/// The group is unpublished first, so no signal handler sends to the number after this.
+fn release(pid: i32) -> i32 {
+    GROUP.store(0, Ordering::SeqCst);
     let mut status = 0;
     loop {
         // SAFETY: `status` is a valid out-parameter.
@@ -395,112 +424,109 @@ fn wait_for(pid: i32) -> (i32, bool) {
                 "cannot wait for the command: {}",
                 io::Error::last_os_error()
             ));
-            return (1, false);
+            return 1;
         }
     }
     if libc::WIFEXITED(status) {
-        (libc::WEXITSTATUS(status), false)
+        libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
-        (128 + libc::WTERMSIG(status), true)
+        128 + libc::WTERMSIG(status)
     } else {
-        (1, false)
+        1
     }
 }
 
 // ---------------------------------------------------------------------------------------
 // What the command leaves running
+//
+// The group's number cannot go to anyone else while this runs. The command's process, which
+// leads the group, is an unreaped zombie here (`wait_for_exit`), and XNU keeps a zombie in the
+// pid hash and in its process group until its parent reaps it: `forkproc` rejects a pid that
+// `phash_find_locked`, `pghash_exists_locked` or `session_find_locked` finds, and
+// `reap_child_locked` is where `phash_remove_locked` and `pgrp_leave_locked` happen
+// (bsd/kern/kern_fork.c, kern_exit.c). So no new process, and no new group, takes the number,
+// and every signal below, and every one the handler passes on meanwhile, reaches only the
+// command's group. `release` reaps it only afterwards, unpublishing the group first.
 
 /// How long the group's leftovers have between `SIGTERM` and `SIGKILL`.
 const REAP_GRACE: Duration = Duration::from_secs(10);
+/// How long `SIGKILL` is repeated, for members forked after a previous one went out.
+const KILL_WAIT: Duration = Duration::from_secs(2);
 /// How often the group is looked at while they stop.
 const REAP_LOOK: Duration = Duration::from_millis(100);
 
-/// What `killpg(group, 0)` says about the group.
-#[derive(Debug, PartialEq)]
-enum Members {
-    None,
-    Some,
-    /// It has processes this user may not signal.
-    Foreign,
-}
-
-fn members(group: i32) -> Members {
-    // SAFETY: signal 0 delivers nothing; it asks whether the group has processes.
-    if unsafe { libc::killpg(group, 0) } == 0 {
-        return Members::Some;
-    }
-    match io::Error::last_os_error().raw_os_error() {
-        Some(libc::EPERM) => Members::Foreign,
-        _ => Members::None,
+/// The group's live members, not counting the zombie leader; None if the kernel cannot say.
+fn left(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
+    match inspector.look(group) {
+        jobs::Look::Absent => Some(0),
+        jobs::Look::Present => Some(inspector.members().len()),
+        jobs::Look::Unknown(_) => None,
     }
 }
 
-/// True when the number is no longer the command's group: a process whose pid is that number
-/// started after the command did, so the number went to another process. Its kernel keeps a
-/// group's number from going to a new process while the group has members, so this is a check
-/// for the moment the last member leaves, between a look and a signal.
-fn reused(group: i32, started_us: u64, now: Option<(i32, u64)>) -> bool {
-    matches!(now, Some((pgid, start)) if start > started_us || pgid != group)
-}
-
-fn reused_now(group: i32, started_us: u64) -> bool {
-    reused(
-        group,
-        started_us,
-        jobs::bsd_info(group).map(|p| (p.pgid, p.start_us)),
-    )
-}
-
-/// Stops what is left in the command's group once the command has ended, or says it is there.
-/// `stop`: the job was interrupted, or `--reap` was given. `started_us`: when the command
-/// started, to tell its group number from the same number given to someone else later.
-fn reap(group: i32, started_us: u64, stop: bool) {
-    match members(group) {
-        Members::None => return,
-        Members::Foreign => {
-            say(&format!(
-                "the command's process group {group} still has processes this user cannot \
-                 signal; left alone"
-            ));
-            return;
+/// Waits up to `limit` for the group to empty, calling `each` at every look. True if it did.
+fn emptied(
+    inspector: &mut jobs::Inspector,
+    group: i32,
+    limit: Duration,
+    mut each: impl FnMut(),
+) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if left(inspector, group) == Some(0) {
+            return true;
         }
-        Members::Some => {}
+        if Instant::now() >= deadline {
+            return false;
+        }
+        each();
+        std::thread::sleep(REAP_LOOK);
     }
-    if !stop {
+}
+
+fn signal_group(group: i32, sig: libc::c_int) {
+    // SAFETY: the command's group, its number held by the unreaped leader (see above).
+    unsafe { libc::killpg(group, sig) };
+}
+
+/// Stops what is left in the command's group once the command has exited, or says it is there.
+/// `stop`: the job was interrupted, or `--reap` was given.
+fn reap(group: i32, stop: bool) {
+    let mut inspector = jobs::Inspector::new();
+    if left(&mut inspector, group) == Some(0) {
+        return;
+    }
+    // A signal passed on after `stop` was worked out still makes the job an interrupted one.
+    if !stop && !FORWARDED.load(Ordering::SeqCst) {
         say(&format!(
             "the command ended, but its process group {group} still has processes running; \
              left alone (--reap stops them when the command ends)"
         ));
         return;
     }
-    let signal_group = |sig: libc::c_int| -> bool {
-        if reused_now(group, started_us) {
-            say(&format!(
-                "process group {group} is no longer the command's; nothing sent"
-            ));
-            return false;
-        }
-        // SAFETY: the group this process created for its command, checked just above.
-        unsafe { libc::killpg(group, sig) };
-        true
-    };
-    if !signal_group(libc::SIGTERM) {
+    signal_group(group, libc::SIGTERM);
+    if emptied(&mut inspector, group, REAP_GRACE, || {}) {
+        say("stopped what the command left running in its process group (SIGTERM)");
         return;
     }
-    let deadline = Instant::now() + REAP_GRACE;
-    while Instant::now() < deadline {
-        if members(group) == Members::None {
-            say("stopped what the command left running in its process group (SIGTERM)");
-            return;
-        }
-        std::thread::sleep(REAP_LOOK);
-    }
-    if members(group) != Members::None && signal_group(libc::SIGKILL) {
-        say(&format!(
+    // Again at every look: a member may fork after a SIGKILL has gone out to the others.
+    let killed = emptied(&mut inspector, group, KILL_WAIT, || {
+        signal_group(group, libc::SIGKILL)
+    });
+    match (killed, left(&mut inspector, group)) {
+        (true, _) => say(&format!(
             "what the command left running in its process group ignored SIGTERM for {} s; \
              killed it (SIGKILL)",
             REAP_GRACE.as_secs()
-        ));
+        )),
+        (false, Some(n)) => say(&format!(
+            "{n} process(es) in the command's process group {group} were still running after \
+             SIGKILL (another user's, or still forking); left"
+        )),
+        (false, None) => say(&format!(
+            "could not tell whether the command's process group {group} still has processes \
+             after SIGKILL"
+        )),
     }
 }
 
@@ -522,9 +548,6 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
             return code;
         }
     };
-    // When the command started, to know its group number later (see `reused`). Read before
-    // the group is published, while the leader surely runs.
-    let started_us = jobs::bsd_info(pid).map_or(0, |p| p.start_us);
     GROUP.store(pid, Ordering::SeqCst);
     // A signal that came in between the spawn and the line above.
     let early = PENDING.swap(0, Ordering::SeqCst);
@@ -534,12 +557,16 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
         FORWARDED.store(true, Ordering::SeqCst);
     }
     tell(&mut daemon, Message::Started(pid));
-    let (code, signalled) = wait_for(pid);
-    reap(
-        pid,
-        started_us,
-        reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
-    );
+    match wait_for_exit(pid) {
+        Ok(signalled) => reap(
+            pid,
+            reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
+        ),
+        // Not known to have exited, so its group's number is not known to be held: nothing
+        // is sent to it.
+        Err(why) => say(&format!("cannot wait for the command: {why}")),
+    }
+    let code = release(pid);
     tell(&mut daemon, Message::Done(code));
     code
 }
@@ -573,29 +600,5 @@ pub fn run(args: Args) -> i32 {
             run_command(&command, None, reap_always)
         }
         Err(Stopped::Signalled(sig)) => 128 + sig,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::reused;
-
-    /// The number is still the command's group while no other process holds it as its pid,
-    /// or the one that does started no later than the command and still leads that group.
-    #[test]
-    fn a_group_number_is_reused_only_by_a_later_process_or_another_group() {
-        assert!(!reused(500, 1_000, None), "nobody holds the number");
-        assert!(
-            !reused(500, 1_000, Some((500, 1_000))),
-            "the command's own leader"
-        );
-        assert!(
-            reused(500, 1_000, Some((500, 2_000))),
-            "a process that started later"
-        );
-        assert!(
-            reused(500, 1_000, Some((501, 1_000))),
-            "a process in another group"
-        );
     }
 }
