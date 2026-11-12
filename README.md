@@ -349,6 +349,31 @@ stderr whenever its place in the queue changes:
 membrake: queued for memory (position 2, needs 1.0 GB)
 ```
 
+### Stopping a job and what it leaves
+
+`membrake exec` is the way to stop a job, so that nothing else has to search the
+process table for it: signal the one `membrake exec` process you started, by the
+pid you recorded when you started it, and `wait` for it. It passes the signal to
+the command's whole process group.
+
+When the command has ended, `membrake exec` looks at the group it created for it.
+If anything is still running there, and the job was interrupted (a signal was
+passed on, or the command died of one) or `--reap` was given, it sends the group
+`SIGTERM`, then `SIGKILL` if anything is left 10 s later, and says so in one line.
+Otherwise it leaves them and says that the group still has processes: a command
+may start a server and mean to leave it up. `--reap` is for a test batch or a
+build that should leave nothing behind.
+
+It only ever signals the group it created for its command, whose number it got
+from starting it, never one it looked up. A process that left the group (`setsid`,
+`setpgid`, as some build daemons do) is not followed; such a process is meant to
+outlive the command. Before each signal it checks that no later process holds the
+group's number. Inside an admitted command (below) `membrake exec` runs its command
+directly and has no group of its own, so it stops nothing there.
+
+This is the answer to nix-config issue 270: on 2026-11-11 a test script that searched
+the process table for its own leftovers reached every process group on the machine.
+
 ### When a command starts
 
 Requests wait in order, and the next one starts only when **all** of this holds:

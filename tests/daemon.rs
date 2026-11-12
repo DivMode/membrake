@@ -2657,3 +2657,137 @@ fn a_sizes_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
         state.join("sizes.tsv.tmp")
     });
 }
+
+// ---------------------------------------------------------------------------------------
+// What a command leaves running in its group (nix-config issue 270)
+//
+// Every process these tests signal is one their own `membrake exec` client started: the
+// client, or a process its command left behind, by the pid that command wrote down. None is
+// looked up.
+
+/// The pid a command wrote to `file`, once it has.
+fn written_pid(file: &str) -> i32 {
+    let mut pid = None;
+    wait_until(&format!("a pid in {file}"), 20, || {
+        pid = fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok());
+        pid.is_some()
+    });
+    pid.unwrap()
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Stops a process a test's command left behind, by the pid it wrote down.
+fn stop_left(pid: i32) {
+    // SAFETY: a process this test's own command started and recorded.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// An interrupted command's leftovers are stopped: `SIGTERM` to the group, then `SIGKILL`
+/// after the grace, here because the leftover ignores `SIGTERM`.
+#[test]
+fn exec_stops_what_an_interrupted_command_left_running() {
+    let dir = scratch("reap-interrupted");
+    let nobody = queue_socket("reap-interrupted");
+    let left = marker_file(&dir, "left");
+    let script = format!("(trap '' TERM; exec sleep 300) & echo $! > {left}; sleep 300");
+    let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
+    let leftover = written_pid(&left);
+    // SAFETY: the client this test started; it passes the signal to its command's group.
+    unsafe { libc::kill(client.pid(), libc::SIGTERM) };
+    assert_eq!(client.code(), Some(128 + libc::SIGTERM));
+    let gone = !alive(leftover);
+    if !gone {
+        stop_left(leftover);
+    }
+    assert!(gone, "the leftover outlived the client: {}", client.said());
+    assert!(
+        client.said().contains("killed it (SIGKILL)"),
+        "{}",
+        client.said()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// With `--reap`, a command that ends normally has its leftovers stopped too.
+#[test]
+fn exec_with_reap_stops_what_a_finished_command_left_running() {
+    let dir = scratch("reap-finished");
+    let nobody = queue_socket("reap-finished");
+    let left = marker_file(&dir, "left");
+    let script = format!("sleep 300 & echo $! > {left}");
+    let mut client = Client::spawn(&dir, "c", &nobody, &["--reap"], &["sh", "-c", &script]);
+    let leftover = written_pid(&left);
+    assert_eq!(client.code(), Some(0));
+    let gone = !alive(leftover);
+    if !gone {
+        stop_left(leftover);
+    }
+    assert!(gone, "the leftover outlived the client: {}", client.said());
+    assert!(
+        client
+            .said()
+            .contains("stopped what the command left running"),
+        "{}",
+        client.said()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Without `--reap` a command that ends normally keeps its leftovers (a server it means to
+/// leave up), and one line says they are there.
+#[test]
+fn exec_without_reap_leaves_a_finished_commands_leftovers_and_says_so() {
+    let dir = scratch("reap-not");
+    let nobody = queue_socket("reap-not");
+    let left = marker_file(&dir, "left");
+    let script = format!("sleep 300 & echo $! > {left}");
+    let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
+    let leftover = written_pid(&left);
+    assert_eq!(client.code(), Some(0));
+    let kept = alive(leftover);
+    stop_left(leftover);
+    assert!(kept, "the leftover was stopped: {}", client.said());
+    assert!(
+        client
+            .said()
+            .contains("still has processes running; left alone"),
+        "{}",
+        client.said()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A process that left the command's group is not followed, even with `--reap`: stopping
+/// leftovers is the group this client created, never a search.
+#[test]
+fn exec_does_not_follow_a_process_that_left_the_group() {
+    let dir = scratch("reap-left-group");
+    let nobody = queue_socket("reap-left-group");
+    let left = marker_file(&dir, "left");
+    let script =
+        format!("perl -e 'setpgrp(0, 0); exec \"sleep\", \"300\"' & echo $! > {left}; sleep 1");
+    let mut client = Client::spawn(&dir, "c", &nobody, &["--reap"], &["sh", "-c", &script]);
+    let leftover = written_pid(&left);
+    assert_eq!(client.code(), Some(0));
+    let kept = alive(leftover);
+    stop_left(leftover);
+    assert!(
+        kept,
+        "a process outside the group was stopped: {}",
+        client.said()
+    );
+    assert!(
+        !client
+            .said()
+            .contains("stopped what the command left running"),
+        "{}",
+        client.said()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -15,8 +15,18 @@
 //! `taskpolicy -c utility nice -n 10` would run it. The exit code is the command's; a command
 //! that dies of a signal gives 128 plus the signal, and 127 and 126 are a command that is not
 //! found and one that cannot be run, as in a shell.
+//!
+//! When the command has ended, whatever it left running in that group is stopped if the job
+//! was interrupted (a signal was passed on to it, or the command died of one) or `--reap` was
+//! given: `SIGTERM` to the group, then `SIGKILL` if anything is left after `REAP_GRACE`. Without
+//! either, one line on stderr says the group still has processes and they are left alone. The
+//! group is the one this process created when it started the command, never one it looked up,
+//! and a process that left it (`setsid`, `setpgid`) is not followed: stopping a job's leftovers
+//! is this, so that scripts and agents never search the process table for them (nix-config
+//! issue 270: on 2026-11-11 such a search reached every process group on the machine).
 
 use crate::act::private_symbol;
+use crate::jobs;
 use crate::wire::{self, Message, Reply};
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -25,7 +35,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 /// Set in the environment of every command the queue let through (or that ran because the
@@ -53,6 +63,9 @@ pub struct Args {
     pub label: Option<String>,
     pub socket: PathBuf,
     pub command: Vec<OsString>,
+    /// Stop what the command leaves running in its group when it ends, even when nothing
+    /// interrupted it.
+    pub reap: bool,
 }
 
 /// Best-effort stderr line. Not `eprintln!`, which panics when stderr is closed.
@@ -67,12 +80,15 @@ fn say(message: &str) {
 static PENDING: AtomicI32 = AtomicI32::new(0);
 /// The command's process group, once it runs.
 static GROUP: AtomicI32 = AtomicI32::new(0);
+/// Set once a signal has been passed on to the command's group: the job was interrupted.
+static FORWARDED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(sig: libc::c_int) {
     let group = GROUP.load(Ordering::SeqCst);
     if group > 0 {
         // SAFETY: killpg is async-signal-safe.
         unsafe { libc::killpg(group, sig) };
+        FORWARDED.store(true, Ordering::SeqCst);
     } else {
         PENDING.store(sig, Ordering::SeqCst);
     }
@@ -365,8 +381,8 @@ fn spawn(command: &[OsString]) -> Result<i32, NotRun> {
     outcome
 }
 
-/// Waits for the command and gives its exit code.
-fn wait_for(pid: i32) -> i32 {
+/// Waits for the command and gives its exit code, and whether a signal ended it.
+fn wait_for(pid: i32) -> (i32, bool) {
     let mut status = 0;
     loop {
         // SAFETY: `status` is a valid out-parameter.
@@ -379,20 +395,117 @@ fn wait_for(pid: i32) -> i32 {
                 "cannot wait for the command: {}",
                 io::Error::last_os_error()
             ));
-            return 1;
+            return (1, false);
         }
     }
     if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
+        (libc::WEXITSTATUS(status), false)
     } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
+        (128 + libc::WTERMSIG(status), true)
     } else {
-        1
+        (1, false)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// What the command leaves running
+
+/// How long the group's leftovers have between `SIGTERM` and `SIGKILL`.
+const REAP_GRACE: Duration = Duration::from_secs(10);
+/// How often the group is looked at while they stop.
+const REAP_LOOK: Duration = Duration::from_millis(100);
+
+/// What `killpg(group, 0)` says about the group.
+#[derive(Debug, PartialEq)]
+enum Members {
+    None,
+    Some,
+    /// It has processes this user may not signal.
+    Foreign,
+}
+
+fn members(group: i32) -> Members {
+    // SAFETY: signal 0 delivers nothing; it asks whether the group has processes.
+    if unsafe { libc::killpg(group, 0) } == 0 {
+        return Members::Some;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => Members::Foreign,
+        _ => Members::None,
+    }
+}
+
+/// True when the number is no longer the command's group: a process whose pid is that number
+/// started after the command did, so the number went to another process. Its kernel keeps a
+/// group's number from going to a new process while the group has members, so this is a check
+/// for the moment the last member leaves, between a look and a signal.
+fn reused(group: i32, started_us: u64, now: Option<(i32, u64)>) -> bool {
+    matches!(now, Some((pgid, start)) if start > started_us || pgid != group)
+}
+
+fn reused_now(group: i32, started_us: u64) -> bool {
+    reused(
+        group,
+        started_us,
+        jobs::bsd_info(group).map(|p| (p.pgid, p.start_us)),
+    )
+}
+
+/// Stops what is left in the command's group once the command has ended, or says it is there.
+/// `stop`: the job was interrupted, or `--reap` was given. `started_us`: when the command
+/// started, to tell its group number from the same number given to someone else later.
+fn reap(group: i32, started_us: u64, stop: bool) {
+    match members(group) {
+        Members::None => return,
+        Members::Foreign => {
+            say(&format!(
+                "the command's process group {group} still has processes this user cannot \
+                 signal; left alone"
+            ));
+            return;
+        }
+        Members::Some => {}
+    }
+    if !stop {
+        say(&format!(
+            "the command ended, but its process group {group} still has processes running; \
+             left alone (--reap stops them when the command ends)"
+        ));
+        return;
+    }
+    let signal_group = |sig: libc::c_int| -> bool {
+        if reused_now(group, started_us) {
+            say(&format!(
+                "process group {group} is no longer the command's; nothing sent"
+            ));
+            return false;
+        }
+        // SAFETY: the group this process created for its command, checked just above.
+        unsafe { libc::killpg(group, sig) };
+        true
+    };
+    if !signal_group(libc::SIGTERM) {
+        return;
+    }
+    let deadline = Instant::now() + REAP_GRACE;
+    while Instant::now() < deadline {
+        if members(group) == Members::None {
+            say("stopped what the command left running in its process group (SIGTERM)");
+            return;
+        }
+        std::thread::sleep(REAP_LOOK);
+    }
+    if members(group) != Members::None && signal_group(libc::SIGKILL) {
+        say(&format!(
+            "what the command left running in its process group ignored SIGTERM for {} s; \
+             killed it (SIGKILL)",
+            REAP_GRACE.as_secs()
+        ));
     }
 }
 
 /// Runs the command to its end and reports it to the daemon, if there is one on the line.
-fn run_command(command: &[OsString], mut daemon: Option<UnixStream>) -> i32 {
+fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always: bool) -> i32 {
     let tell = |daemon: &mut Option<UnixStream>, message: Message| {
         if let Some(stream) = daemon.as_mut()
             && stream.write_all(message.line().as_bytes()).is_err()
@@ -409,15 +522,24 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>) -> i32 {
             return code;
         }
     };
+    // When the command started, to know its group number later (see `reused`). Read before
+    // the group is published, while the leader surely runs.
+    let started_us = jobs::bsd_info(pid).map_or(0, |p| p.start_us);
     GROUP.store(pid, Ordering::SeqCst);
     // A signal that came in between the spawn and the line above.
     let early = PENDING.swap(0, Ordering::SeqCst);
     if early != 0 {
         // SAFETY: signalling the group this process just started.
         unsafe { libc::killpg(pid, early) };
+        FORWARDED.store(true, Ordering::SeqCst);
     }
     tell(&mut daemon, Message::Started(pid));
-    let code = wait_for(pid);
+    let (code, signalled) = wait_for(pid);
+    reap(
+        pid,
+        started_us,
+        reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
+    );
     tell(&mut daemon, Message::Done(code));
     code
 }
@@ -428,6 +550,7 @@ pub fn run(args: Args) -> i32 {
         label,
         socket,
         command,
+        reap: reap_always,
     } = args;
     if std::env::var_os(ADMITTED).is_some() {
         // Replaces this process: the command is as direct as it can be.
@@ -444,11 +567,35 @@ pub fn run(args: Args) -> i32 {
     let signature = wire::signature(&command);
     let label = wire::sanitize(label.as_deref().unwrap_or(&signature), wire::MAX_LABEL);
     match wait_for_turn(&socket, &label, &signature) {
-        Ok(stream) => run_command(&command, Some(stream)),
+        Ok(stream) => run_command(&command, Some(stream), reap_always),
         Err(Stopped::Unavailable(why)) => {
             say(&format!("queue unavailable ({why}); running now"));
-            run_command(&command, None)
+            run_command(&command, None, reap_always)
         }
         Err(Stopped::Signalled(sig)) => 128 + sig,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reused;
+
+    /// The number is still the command's group while no other process holds it as its pid,
+    /// or the one that does started no later than the command and still leads that group.
+    #[test]
+    fn a_group_number_is_reused_only_by_a_later_process_or_another_group() {
+        assert!(!reused(500, 1_000, None), "nobody holds the number");
+        assert!(
+            !reused(500, 1_000, Some((500, 1_000))),
+            "the command's own leader"
+        );
+        assert!(
+            reused(500, 1_000, Some((500, 2_000))),
+            "a process that started later"
+        );
+        assert!(
+            reused(500, 1_000, Some((501, 1_000))),
+            "a process in another group"
+        );
     }
 }
