@@ -2731,7 +2731,9 @@ fn exec_stops_what_an_interrupted_command_left_running() {
         client.said()
     );
     assert!(
-        client.said().contains("killed it (SIGKILL)"),
+        client
+            .said()
+            .contains("stopped what the command left running in its process group (SIGKILL"),
         "{}",
         client.said()
     );
