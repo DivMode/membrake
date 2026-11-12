@@ -2846,9 +2846,10 @@ fn exec_does_not_follow_a_process_that_left_the_group() {
     let dir = scratch("reap-left-group");
     let nobody = queue_socket("reap-left-group");
     let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
-    // The process leaves the group first and only then writes its pid.
+    // The process leaves the group first and only then writes its pid. The system's perl by
+    // its path: the Nix build that runs these tests has none on PATH.
     let script = format!(
-        "perl -e 'setpgrp(0, 0); open my $f, \">\", $ARGV[0]; print $f $$; close $f; \
+        "/usr/bin/perl -e 'setpgrp(0, 0); open my $f, \">\", $ARGV[0]; print $f $$; close $f; \
          exec \"sleep\", \"60\"' {file} & {} true",
         until(&go)
     );
