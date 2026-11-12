@@ -1142,7 +1142,7 @@ fn a_frozen_job_that_became_ineligible_is_not_killed() {
         assert!(Instant::now() < deadline, "the script never waited for go");
         std::thread::sleep(Duration::from_millis(10));
     }
-    while !jobs::command_line(newer.pgid()).is_some_and(|c| c == format!("sleep {later}")) {
+    while jobs::command_line(newer.pgid()).is_none_or(|c| c != format!("sleep {later}")) {
         assert!(
             Instant::now() < deadline,
             "{:?}",
