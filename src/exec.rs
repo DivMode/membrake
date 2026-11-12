@@ -456,12 +456,24 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 const REAP_LOOK: Duration = Duration::from_millis(100);
 
 /// The group's live members, not counting the zombie leader; None if the kernel cannot say.
-fn left(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
+fn look(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
     match inspector.look(group) {
         jobs::Look::Absent => Some(0),
         jobs::Look::Present => Some(inspector.members().len()),
         jobs::Look::Unknown(_) => None,
     }
+}
+
+/// As `look`, but empty only when a second look a `REAP_LOOK` later agrees. One look lists
+/// the group's pids and then reads each, so a member that forks and exits in between leaves
+/// its child out of both; the child is in the next list.
+fn left(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
+    let first = look(inspector, group);
+    if first != Some(0) {
+        return first;
+    }
+    std::thread::sleep(REAP_LOOK);
+    look(inspector, group)
 }
 
 /// Waits up to `limit` for the group to empty, calling `each` at every look. True if it did.
@@ -489,31 +501,88 @@ fn signal_group(group: i32, sig: libc::c_int) {
     unsafe { libc::killpg(group, sig) };
 }
 
-/// Stops what is left in the command's group once the command has exited, or says it is there.
-/// `stop`: the job was interrupted, or `--reap` was given.
-fn reap(group: i32, stop: bool) {
-    let mut inspector = jobs::Inspector::new();
-    if left(&mut inspector, group) == Some(0) {
-        return;
+/// The signals passed on to the command (`install_signal_handlers`), as a set.
+fn passed_on() -> libc::sigset_t {
+    // SAFETY: an initialised, then filled, signal set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaddset(&mut set, sig);
+        }
+        set
     }
-    // A signal passed on after `stop` was worked out still makes the job an interrupted one.
-    if !stop && !FORWARDED.load(Ordering::SeqCst) {
-        say(&format!(
-            "the command ended, but its process group {group} still has processes running; \
-             left alone (--reap stops them when the command ends)"
-        ));
-        return;
+}
+
+/// Blocks or unblocks the signals passed on to the command.
+fn hold_signals(block: bool) {
+    let set = passed_on();
+    let how = if block {
+        libc::SIG_BLOCK
+    } else {
+        libc::SIG_UNBLOCK
+    };
+    // SAFETY: `set` is initialised; the old mask is not wanted.
+    unsafe { libc::pthread_sigmask(how, &set, std::ptr::null_mut()) };
+}
+
+/// True when one of the signals passed on to the command is pending (blocked, not yet handled).
+fn signal_pending() -> bool {
+    // SAFETY: zeroed, then filled by the kernel.
+    unsafe {
+        let mut pending: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut pending);
+        [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .iter()
+            .any(|&sig| libc::sigismember(&pending, sig) == 1)
+    }
+}
+
+/// Stops what is left in the command's group once the command has exited, or says it is there.
+/// `stop`: the job was interrupted, or `--reap` was given. Returns with the signals passed on
+/// to the command blocked when it left the group alone (see `run_command`).
+fn reap(group: i32, stop: bool) -> bool {
+    let mut inspector = jobs::Inspector::new();
+    let found = left(&mut inspector, group);
+    if found == Some(0) {
+        return false;
+    }
+    // The decision to leave the group alone is made with the signals that would interrupt the
+    // job blocked, and one already pending counts: a signal cannot arrive between the decision
+    // and acting on it. If the group is left, they stay blocked until the command is reaped
+    // and the group unpublished (`release`), so none is passed on to it afterwards either.
+    if !stop {
+        hold_signals(true);
+        if !FORWARDED.load(Ordering::SeqCst) && !signal_pending() {
+            say(&match found {
+                Some(_) => format!(
+                    "the command ended, but its process group {group} still has processes \
+                     running; left alone (--reap stops them when the command ends)"
+                ),
+                None => format!(
+                    "the command ended; could not tell whether its process group {group} still \
+                     has processes; left alone"
+                ),
+            });
+            return true;
+        }
+        hold_signals(false);
     }
     signal_group(group, libc::SIGTERM);
     if emptied(&mut inspector, group, REAP_GRACE, || {}) {
         say("stopped what the command left running in its process group (SIGTERM)");
-        return;
+        return false;
     }
     // Again at every look: a member may fork after a SIGKILL has gone out to the others.
+    let mut kills = 0;
     let killed = emptied(&mut inspector, group, KILL_WAIT, || {
-        signal_group(group, libc::SIGKILL)
+        signal_group(group, libc::SIGKILL);
+        kills += 1;
     });
     match (killed, left(&mut inspector, group)) {
+        (true, _) if kills == 0 => {
+            say("stopped what the command left running in its process group (SIGTERM)")
+        }
         (true, _) => say(&format!(
             "what the command left running in its process group ignored SIGTERM for {} s; \
              killed it (SIGKILL)",
@@ -528,6 +597,7 @@ fn reap(group: i32, stop: bool) {
              after SIGKILL"
         )),
     }
+    false
 }
 
 /// Runs the command to its end and reports it to the daemon, if there is one on the line.
@@ -557,16 +627,23 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
         FORWARDED.store(true, Ordering::SeqCst);
     }
     tell(&mut daemon, Message::Started(pid));
-    match wait_for_exit(pid) {
+    let held = match wait_for_exit(pid) {
         Ok(signalled) => reap(
             pid,
             reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
         ),
-        // Not known to have exited, so its group's number is not known to be held: nothing
-        // is sent to it.
-        Err(why) => say(&format!("cannot wait for the command: {why}")),
-    }
+        // Not known to have exited, so its group's number is not known to be held: the group
+        // is unpublished before anything else, and nothing is sent to it.
+        Err(why) => {
+            GROUP.store(0, Ordering::SeqCst);
+            say(&format!("cannot wait for the command: {why}"));
+            false
+        }
+    };
     let code = release(pid);
+    if held {
+        hold_signals(false);
+    }
     tell(&mut daemon, Message::Done(code));
     code
 }

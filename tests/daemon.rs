@@ -2718,6 +2718,12 @@ fn leftover(trap: &str, file: &str) -> String {
     format!("sh -c '{trap} echo $$ > {file}; exec sleep 300' &")
 }
 
+/// `sh -c` text that waits until the test has written `go`: the command goes on, and so lets
+/// the cleanup start, only once the test holds the leftover's identity (`Left::read`).
+fn until(go: &str) -> String {
+    format!("while [ ! -e {go} ]; do sleep 0.05; done;")
+}
+
 /// An interrupted command's leftovers are stopped: `SIGTERM` to the group, then `SIGKILL`
 /// after the grace, here because the leftover ignores `SIGTERM`.
 #[test]
@@ -2750,13 +2756,11 @@ fn exec_stops_what_an_interrupted_command_left_running() {
 fn exec_stops_what_a_command_that_died_of_a_signal_left_running() {
     let dir = scratch("reap-died");
     let nobody = queue_socket("reap-died");
-    let file = marker_file(&dir, "left");
-    let script = format!(
-        "{} while [ ! -s {file} ]; do sleep 0.05; done; kill -TERM $$",
-        leftover("", &file)
-    );
+    let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
+    let script = format!("{} {} kill -TERM $$", leftover("", &file), until(&go));
     let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
     let left = Left::read(&file);
+    fs::write(&go, "").unwrap();
     assert_eq!(client.code(), Some(128 + libc::SIGTERM));
     assert!(
         !left.alive(),
@@ -2778,13 +2782,11 @@ fn exec_stops_what_a_command_that_died_of_a_signal_left_running() {
 fn exec_with_reap_stops_what_a_finished_command_left_running() {
     let dir = scratch("reap-finished");
     let nobody = queue_socket("reap-finished");
-    let file = marker_file(&dir, "left");
-    let script = format!(
-        "{} while [ ! -s {file} ]; do sleep 0.05; done",
-        leftover("", &file)
-    );
+    let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
+    let script = format!("{} {} true", leftover("", &file), until(&go));
     let mut client = Client::spawn(&dir, "c", &nobody, &["--reap"], &["sh", "-c", &script]);
     let left = Left::read(&file);
+    fs::write(&go, "").unwrap();
     assert_eq!(client.code(), Some(0));
     assert!(
         !left.alive(),
@@ -2807,13 +2809,11 @@ fn exec_with_reap_stops_what_a_finished_command_left_running() {
 fn exec_without_reap_leaves_a_finished_commands_leftovers_and_says_so() {
     let dir = scratch("reap-not");
     let nobody = queue_socket("reap-not");
-    let file = marker_file(&dir, "left");
-    let script = format!(
-        "{} while [ ! -s {file} ]; do sleep 0.05; done",
-        leftover("", &file)
-    );
+    let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
+    let script = format!("{} {} true", leftover("", &file), until(&go));
     let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
     let left = Left::read(&file);
+    fs::write(&go, "").unwrap();
     assert_eq!(client.code(), Some(0));
     assert!(left.alive(), "the leftover was stopped: {}", client.said());
     assert!(
@@ -2855,15 +2855,16 @@ fn exec_with_nothing_left_ends_at_once() {
 fn exec_does_not_follow_a_process_that_left_the_group() {
     let dir = scratch("reap-left-group");
     let nobody = queue_socket("reap-left-group");
-    let file = marker_file(&dir, "left");
-    // The process leaves the group first and only then writes its pid, so the command ends
-    // only once it has left.
+    let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
+    // The process leaves the group first and only then writes its pid.
     let script = format!(
         "perl -e 'setpgrp(0, 0); open my $f, \">\", $ARGV[0]; print $f $$; close $f; \
-         exec \"sleep\", \"300\"' {file} & while [ ! -s {file} ]; do sleep 0.05; done"
+         exec \"sleep\", \"300\"' {file} & {} true",
+        until(&go)
     );
     let mut client = Client::spawn(&dir, "c", &nobody, &["--reap"], &["sh", "-c", &script]);
     let left = Left::read(&file);
+    fs::write(&go, "").unwrap();
     assert_eq!(client.code(), Some(0));
     assert!(
         left.alive(),

@@ -364,9 +364,12 @@ for anything forked meanwhile, and says in one line what happened, including
 anything still left. Otherwise it leaves them and says that the group still has
 processes: a command may start a server and mean to leave it up. `--reap` is for
 a test batch or a build that should leave nothing behind. A leftover that is
-stopped is not a special case: once the command has exited its group is
-orphaned, and macOS sends a stopped member of an orphaned group `SIGHUP` and
-`SIGCONT`.
+stopped usually never gets that far: when the command exits its group is often
+orphaned, and macOS sends the stopped members of an orphaned group `SIGHUP` and
+`SIGCONT`. One that is not resumed, or that ignores `SIGHUP`, still gets
+`SIGKILL` after the grace, which stops a stopped process too. The decision to
+leave a group alone is made with `SIGINT`, `SIGTERM` and `SIGHUP` blocked, so one
+that arrives while it is being made counts as an interruption.
 
 It only ever signals the group it created for its command, whose number it got
 from starting it, never one it looked up. That number cannot go to anyone else
