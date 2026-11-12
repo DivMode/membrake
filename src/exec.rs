@@ -23,7 +23,9 @@
 //! group still has processes and they are left alone. The group is the one this process
 //! created when it started the command, never one it looked up; its number stays the command's
 //! throughout, because the command is reaped only afterwards (see "What the command leaves
-//! running"). A process that left the group (`setsid`, `setpgid`) is not followed. Stopping a
+//! running"). Stopping is best effort against members that keep forking and exiting, which can
+//! slip past the kernel's view of the group (see `group_state`); signalling only the command's
+//! own group is not. A process that left the group (`setsid`, `setpgid`) is not followed. Stopping a
 //! job's leftovers is this, so that scripts and agents never search the process table for them
 //! (nix-config issue 270: on 2026-11-11 such a search reached every process group).
 
@@ -455,40 +457,66 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// How often the group is looked at while they stop.
 const REAP_LOOK: Duration = Duration::from_millis(100);
 
-/// True while the group has a member this user may signal. `killpg` with signal 0 asks the
-/// kernel, which walks the group's member list under its lock, so a member that forks and exits
-/// cannot hide its child from it as it can from a list read one pid at a time. The unreaped
-/// leader does not count: for a group whose only member is it, the call fails with `EPERM`
-/// (measured on macOS 27, 2026-11-11: live member, success; zombie leader only, `EPERM`; after
-/// reaping, `ESRCH`).
-fn signallable(group: i32) -> bool {
-    // SAFETY: signal 0 delivers nothing.
-    unsafe { libc::killpg(group, 0) == 0 }
+/// What is left in the command's group, as far as the kernel can say.
+#[derive(Debug, PartialEq)]
+enum Group {
+    /// Nothing but the unreaped leader, by both observations below.
+    Empty,
+    /// A member this user may signal.
+    Signallable,
+    /// `n` live members, none of which this user may signal (another user's).
+    Foreign(usize),
+    /// `killpg` found nothing to signal, but the members could not be read.
+    Unknown,
 }
 
-/// The group's live members this user cannot signal (another user's), for the message only.
-fn foreign(group: i32) -> Option<usize> {
+/// Two observations, each with a gap the other narrows. `killpg` with signal 0 is the kernel's
+/// answer for the group as a whole: success means a member this user may signal. The held
+/// leader does not count; for a group whose only member is it, the call fails with `EPERM`
+/// (measured on macOS 27, 2026-11-11: live member, success; zombie leader only, `EPERM`; after
+/// reaping, `ESRCH`). `EPERM` also means "only members this user may not signal", so then the
+/// group is read member by member. Both take the member list first and look at each member
+/// after, so a member that forks and exits in between can hide its child from either (XNU's
+/// `pgrp_iterate` too). That is a limit: against a group whose members keep forking and exiting,
+/// "empty" is the best the kernel will say, not a proof.
+fn group_state(group: i32) -> Group {
+    // SAFETY: signal 0 delivers nothing.
+    if unsafe { libc::killpg(group, 0) } == 0 {
+        return Group::Signallable;
+    }
     let mut inspector = jobs::Inspector::new();
     match inspector.look(group) {
-        jobs::Look::Absent => Some(0),
-        jobs::Look::Present => Some(inspector.members().len()),
-        jobs::Look::Unknown(_) => None,
+        jobs::Look::Absent => Group::Empty,
+        jobs::Look::Present => Group::Foreign(inspector.members().len()),
+        jobs::Look::Unknown(_) => Group::Unknown,
     }
 }
 
 /// Waits up to `limit` for the group to hold nothing this user may signal, calling `each`
-/// before every wait. True if it came to that.
-fn emptied(group: i32, limit: Duration, mut each: impl FnMut()) -> bool {
+/// before every wait, and gives the state it ended in.
+fn settle(group: i32, limit: Duration, mut each: impl FnMut()) -> Group {
     let deadline = Instant::now() + limit;
     loop {
-        if !signallable(group) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
+        let state = group_state(group);
+        if state != Group::Signallable || Instant::now() >= deadline {
+            return state;
         }
         each();
         std::thread::sleep(REAP_LOOK);
+    }
+}
+
+/// One line for what is left that this user cannot stop.
+fn say_unstoppable(group: i32, state: &Group) {
+    match state {
+        Group::Foreign(n) => say(&format!(
+            "{n} process(es) of another user are still in the command's process group {group}; \
+             this user cannot signal them"
+        )),
+        Group::Unknown => say(&format!(
+            "could not read what is left in the command's process group {group}"
+        )),
+        Group::Empty | Group::Signallable => {}
     }
 }
 
@@ -548,13 +576,9 @@ fn signal_pending(before: &libc::sigset_t) -> bool {
 /// returns with the signals passed on to the command blocked, and the mask to restore once the
 /// command is reaped (see `run_command`).
 fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
-    if !signallable(group) {
-        if let Some(n @ 1..) = foreign(group) {
-            say(&format!(
-                "{n} process(es) of another user are still in the command's process group \
-                 {group}; this user cannot signal them"
-            ));
-        }
+    let state = group_state(group);
+    if state != Group::Signallable {
+        say_unstoppable(group, &state);
         return None;
     }
     // The decision to leave the group alone is made with the signals that would interrupt the
@@ -573,35 +597,28 @@ fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
         restore_signals(&before);
     }
     signal_group(group, libc::SIGTERM);
-    if emptied(group, REAP_GRACE, || {}) {
+    let state = settle(group, REAP_GRACE, || {});
+    if state != Group::Signallable {
         say("stopped what the command left running in its process group (SIGTERM)");
+        say_unstoppable(group, &state);
         return None;
     }
     // Again at every look: a member may fork after a SIGKILL has gone out to the others.
-    let mut kills = 0;
-    let killed = emptied(group, KILL_WAIT, || {
-        signal_group(group, libc::SIGKILL);
-        kills += 1;
-    });
-    match (killed, foreign(group)) {
-        (true, _) if kills == 0 => {
-            say("stopped what the command left running in its process group (SIGTERM)")
-        }
-        (true, _) => say(&format!(
+    signal_group(group, libc::SIGKILL);
+    let state = settle(group, KILL_WAIT, || signal_group(group, libc::SIGKILL));
+    if state == Group::Signallable {
+        say(&format!(
+            "the command's process group {group} still had processes after {} s of SIGKILL \
+             (still forking); left",
+            KILL_WAIT.as_secs()
+        ));
+    } else {
+        say(&format!(
             "what the command left running in its process group ignored SIGTERM for {} s; \
              killed it (SIGKILL)",
             REAP_GRACE.as_secs()
-        )),
-        (false, Some(n)) => say(&format!(
-            "{n} process(es) in the command's process group {group} were still running after \
-             {} s of SIGKILL (still forking); left",
-            KILL_WAIT.as_secs()
-        )),
-        (false, None) => say(&format!(
-            "the command's process group {group} still had processes after {} s of SIGKILL; \
-             could not read them",
-            KILL_WAIT.as_secs()
-        )),
+        ));
+        say_unstoppable(group, &state);
     }
     None
 }

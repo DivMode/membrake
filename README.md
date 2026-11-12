@@ -361,10 +361,12 @@ If anything is still running there, and the job was interrupted (a signal was
 passed on, or the command died of one) or `--reap` was given, it sends the group
 `SIGTERM`, then `SIGKILL` if anything is left 10 s later, repeated for up to 2 s
 for anything forked meanwhile, and says in one line what happened, including
-anything still left. Whether anything is left is the kernel's answer to
-`killpg(group, 0)`, which walks the group's member list under its lock, so a
-member that forks and exits cannot hide its child from it. A command that leaves
-nothing pays one such call. Otherwise it leaves them and says that the group still has
+anything still left, including members of another user it cannot signal.
+Whether anything is left is the kernel's answer to `killpg(group, 0)`, then a
+read of the group member by member. Both take the member list first and look at
+each member after, so against a group whose members keep forking and exiting,
+stopping is best effort; signalling only the command's own group is not. A
+command that leaves nothing pays one call and one read. Otherwise it leaves them and says that the group still has
 processes: a command may start a server and mean to leave it up. `--reap` is for
 a test batch or a build that should leave nothing behind. A leftover that is
 stopped usually never gets that far: when the command exits its group is often
