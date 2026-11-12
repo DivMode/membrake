@@ -455,8 +455,20 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// How often the group is looked at while they stop.
 const REAP_LOOK: Duration = Duration::from_millis(100);
 
-/// The group's live members, not counting the zombie leader; None if the kernel cannot say.
-fn look(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
+/// True while the group has a member this user may signal. `killpg` with signal 0 asks the
+/// kernel, which walks the group's member list under its lock, so a member that forks and exits
+/// cannot hide its child from it as it can from a list read one pid at a time. The unreaped
+/// leader does not count: for a group whose only member is it, the call fails with `EPERM`
+/// (measured on macOS 27, 2026-11-11: live member, success; zombie leader only, `EPERM`; after
+/// reaping, `ESRCH`).
+fn signallable(group: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing.
+    unsafe { libc::killpg(group, 0) == 0 }
+}
+
+/// The group's live members this user cannot signal (another user's), for the message only.
+fn foreign(group: i32) -> Option<usize> {
+    let mut inspector = jobs::Inspector::new();
     match inspector.look(group) {
         jobs::Look::Absent => Some(0),
         jobs::Look::Present => Some(inspector.members().len()),
@@ -464,28 +476,12 @@ fn look(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
     }
 }
 
-/// As `look`, but empty only when a second look a `REAP_LOOK` later agrees. One look lists
-/// the group's pids and then reads each, so a member that forks and exits in between leaves
-/// its child out of both; the child is in the next list.
-fn left(inspector: &mut jobs::Inspector, group: i32) -> Option<usize> {
-    let first = look(inspector, group);
-    if first != Some(0) {
-        return first;
-    }
-    std::thread::sleep(REAP_LOOK);
-    look(inspector, group)
-}
-
-/// Waits up to `limit` for the group to empty, calling `each` at every look. True if it did.
-fn emptied(
-    inspector: &mut jobs::Inspector,
-    group: i32,
-    limit: Duration,
-    mut each: impl FnMut(),
-) -> bool {
+/// Waits up to `limit` for the group to hold nothing this user may signal, calling `each`
+/// before every wait. True if it came to that.
+fn emptied(group: i32, limit: Duration, mut each: impl FnMut()) -> bool {
     let deadline = Instant::now() + limit;
     loop {
-        if left(inspector, group) == Some(0) {
+        if !signallable(group) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -514,72 +510,80 @@ fn passed_on() -> libc::sigset_t {
     }
 }
 
-/// Blocks or unblocks the signals passed on to the command.
-fn hold_signals(block: bool) {
+/// Blocks the signals passed on to the command, on top of whatever is blocked already, and
+/// gives the mask as it was, for `restore_signals`.
+fn hold_signals() -> libc::sigset_t {
     let set = passed_on();
-    let how = if block {
-        libc::SIG_BLOCK
-    } else {
-        libc::SIG_UNBLOCK
-    };
-    // SAFETY: `set` is initialised; the old mask is not wanted.
-    unsafe { libc::pthread_sigmask(how, &set, std::ptr::null_mut()) };
+    // SAFETY: both sets are initialised; the kernel fills `old`.
+    unsafe {
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        old
+    }
 }
 
-/// True when one of the signals passed on to the command is pending (blocked, not yet handled).
-fn signal_pending() -> bool {
+/// Puts back the mask `hold_signals` found: a signal the caller had blocked stays blocked.
+fn restore_signals(old: &libc::sigset_t) {
+    // SAFETY: `old` came from `pthread_sigmask`.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, old, std::ptr::null_mut()) };
+}
+
+/// True when one of the signals passed on to the command is pending only because
+/// `hold_signals` blocked it: one the caller had blocked itself was never going to interrupt.
+fn signal_pending(before: &libc::sigset_t) -> bool {
     // SAFETY: zeroed, then filled by the kernel.
     unsafe {
         let mut pending: libc::sigset_t = std::mem::zeroed();
         libc::sigpending(&mut pending);
         [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
             .iter()
-            .any(|&sig| libc::sigismember(&pending, sig) == 1)
+            .any(|&sig| {
+                libc::sigismember(&pending, sig) == 1 && libc::sigismember(before, sig) == 0
+            })
     }
 }
 
 /// Stops what is left in the command's group once the command has exited, or says it is there.
-/// `stop`: the job was interrupted, or `--reap` was given. Returns with the signals passed on
-/// to the command blocked when it left the group alone (see `run_command`).
-fn reap(group: i32, stop: bool) -> bool {
-    let mut inspector = jobs::Inspector::new();
-    let found = left(&mut inspector, group);
-    if found == Some(0) {
-        return false;
+/// `stop`: the job was interrupted, or `--reap` was given. When it left the group alone it
+/// returns with the signals passed on to the command blocked, and the mask to restore once the
+/// command is reaped (see `run_command`).
+fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
+    if !signallable(group) {
+        if let Some(n @ 1..) = foreign(group) {
+            say(&format!(
+                "{n} process(es) of another user are still in the command's process group \
+                 {group}; this user cannot signal them"
+            ));
+        }
+        return None;
     }
     // The decision to leave the group alone is made with the signals that would interrupt the
     // job blocked, and one already pending counts: a signal cannot arrive between the decision
     // and acting on it. If the group is left, they stay blocked until the command is reaped
     // and the group unpublished (`release`), so none is passed on to it afterwards either.
     if !stop {
-        hold_signals(true);
-        if !FORWARDED.load(Ordering::SeqCst) && !signal_pending() {
-            say(&match found {
-                Some(_) => format!(
-                    "the command ended, but its process group {group} still has processes \
-                     running; left alone (--reap stops them when the command ends)"
-                ),
-                None => format!(
-                    "the command ended; could not tell whether its process group {group} still \
-                     has processes; left alone"
-                ),
-            });
-            return true;
+        let before = hold_signals();
+        if !FORWARDED.load(Ordering::SeqCst) && !signal_pending(&before) {
+            say(&format!(
+                "the command ended, but its process group {group} still has processes \
+                 running; left alone (--reap stops them when the command ends)"
+            ));
+            return Some(before);
         }
-        hold_signals(false);
+        restore_signals(&before);
     }
     signal_group(group, libc::SIGTERM);
-    if emptied(&mut inspector, group, REAP_GRACE, || {}) {
+    if emptied(group, REAP_GRACE, || {}) {
         say("stopped what the command left running in its process group (SIGTERM)");
-        return false;
+        return None;
     }
     // Again at every look: a member may fork after a SIGKILL has gone out to the others.
     let mut kills = 0;
-    let killed = emptied(&mut inspector, group, KILL_WAIT, || {
+    let killed = emptied(group, KILL_WAIT, || {
         signal_group(group, libc::SIGKILL);
         kills += 1;
     });
-    match (killed, left(&mut inspector, group)) {
+    match (killed, foreign(group)) {
         (true, _) if kills == 0 => {
             say("stopped what the command left running in its process group (SIGTERM)")
         }
@@ -590,14 +594,16 @@ fn reap(group: i32, stop: bool) -> bool {
         )),
         (false, Some(n)) => say(&format!(
             "{n} process(es) in the command's process group {group} were still running after \
-             SIGKILL (another user's, or still forking); left"
+             {} s of SIGKILL (still forking); left",
+            KILL_WAIT.as_secs()
         )),
         (false, None) => say(&format!(
-            "could not tell whether the command's process group {group} still has processes \
-             after SIGKILL"
+            "the command's process group {group} still had processes after {} s of SIGKILL; \
+             could not read them",
+            KILL_WAIT.as_secs()
         )),
     }
-    false
+    None
 }
 
 /// Runs the command to its end and reports it to the daemon, if there is one on the line.
@@ -627,7 +633,7 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
         FORWARDED.store(true, Ordering::SeqCst);
     }
     tell(&mut daemon, Message::Started(pid));
-    let held = match wait_for_exit(pid) {
+    let held: Option<libc::sigset_t> = match wait_for_exit(pid) {
         Ok(signalled) => reap(
             pid,
             reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
@@ -637,12 +643,12 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
         Err(why) => {
             GROUP.store(0, Ordering::SeqCst);
             say(&format!("cannot wait for the command: {why}"));
-            false
+            None
         }
     };
     let code = release(pid);
-    if held {
-        hold_signals(false);
+    if let Some(before) = held {
+        restore_signals(&before);
     }
     tell(&mut daemon, Message::Done(code));
     code

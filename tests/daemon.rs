@@ -2665,10 +2665,9 @@ fn a_sizes_file_that_blocks_does_not_stop_the_brake_or_the_queue() {
 // ---------------------------------------------------------------------------------------
 // What a command leaves running in its group (nix-config issue 270)
 //
-// Every process these tests signal is one their own `membrake exec` client started: the
-// client, or a process its command left behind, by the pid that process wrote down itself
-// once it was ready, and only while that pid is still the process first seen (its start time).
-// None is looked up.
+// The only process these tests signal is their own `membrake exec` client, before it has been
+// reaped. What a command leaves behind is a `sleep 30`, which ends by itself; the tests only
+// look at it, by the pid it wrote down once ready and the start time first seen there.
 
 /// A process a test's command left behind: its pid, as it wrote it once ready, and its start
 /// time, so that a pid that went to another process is never mistaken for it.
@@ -2696,26 +2695,14 @@ impl Left {
     fn alive(&self) -> bool {
         jobs::bsd_info(self.pid).is_some_and(|p| p.start_us == self.start_us && !p.zombie)
     }
-
-    fn signal(&self, sig: libc::c_int) {
-        if self.alive() {
-            // SAFETY: the process this test's command left, checked by its start time.
-            unsafe { libc::kill(self.pid, sig) };
-        }
-    }
 }
 
-impl Drop for Left {
-    fn drop(&mut self) {
-        self.signal(libc::SIGKILL);
-    }
-}
-
-/// `sh -c` text that starts `sleep 300` in the background, in the command's group, and has it
+/// `sh -c` text that starts `sleep 30` in the background, in the command's group, and has it
 /// write its own pid to `file` once `trap` (if any) is in place: the shell execs `sleep` only
-/// after writing, and an ignored signal stays ignored across exec.
+/// after writing, and an ignored signal stays ignored across exec. 30 s outlasts the grace and
+/// every check, and nothing needs to stop it afterwards.
 fn leftover(trap: &str, file: &str) -> String {
-    format!("sh -c '{trap} echo $$ > {file}; exec sleep 300' &")
+    format!("sh -c '{trap} echo $$ > {file}; exec sleep 30' &")
 }
 
 /// `sh -c` text that waits until the test has written `go`: the command goes on, and so lets
@@ -2731,7 +2718,7 @@ fn exec_stops_what_an_interrupted_command_left_running() {
     let dir = scratch("reap-interrupted");
     let nobody = queue_socket("reap-interrupted");
     let file = marker_file(&dir, "left");
-    let script = format!("{} sleep 300", leftover("trap \"\" TERM;", &file));
+    let script = format!("{} sleep 30", leftover("trap \"\" TERM;", &file));
     let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
     let left = Left::read(&file);
     // SAFETY: the client this test started; it passes the signal to its command's group.
@@ -2836,7 +2823,7 @@ fn exec_with_nothing_left_ends_at_once() {
         let mut client = Client::spawn(&dir, "c", &nobody, options, &["sh", "-c", "exit 7"]);
         assert_eq!(client.code(), Some(7));
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(2),
             "{options:?}: took {:?}",
             started.elapsed()
         );
@@ -2859,7 +2846,7 @@ fn exec_does_not_follow_a_process_that_left_the_group() {
     // The process leaves the group first and only then writes its pid.
     let script = format!(
         "perl -e 'setpgrp(0, 0); open my $f, \">\", $ARGV[0]; print $f $$; close $f; \
-         exec \"sleep\", \"300\"' {file} & {} true",
+         exec \"sleep\", \"30\"' {file} & {} true",
         until(&go)
     );
     let mut client = Client::spawn(&dir, "c", &nobody, &["--reap"], &["sh", "-c", &script]);
