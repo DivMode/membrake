@@ -566,7 +566,8 @@ fn signal_pending(before: &libc::sigset_t) -> bool {
 /// returns with the signals passed on to the command blocked, and the mask to restore once the
 /// command is reaped (see `run_command`).
 fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
-    if listed(group) == Listed::Leader {
+    let first = listed(group);
+    if first == Listed::Leader {
         return None;
     }
     // The decision to leave the group alone is made with the signals that would interrupt the
@@ -576,7 +577,11 @@ fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
     if !stop {
         let before = hold_signals();
         if !FORWARDED.load(Ordering::SeqCst) && !signal_pending(&before) {
-            say(&if signallable(group) {
+            say(&if first == Listed::Unknown {
+                format!(
+                    "the command ended; its process group {group} could not be listed; left alone"
+                )
+            } else if signallable(group) {
                 format!(
                     "the command ended, but its process group {group} still has processes \
                      running; left alone (--reap stops them when the command ends)"
@@ -602,8 +607,8 @@ fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
     signal_group(group, libc::SIGKILL);
     if emptied(group, KILL_WAIT, || signal_group(group, libc::SIGKILL)) {
         say(&format!(
-            "stopped what the command left running in its process group (SIGKILL, after \
-             SIGTERM was ignored for {} s)",
+            "stopped what the command left running in its process group (SIGTERM, then SIGKILL \
+             after {} s)",
             REAP_GRACE.as_secs()
         ));
         return None;
@@ -619,8 +624,8 @@ fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
              whether anything is left is not known"
         ),
         Listed::Leader => format!(
-            "stopped what the command left running in its process group (SIGKILL, after \
-             SIGTERM was ignored for {} s)",
+            "stopped what the command left running in its process group (SIGTERM, then SIGKILL \
+             after {} s)",
             REAP_GRACE.as_secs()
         ),
     });
