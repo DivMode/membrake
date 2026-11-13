@@ -66,7 +66,7 @@ enum Command {
     /// Run a command when there is memory for it
     ///
     /// Asks the daemon (`membrake run`) for a turn, waits for the go-ahead, runs the command
-    /// below interactive apps (nice 10, utility QoS) in a process group of its own, and exits
+    /// at the caller's priority in a process group of its own, and exits
     /// with its exit code (128 plus the signal if it died of one). The daemon starts a command
     /// when the memory in use plus what it is expected to need stays under a cap it learns,
     /// never while memory is tight or a job is frozen. If the daemon cannot be reached the

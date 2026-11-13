@@ -338,8 +338,8 @@ membrake exec -- bun run test
 membrake exec --label "web types" -- tsc -p apps/web
 ```
 
-The command runs as it would anywhere else, in a process group of its own, below
-interactive apps (`nice` 10, utility QoS), with its output and its exit code
+The command runs as it would anywhere else, at full speed (the caller's priority:
+no `nice`, no QoS clamp), in a process group of its own, with its output and its exit code
 (128 plus the signal if it died of one; 127 and 126 for a command that is not
 found or cannot be run, as in a shell). `SIGINT`, `SIGTERM` and `SIGHUP` sent to
 `membrake exec` go to the command. Meanwhile `membrake exec` prints one line to
@@ -615,9 +615,9 @@ membrake exec --label "full check" -- ./scripts/verify.sh
 
 Self-hosted runners have a fixed number of slots, so they are not queued. Give
 their account to the brake as `--protect-user NAME`: their jobs are never
-frozen and are killed only when nothing else is left. To keep the CPU fair as
-well, run the runners at a higher priority than agent work and below your apps
-(agent work under `membrake exec` runs at utility QoS and `nice` 10).
+frozen and are killed only when nothing else is left. `membrake exec` does not
+lower a command's CPU priority: the brake guards memory, and work under it runs
+at full speed until memory, not the CPU, says stop.
 
 ### People in a terminal
 
