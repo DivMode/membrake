@@ -33,6 +33,7 @@
 //! (nix-config issue 270: on 2026-11-11 such a search reached every process group).
 
 use crate::jobs;
+use crate::queue::WaitReason;
 use crate::wire::{self, Message, Reply};
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -128,16 +129,40 @@ enum Stopped {
     Signalled(i32),
 }
 
-/// A turn granted within this long is not worth a line: on an idle machine every command
-/// is told "position 1" for up to a tick before it starts.
+/// A turn granted within this long is not worth a line.
 const QUIET: Duration = Duration::from_secs(2);
 
-/// The line printed whenever the position changes, once the wait has lasted `QUIET`.
-fn queued_line(position: usize, need: u64) -> String {
-    format!(
-        "queued for memory (position {position}, needs {:.1} GB)",
-        need as f64 / (1u64 << 30) as f64
-    )
+/// The line printed whenever the position or reason changes, after `QUIET`.
+fn queued_line(position: usize, need: u64, reason: WaitReason) -> String {
+    let gib = |bytes| bytes as f64 / (1u64 << 30) as f64;
+    let why = match reason {
+        WaitReason::Unspecified => {
+            return format!(
+                "queued for memory (position {position}, needs {:.1} GB)",
+                gib(need)
+            );
+        }
+        WaitReason::Tight => "memory is tight".to_string(),
+        WaitReason::Frozen => "a job is frozen".to_string(),
+        WaitReason::Behind => "behind another request".to_string(),
+        WaitReason::Cap {
+            used,
+            reserved,
+            cap,
+        } => format!(
+            "memory over the cap ({:.1} GB in use + {:.1} GB reserved of a {:.1} GB cap)",
+            gib(used),
+            gib(reserved),
+            gib(cap)
+        ),
+    };
+    match reason {
+        WaitReason::Tight | WaitReason::Frozen => format!("queued (position {position}): {why}"),
+        _ => format!(
+            "queued (position {position}): {why}, needs {:.1} GB",
+            gib(need)
+        ),
+    }
 }
 
 fn connect_error(socket: &Path, e: &io::Error) -> String {
@@ -173,7 +198,7 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
     // When the daemon last said anything.
     let mut heard = asked;
     let mut told = false;
-    let mut position: Option<(usize, u64)> = None;
+    let mut position = None;
     let mut shown = None;
     let mut input = Vec::new();
     loop {
@@ -188,20 +213,21 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
                 Some(Reply::Queued {
                     position: now,
                     need,
+                    reason,
                 }) => {
                     told = true;
-                    position = Some((now, need));
+                    position = Some((now, need, reason));
                 }
                 Some(Reply::Error(why)) => return Err(Stopped::Unavailable(why)),
                 None => return Err(Stopped::Unavailable(UNEXPECTED.into())),
             }
         }
-        if let Some((now, need)) = position
+        if let Some((now, need, reason)) = position
             && asked.elapsed() >= QUIET
-            && shown != Some(now)
+            && shown != position
         {
-            shown = Some(now);
-            say(&queued_line(now, need));
+            shown = position;
+            say(&queued_line(now, need, reason));
         }
         if !told && heard.elapsed() > FIRST_ANSWER {
             return Err(Stopped::Unavailable("the daemon did not answer".into()));
@@ -687,5 +713,44 @@ pub fn run(args: Args) -> i32 {
             run_command(&command, None, reap_always)
         }
         Err(Stopped::Signalled(sig)) => 128 + sig,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::GIB;
+
+    #[test]
+    fn queued_lines_explain_the_reason_and_preserve_old_daemon_text() {
+        for (position, reason, expected) in [
+            (
+                1,
+                WaitReason::Unspecified,
+                "queued for memory (position 1, needs 1.0 GB)",
+            ),
+            (1, WaitReason::Tight, "queued (position 1): memory is tight"),
+            (
+                1,
+                WaitReason::Frozen,
+                "queued (position 1): a job is frozen",
+            ),
+            (
+                2,
+                WaitReason::Behind,
+                "queued (position 2): behind another request, needs 1.0 GB",
+            ),
+            (
+                1,
+                WaitReason::Cap {
+                    used: 40 * GIB,
+                    reserved: 8 * GIB,
+                    cap: 48 * GIB,
+                },
+                "queued (position 1): memory over the cap (40.0 GB in use + 8.0 GB reserved of a 48.0 GB cap), needs 1.0 GB",
+            ),
+        ] {
+            assert_eq!(queued_line(position, GIB, reason), expected);
+        }
     }
 }

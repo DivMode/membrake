@@ -1548,7 +1548,7 @@ fn queue_a_client_waits_while_memory_is_tight_and_runs_when_it_is_calm() {
 
     let ran = marker_file(&dir, "ran");
     let mut client = Client::spawn(&dir, "c", &socket, &["--label", "tests"], &["touch", &ran]);
-    client.wait_said("membrake: queued for memory (position 1, needs 1.0 GB)");
+    client.wait_said("membrake: queued (position 1): memory is tight");
     script.tight(8);
     daemon.wait_samples(&log, 11);
     assert!(client.running(), "held while memory is tight");
@@ -1557,7 +1557,7 @@ fn queue_a_client_waits_while_memory_is_tight_and_runs_when_it_is_calm() {
     script.calm(8);
     assert_eq!(client.code(), Some(0));
     assert!(Path::new(&ran).exists(), "it ran once memory was calm");
-    assert_eq!(client.said().matches("queued for memory").count(), 1);
+    assert_eq!(client.said().matches("queued (position 1)").count(), 1);
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1572,8 +1572,7 @@ fn queue_the_exit_code_is_passed_through() {
     script.calm(10);
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
 
-    // Three clients one after the other, each let go at least 3 s of the script's time after
-    // the last: the ten readings of the start are not enough, however slowly they are asked.
+    // Three clients one after the other, each using the latest calm memory reading.
     let mut three = Client::spawn(&dir, "three", &socket, &[], &["sh", "-c", "exit 3"]);
     assert_eq!(three.code_while_calm(&mut script), Some(3));
 
@@ -1773,6 +1772,8 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     let mut script = Script::new(&dir);
     script.tight_and_quiet(3);
     let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, SHORT);
+    // Start with a known reason so every keep-alive can be compared byte for byte.
+    daemon.wait_samples(&dir.join("log"), 3);
 
     // The hand-made client only listens. It asks first, and is told its place at once (the
     // socket thread answers, whatever the sampling thread is doing).
@@ -1812,7 +1813,9 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     }
     assert!(lines.len() >= 6, "one at least every 0.67 s: {lines:?}");
     assert!(
-        lines.iter().all(|l| l == &lines[0]) && lines[0].starts_with("QUEUED\t1\t"),
+        lines.iter().all(|l| l == &lines[0])
+            && lines[0].starts_with("QUEUED\t1\t")
+            && lines[0].ends_with("\ttight"),
         "the same place, said again: {lines:?}"
     );
     assert!(!Path::new(&ran).exists(), "and its command has not run");
@@ -2137,7 +2140,7 @@ fn queue_nothing_is_admitted_while_a_job_is_frozen() {
 
     let ran = marker_file(&dir, "ran");
     let mut client = Client::spawn(&dir, "c", &socket, &[], &["touch", &ran]);
-    client.wait_said("queued for memory");
+    client.wait_said("queued (position 1)");
     // Calm, but inside the 10 s the brake waits before it resumes anything.
     script.calm(8);
     daemon.wait_samples(&log, 10);
