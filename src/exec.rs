@@ -11,8 +11,10 @@
 //! the heavy commands a heavy command starts do not queue behind it.
 //!
 //! The command runs in a process group of its own (the job the brake freezes and the queue
-//! measures), below interactive apps: at nice 10 and under macOS's utility QoS clamp, the way
-//! `taskpolicy -c utility nice -n 10` would run it. The exit code is the command's; a command
+//! measures), at the caller's own priority: no nice, no QoS clamp. The brake guards memory, not
+//! the CPU; a clamp put admitted work on the efficiency cores and stretched its timers (a 20 ms
+//! sleep took 65-95 ms, a CPU loop 1.5-2.8x as long), and wall-clock-paced tests failed under it
+//! on an idle Mac. The exit code is the command's; a command
 //! that dies of a signal gives 128 plus the signal, and 127 and 126 are a command that is not
 //! found and one that cannot be run, as in a shell.
 //!
@@ -30,7 +32,6 @@
 //! job's leftovers is this, so that scripts and agents never search the process table for them
 //! (nix-config issue 270: on 2026-11-11 such a search reached every process group).
 
-use crate::act::private_symbol;
 use crate::jobs;
 use crate::wire::{self, Message, Reply};
 use std::ffi::{CString, OsStr, OsString};
@@ -53,15 +54,8 @@ pub const ADMITTED: &str = "MEMBRAKE_ADMITTED";
 const FIRST_ANSWER: Duration = Duration::from_secs(10);
 /// How often a waiting client looks up from the socket to see whether it was signalled.
 const LOOK_UP: Duration = Duration::from_millis(250);
-/// `POSIX_SPAWN_PROC_CLAMP_UTILITY`, from xnu's `spawn_internal.h`: what `taskpolicy -c
-/// utility` asks for.
-const CLAMP_UTILITY: u64 = 1;
-/// Heavy work runs below interactive apps. A caller's lower priority is never raised.
-const BACKGROUND_NICE: libc::c_int = 10;
 /// Where a shell looks for a program when `PATH` is not set.
 const DEFAULT_PATH: &str = "/usr/bin:/bin";
-
-type SetQosClamp = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, u64) -> libc::c_int;
 
 pub struct Args {
     /// What the queue shows for this command; its signature if None.
@@ -263,16 +257,6 @@ impl NotRun {
     }
 }
 
-/// Below interactive apps, but never above a priority the caller chose.
-fn lower_priority() {
-    // SAFETY: plain priority calls on this process; a refusal never stops the command.
-    unsafe {
-        if libc::getpriority(libc::PRIO_PROCESS, 0) < BACKGROUND_NICE {
-            libc::setpriority(libc::PRIO_PROCESS, 0, BACKGROUND_NICE);
-        }
-    }
-}
-
 /// The programs to try for `name`: itself if it has a directory, else it in every directory
 /// of `PATH`, in order.
 fn candidates(name: &OsStr, path: Option<&OsStr>) -> Vec<PathBuf> {
@@ -296,7 +280,7 @@ fn c_string(text: &OsStr) -> Result<CString, NotRun> {
     })
 }
 
-/// Starts the command as the leader of a new process group, under the utility QoS clamp, with
+/// Starts the command as the leader of a new process group, at the caller's priority, with
 /// `MEMBRAKE_ADMITTED` set; returns its pid, which is also its group. The program is looked up
 /// the way a shell does, trying each directory of `PATH` and reporting not-found only if none
 /// has it.
@@ -350,11 +334,6 @@ fn spawn(command: &[OsString]) -> Result<i32, NotRun> {
                 | libc::posix_spawnattr_setsigmask(&mut attr, &no_signals);
             if rc != 0 {
                 return Err(NotRun::of(rc));
-            }
-            // A macOS without the clamp still runs the command, only not clamped.
-            if let Some(set) = private_symbol(c"posix_spawnattr_set_qos_clamp_np") {
-                let set: SetQosClamp = std::mem::transmute(set);
-                set(&mut attr, CLAMP_UTILITY);
             }
         }
         let mut refused = None;
@@ -641,7 +620,6 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
             *daemon = None;
         }
     };
-    lower_priority();
     let pid = match spawn(command) {
         Ok(pid) => pid,
         Err(NotRun { code, why }) => {

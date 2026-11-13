@@ -724,8 +724,7 @@ pub fn read_group(pgid: i32, insp: &mut Inspector) -> Read {
         Err(why) => return Read::Unreadable(why),
     };
     let (mut procs, mut members) = (Vec::new(), Vec::new());
-    for i in 0..count {
-        let pid = insp.pids[i];
+    for &pid in insp.pids.iter().take(count) {
         let p = match probe_proc(pid) {
             Probe::Found(p) if !p.zombie && p.pgid == pgid => p,
             Probe::Found(_) | Probe::Gone => continue,

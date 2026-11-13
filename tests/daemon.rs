@@ -2030,10 +2030,11 @@ fn queue_status_lists_the_waiting_and_the_admitted() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The command is a process group of its own, below interactive apps (nice 10 or lower
-/// priority still), and knows it was admitted, so what it starts does not queue again.
+/// The command is a process group of its own at the caller's priority (no nice, no clamp: the
+/// brake guards memory, not the CPU), and knows it was admitted, so what it starts does not
+/// queue again.
 #[test]
-fn queue_the_command_runs_below_interactive_apps_in_a_group_of_its_own() {
+fn queue_the_command_runs_at_the_callers_priority_in_a_group_of_its_own() {
     let dir = scratch("qprio");
     let socket = queue_socket("prio");
     let mut script = Script::new(&dir);
@@ -2067,7 +2068,9 @@ fn queue_the_command_runs_below_interactive_apps_in_a_group_of_its_own() {
     assert_eq!(leader.pgid, group, "it leads the group it runs in");
     // SAFETY: getpriority has no preconditions.
     let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, group as libc::id_t) };
-    assert!(nice >= 10, "nice {nice}");
+    // SAFETY: as above.
+    let caller = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    assert_eq!(nice, caller, "the command keeps the caller's priority");
     assert_eq!(fs::read_to_string(&env).unwrap().trim(), "1");
     drop(client);
     assert!(daemon.terminate().success());
