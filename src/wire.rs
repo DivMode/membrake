@@ -5,11 +5,14 @@
 //! client -> daemon   REQUEST  v1  <label>  <signature>
 //!                    STARTED  <pgid>
 //!                    DONE     <exit code>
-//! daemon -> client   QUEUED   <position>  <need in bytes>    (whenever either changes, and
+//! daemon -> client   QUEUED   <position>  <need in bytes>  <reason>  (whenever any changes, and
 //!                                                             at least every `KEEP_ALIVE`)
 //!                    GO
 //!                    ERROR    <text>
 //! ```
+//!
+//! Reasons are `tight`, `frozen`, `behind`, or `cap` followed by used, reserved and cap bytes.
+//! A three-field `QUEUED` from an older daemon has an unspecified reason.
 //!
 //! A client that is waiting is told where it stands at least every `KEEP_ALIVE`, whether or not
 //! that changed, and takes a daemon that says nothing for `SILENCE` to have stopped answering.
@@ -21,6 +24,7 @@
 //! `STARTED` is accepted once, after `GO`, and only for the group of a command that this client
 //! started after it was told to go; anything else is an `ERROR` and the end of the connection.
 
+use crate::queue::WaitReason;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::Duration;
@@ -165,6 +169,7 @@ pub enum Reply {
     Queued {
         position: usize,
         need: u64,
+        reason: WaitReason,
     },
     /// Start the command now.
     Go,
@@ -174,7 +179,29 @@ pub enum Reply {
 impl Reply {
     pub fn line(&self) -> String {
         match self {
-            Reply::Queued { position, need } => format!("QUEUED\t{position}\t{need}\n"),
+            Reply::Queued {
+                position,
+                need,
+                reason,
+            } => {
+                let mut line = format!("QUEUED\t{position}\t{need}");
+                match reason {
+                    WaitReason::Unspecified => {}
+                    WaitReason::Tight => line.push_str("\ttight"),
+                    WaitReason::Frozen => line.push_str("\tfrozen"),
+                    WaitReason::Behind => line.push_str("\tbehind"),
+                    WaitReason::Cap {
+                        used,
+                        reserved,
+                        cap,
+                    } => {
+                        use std::fmt::Write as _;
+                        let _ = write!(line, "\tcap\t{used}\t{reserved}\t{cap}");
+                    }
+                }
+                line.push('\n');
+                line
+            }
             Reply::Go => "GO\n".to_string(),
             Reply::Error(text) => format!("ERROR\t{}\n", sanitize(text, MAX_LINE / 2)),
         }
@@ -186,6 +213,18 @@ impl Reply {
             "QUEUED" => Some(Reply::Queued {
                 position: fields.next()?.parse().ok()?,
                 need: fields.next()?.parse().ok()?,
+                reason: match fields.next() {
+                    None => WaitReason::Unspecified,
+                    Some("tight") => WaitReason::Tight,
+                    Some("frozen") => WaitReason::Frozen,
+                    Some("behind") => WaitReason::Behind,
+                    Some("cap") => WaitReason::Cap {
+                        used: fields.next()?.parse().ok()?,
+                        reserved: fields.next()?.parse().ok()?,
+                        cap: fields.next()?.parse().ok()?,
+                    },
+                    _ => return None,
+                },
             }),
             "GO" => Some(Reply::Go),
             "ERROR" => Some(Reply::Error(sanitize(fields.next()?, MAX_LINE))),
@@ -253,6 +292,7 @@ mod tests {
             Reply::Queued {
                 position: 3,
                 need: 1 << 30,
+                reason: WaitReason::Unspecified,
             },
             Reply::Go,
             Reply::Error("no".into()),
@@ -271,6 +311,39 @@ mod tests {
             assert!(Message::parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(Reply::parse("QUEUED\t1"), None);
+    }
+
+    #[test]
+    fn queued_reasons_round_trip_and_old_daemons_are_readable() {
+        for reason in [
+            WaitReason::Unspecified,
+            WaitReason::Tight,
+            WaitReason::Frozen,
+            WaitReason::Behind,
+            WaitReason::Cap {
+                used: 40 * (1 << 30),
+                reserved: 8 * (1 << 30),
+                cap: 48 * (1 << 30),
+            },
+        ] {
+            let reply = Reply::Queued {
+                position: 1,
+                need: 1 << 30,
+                reason,
+            };
+            assert_eq!(Reply::parse(reply.line().trim_end()), Some(reply));
+        }
+        assert_eq!(
+            Reply::parse("QUEUED\t2\t1073741824"),
+            Some(Reply::Queued {
+                position: 2,
+                need: 1 << 30,
+                reason: WaitReason::Unspecified,
+            })
+        );
+        for bad in ["QUEUED\t1\t1\tcap", "QUEUED\t1\t1\tcap\t2\tx\t4"] {
+            assert_eq!(Reply::parse(bad), None);
+        }
     }
 
     /// The README promises these two numbers; a running daemon never lets a client reach its

@@ -402,16 +402,27 @@ Requests wait in order, and the next one starts only when **all** of this holds:
   a `SIGCONT` that keeps failing. It stays recorded and is retried on every sample,
   but it holds the queue for 300 s in total, however often memory is tight again
   meanwhile, and the daemon logs once when it stops;
-- at least 3 s have passed since the last start, because a started job takes
-  seconds to show in the numbers;
-- `used + need < cap`. `used` is the memory the kernel does not count as
+- `used + reserved + need < cap`. `used` is the memory the kernel does not count as
   available (RAM × (100 − `kern.memorystatus_level`) / 100), averaged over the
   last 5 s. `need` is the peak this kind of command was seen to reach before, or,
-  for a command nothing is known about, `min(1 GiB, cap / 5)`.
+  for a command nothing is known about, `min(1 GiB, cap / 5)`. `reserved` is the
+  total expected need of running commands admitted in the last 10 s: five seconds
+  for a start's memory to appear, plus five to fill the average. Each admission
+  adds its need before the next request is considered.
+
+Every request that fits starts in the same step, in queue order; when the next
+one does not fit, nothing behind it starts. A new arrival can start immediately
+using the latest sample's memory and tight/frozen state, without waiting for
+another sample. Before the first sample, requests wait for that sample.
 
 If nothing admitted is running and nothing is frozen, the next command starts
 even when it does not fit, so one big job is never stuck behind a busy machine.
 Never while memory is tight.
+
+A waiting client is told why: memory is tight, a job is frozen, its expected need
+does not fit under the cap (with memory in use and reserved shown separately), or
+it is behind another waiting request. With an older daemon it shows its position
+and expected need as before.
 
 The `cap` is learned, as in Buck2: it starts at 70% of RAM, and whenever memory
 is tight it becomes the memory in use averaged over the last 15 s, which is what

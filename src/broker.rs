@@ -5,9 +5,9 @@
 //! for I/O and never for formatting: whoever needs more than a moment's look at it copies what
 //! it needs out first. The socket thread owns every connection: it accepts, reads what clients
 //! say, queues their requests, and tells each client where it stands. The sampling thread (the
-//! runner's tick) owns the clock: once a sample it asks the scheduler whether the next request
-//! may start, and measures the groups of the admitted commands. A client waiting for its turn
-//! therefore never delays a sample, and a sample never waits for a client: the tick only tries
+//! runner's tick) supplies the memory state and measures the admitted groups. Both threads
+//! admit all requests that fit: on a sample, or on arrival using the latest sample. A waiting
+//! client therefore never delays a sample, and a sample never waits for a client: the tick only tries
 //! the mutex, and leaves the queue's work for the next sample if the socket thread has it.
 //!
 //! What the socket thread tells a waiting client shows that it is alive, not that anything is
@@ -36,7 +36,7 @@
 //! signalled.
 
 use crate::jobs::{self, AGENT_CLI, Inspector, Probe, Regex};
-use crate::queue::{Id, Released, Sample, Scheduler, Snapshot};
+use crate::queue::{Id, Released, Sample, Scheduler, Snapshot, WaitReason};
 use crate::runner::{age, gb};
 use crate::signals::{self, Signals};
 use crate::sizes::Sizes;
@@ -183,6 +183,28 @@ fn released_note(released: &Released, exit: Option<i32>) -> String {
                 age(wall - r.since),
                 gb(r.peak)
             )
+        }
+    }
+}
+
+/// Both admission paths copy the view under the core lock, then format notes outside it.
+/// The socket thread delivers `GO` from that same running state in `Ctx::deliver`.
+fn admission_notes(view: &Snapshot, admitted: &[Id], dry_run: bool, out: &mut Vec<Note>) {
+    for id in admitted {
+        if let Some(job) = view.running.iter().find(|r| r.id == *id) {
+            out.push((
+                "queue",
+                format!(
+                    "{}admit {} (session {}) after {}: expects {}, {} in use of a {} cap",
+                    if dry_run { "dry run, would " } else { "" },
+                    job.label,
+                    job.session,
+                    age(job.waited),
+                    gb(job.need),
+                    gb(view.used),
+                    gb(view.cap),
+                ),
+            ));
         }
     }
 }
@@ -367,6 +389,8 @@ pub struct Broker {
     inspector: Inspector,
     /// Where the queue stood at the last tick, copied out of the core.
     view: Snapshot,
+    /// Reused output of the scheduler's admission loop.
+    admitted: Vec<Id>,
     /// On how many samples the queue's work was done (see `scheduled`).
     scheduled: u64,
 }
@@ -448,6 +472,7 @@ impl Broker {
             seen: Vec::with_capacity(16),
             inspector: Inspector::new(),
             view: Snapshot::default(),
+            admitted: Vec::new(),
             scheduled: 0,
         })
     }
@@ -483,7 +508,7 @@ impl Broker {
             tight,
             frozen,
         };
-        let (admitted, lost) = {
+        let lost = {
             let mut guard = match self.core.try_lock() {
                 Ok(guard) => guard,
                 // A panic on the socket thread must not stop the sampling thread.
@@ -498,7 +523,7 @@ impl Broker {
             }
             let sizes = &core.sizes;
             let learned = |signature: &str| sizes.get(signature);
-            let admitted = core.sched.step(&sample, &learned);
+            core.sched.step(&sample, &learned, &mut self.admitted);
             self.groups.clear();
             self.groups.extend(
                 core.sched
@@ -507,30 +532,14 @@ impl Broker {
                     .filter_map(|r| r.pgid.map(|pgid| (r.id, pgid, r.leader_start_us))),
             );
             core.sched.snapshot(&learned, &mut self.view);
-            (admitted, lost)
+            lost
         };
         // From here on the socket thread has the core again.
         self.scheduled += 1;
         if lost > 0 {
             notes.push(lost_note(lost));
         }
-        if let Some(id) = admitted
-            && let Some(job) = self.view.running.iter().find(|r| r.id == id)
-        {
-            notes.push((
-                "queue",
-                format!(
-                    "{}admit {} (session {}) after {}: expects {}, {} in use of a {} cap",
-                    if self.dry_run { "dry run, would " } else { "" },
-                    job.label,
-                    job.session,
-                    age(job.waited),
-                    gb(job.need),
-                    gb(self.view.used),
-                    gb(self.view.cap),
-                ),
-            ));
-        }
+        admission_notes(&self.view, &self.admitted, self.dry_run, &mut notes);
         if let Some(files) = &self.files {
             self.text.clear();
             render(&self.view, &mut self.text);
@@ -765,8 +774,8 @@ struct Conn {
     output: Vec<u8>,
     /// Its place in the scheduler, once it has asked.
     id: Option<Id>,
-    /// The last position and need it was told.
-    told: Option<(usize, u64)>,
+    /// The last position, need and reason it was told.
+    told: Option<(usize, u64, WaitReason)>,
     /// When it was last told, whether or not that changed anything.
     told_at: Instant,
     /// When it was told to go (wall-clock seconds), if it has been: the command it starts
@@ -863,7 +872,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// One line from a client.
-    fn handle(&self, conn: &mut Conn, line: &str) {
+    fn handle(&self, conn: &mut Conn, line: &str, admitted: &mut Vec<Id>, view: &mut Snapshot) {
         if line.len() > wire::MAX_LINE {
             return conn.refuse("line too long");
         }
@@ -886,13 +895,27 @@ impl Ctx<'_> {
                     "{label} asks for a turn (pid {}, uid {}, session {session})",
                     conn.peer.pid, conn.peer.uid
                 );
-                let mut core = lock(self.core);
+                let mut guard = lock(self.core);
+                let core = &mut *guard;
                 core.note("queue", text);
-                conn.id = Some(
+                let wall = signals::wall();
+                conn.id = Some(core.sched.enqueue(session, label, signature, wall));
+                admitted.clear();
+                if !core.stalled(self.stalled_after) {
+                    let learned = |signature: &str| core.sizes.get(signature);
                     core.sched
-                        .enqueue(session, label, signature, signals::wall()),
-                );
-                drop(core);
+                        .admit_now(signals::uptime(), wall, &learned, admitted);
+                    core.sched.snapshot(&learned, view);
+                }
+                drop(guard);
+                let mut notes = Vec::new();
+                admission_notes(view, admitted, self.dry_run, &mut notes);
+                if !notes.is_empty() {
+                    let mut core = lock(self.core);
+                    for (kind, text) in notes {
+                        core.note(kind, text);
+                    }
+                }
                 if self.dry_run {
                     // A dry run holds nobody: the queue still decides, to be logged, but the
                     // client goes now.
@@ -974,7 +997,7 @@ impl Ctx<'_> {
                 continue;
             };
             if let Some(w) = view.waiting.iter().find(|w| w.id == id) {
-                let standing = (w.position, w.need);
+                let standing = (w.position, w.need, w.reason);
                 if stalled {
                     conn.refuse(NOT_SCHEDULING);
                 } else if !self.dry_run
@@ -987,6 +1010,7 @@ impl Ctx<'_> {
                     conn.say(&Reply::Queued {
                         position: w.position,
                         need: w.need,
+                        reason: w.reason,
                     });
                 }
             } else if view.running.iter().any(|r| r.id == id) {
@@ -1020,6 +1044,7 @@ fn serve(
     };
     let mut conns: Vec<Conn> = Vec::new();
     let mut view = Snapshot::default();
+    let mut admitted = Vec::new();
     let mut accept_failed = false;
     while !stop.load(Ordering::SeqCst) && !crate::act::shutdown_requested() {
         let mut fds = Vec::with_capacity(conns.len() + 1);
@@ -1063,7 +1088,7 @@ fn serve(
             while !conn.closing
                 && let Some(line) = wire::take_line(&mut conn.input)
             {
-                ctx.handle(conn, &line);
+                ctx.handle(conn, &line, &mut admitted, &mut view);
             }
             if conn.closing {
                 // Told to go away: whatever more it sends is not read.
@@ -1314,6 +1339,7 @@ mod tests {
         // Tight: no go-ahead however long it waits.
         let mut time = 100.0;
         let notes = tick_n(&mut broker, &mut time, 35, 3);
+        assert!(client.next().ends_with("\ttight"));
         assert!(client.line(Duration::from_millis(300)).is_none());
         let asked = notes
             .iter()
@@ -1328,9 +1354,70 @@ mod tests {
         let mut go = None;
         tick_until(&mut broker, &mut time, 80, || {
             go = client.line(Duration::from_millis(20));
-            go.is_some()
+            go.as_deref() == Some("GO")
         });
         assert_eq!(go.as_deref(), Some("GO"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Both clients get the go-ahead from the last calm sample, with no further tick. Their
+    /// admission notes are queued for the event log through the same formatter as a tick.
+    #[test]
+    fn clients_that_fit_get_go_on_arrival_without_another_sample() {
+        let (mut broker, socket, dir) = broker("arrival", false);
+        broker.tick(&reading(signals::uptime(), 80), false, false);
+        assert_eq!(broker.scheduled(), 1);
+        let mut first = Client::connect(&socket);
+        first.request("first");
+        assert_eq!(first.next(), "GO");
+        let mut second = Client::connect(&socket);
+        second.request("second");
+        assert_eq!(second.next(), "GO");
+        assert_eq!(
+            broker.scheduled(),
+            1,
+            "neither request needed another sample"
+        );
+        let core = lock(&broker.core);
+        assert_eq!(core.sched.running().len(), 2);
+        for label in ["first", "second"] {
+            assert_eq!(
+                core.log
+                    .iter()
+                    .filter(|n| n.1.starts_with(&format!("admit {label} ")))
+                    .count(),
+                1
+            );
+        }
+        drop(core);
+        drop(broker);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sample_admits_and_logs_every_client_that_fits() {
+        let (mut broker, socket, dir) = broker("batch", false);
+        let mut first = Client::connect(&socket);
+        first.request("first");
+        assert!(first.next().starts_with("QUEUED\t1\t"));
+        let mut second = Client::connect(&socket);
+        second.request("second");
+        assert!(second.next().ends_with("\tbehind"));
+        let mut time = 0.0;
+        let notes = tick_until(&mut broker, &mut time, 80, || {
+            first.line(Duration::from_millis(20)).as_deref() == Some("GO")
+        });
+        assert_eq!(second.next(), "GO");
+        for label in ["first", "second"] {
+            assert_eq!(
+                notes
+                    .iter()
+                    .filter(|n| n.1.starts_with(&format!("admit {label} ")))
+                    .count(),
+                1
+            );
+        }
+        drop(broker);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1713,7 +1800,7 @@ mod tests {
                 tight: false,
                 frozen: false,
             };
-            core.sched.step(&sample, &|_| None);
+            core.sched.step(&sample, &|_| None, &mut Vec::new());
             assert_eq!(core.sched.running().len(), 1, "admitted");
             id
         };
@@ -1833,13 +1920,7 @@ mod tests {
         tick_until(&mut broker, &mut time, 80, || !lock(&core).stalled(silence));
         let mut again = Client::connect(&socket);
         again.request("third");
-        assert!(again.next().starts_with("QUEUED\t"));
-        let mut go = None;
-        tick_until(&mut broker, &mut time, 80, || {
-            go = again.line(Duration::from_millis(20));
-            go.is_some()
-        });
-        assert_eq!(go.as_deref(), Some("GO"));
+        assert_eq!(again.next(), "GO");
         let _ = fs::remove_dir_all(&dir);
     }
 

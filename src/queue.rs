@@ -3,9 +3,8 @@
 //! `engine` is).
 //!
 //! The design is Buck2's local-action scheduler (`scheduler.rs`, Meta Platforms, Apache-2.0;
-//! see THIRD_PARTY_NOTICES.md): start one more job only when the memory in use, averaged over
-//! the last 5 s, plus what that job is expected to need stays under a cap; space the starts at
-//! least 3 s apart, because a started job takes seconds to show in the numbers; learn the cap
+//! see THIRD_PARTY_NOTICES.md): start jobs only when the memory in use, averaged over
+//! the last 5 s, plus what they are expected to need stays under a cap; learn the cap
 //! from the memory in use, averaged over the last 15 s, whenever the machine was under
 //! pressure; and expect `min(1 GiB, cap / 5)` of a job nothing is known about. Buck2 leaves a
 //! cap that was learned too low as a FIXME, and it stays low for good. Here it is probed
@@ -22,16 +21,21 @@
 //!   agent's backlog cannot hold up another's single command. Within a session it is first
 //!   come, first served.
 //! - When the next one does not fit, nothing behind it starts.
+//! - Each start reserves its expected need for 10 s, until its memory has had time to enter
+//!   the 5 s average. All requests that fit with those reservations start in one step.
+//!   Arrivals use the last sample's state to start immediately, without waiting for a sample.
 //! - If no admitted command is running and nothing is frozen, the next one starts even if it
 //!   does not fit, or it would wait for a machine that never gets any quieter. Never while
 //!   memory is tight.
+//! - Waiting clients are told whether memory is tight, a job is frozen, the next request
+//!   exceeds the cap (including reservations), or they are behind that request.
 
 /// Memory is counted in bytes; this is the unit of the defaults.
 pub const GIB: u64 = 1 << 30;
-/// The least time between two admissions (seconds).
-pub const SPACING: f64 = 3.0;
 /// Memory in use is averaged over this long when deciding whether a command fits (seconds).
 pub const USED_WINDOW: f64 = 5.0;
+/// Allow five seconds for a start's memory to appear, plus a full window to enter the average.
+pub const RESERVE: f64 = USED_WINDOW + 5.0;
 /// The cap is learned from the memory in use averaged over this long (seconds).
 pub const CAP_WINDOW: f64 = 15.0;
 /// The cap is probed upwards after this long without pressure (seconds).
@@ -135,6 +139,8 @@ pub struct Running {
     pub signature: String,
     /// Wall-clock seconds when it was admitted.
     pub since: f64,
+    /// Engine seconds when it was admitted, for its memory reservation.
+    pub admitted: f64,
     /// How long it waited, seconds.
     pub waited: f64,
     /// What it was expected to need when it was admitted.
@@ -155,6 +161,22 @@ pub enum Released {
     Running(Running),
 }
 
+/// Why a request is still waiting, as of the latest admission decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaitReason {
+    /// No sample yet, or a reply from a daemon that does not give reasons.
+    #[default]
+    Unspecified,
+    Tight,
+    Frozen,
+    Cap {
+        used: u64,
+        reserved: u64,
+        cap: u64,
+    },
+    Behind,
+}
+
 /// A request waiting for its turn, as it is shown to the world.
 #[derive(Default)]
 pub struct Place {
@@ -162,6 +184,7 @@ pub struct Place {
     /// Counts from 1, in the order the requests will be admitted if nothing changes.
     pub position: usize,
     pub need: u64,
+    pub reason: WaitReason,
     pub session: i32,
     pub since: f64,
     pub label: String,
@@ -218,7 +241,10 @@ pub struct Scheduler {
     ram: u64,
     /// Memory in use over the last `USED_WINDOW`, as of the last step.
     used: u64,
-    last_admission: f64,
+    /// Engine time of the latest admission decision, and the last sample's stop conditions.
+    now: f64,
+    tight: bool,
+    frozen: bool,
     /// The last time memory was tight or the cap was probed: what the 60 s count runs from.
     quiet_since: f64,
     next_id: Id,
@@ -239,7 +265,9 @@ impl Scheduler {
             cap: None,
             ram: 0,
             used: 0,
-            last_admission: f64::NEG_INFINITY,
+            now: 0.0,
+            tight: false,
+            frozen: false,
             quiet_since: 0.0,
             next_id: 0,
         }
@@ -327,9 +355,15 @@ impl Scheduler {
         learned(signature).unwrap_or_else(|| self.cap.map_or(GIB, |cap| GIB.min(cap / 5)))
     }
 
-    fn fits(&self, at: usize, learned: &dyn Fn(&str) -> Option<u64>) -> bool {
-        let need = self.need(&self.waiting[at].signature, learned);
-        self.used.saturating_add(need) < self.cap.unwrap_or(0)
+    fn reserved(&self, now: f64) -> u64 {
+        self.running
+            .iter()
+            .filter(|r| now - r.admitted < RESERVE)
+            .fold(0u64, |sum, r| sum.saturating_add(r.need))
+    }
+
+    fn fits(&self, need: u64, reserved: u64) -> bool {
+        self.used.saturating_add(reserved).saturating_add(need) < self.cap.unwrap_or(0)
     }
 
     /// Copies out where every request stands: the waiting ones in the order they will be
@@ -356,6 +390,7 @@ impl Scheduler {
                 .map_or(0, |&(_, running)| running)
         };
         let mut position = 0;
+        let reserved = self.reserved(self.now);
         while let Some(at) = (0..out.left.len()).min_by_key(|&at| {
             let w = &self.waiting[out.left[at]];
             (turn(&out.turns, w.session), w.id)
@@ -369,6 +404,21 @@ impl Scheduler {
             place.id = w.id;
             place.position = position;
             place.need = self.need(&w.signature, learned);
+            place.reason = if position > 1 {
+                WaitReason::Behind
+            } else if self.tight {
+                WaitReason::Tight
+            } else if self.frozen {
+                WaitReason::Frozen
+            } else if self.cap.is_some() && !self.fits(place.need, reserved) {
+                WaitReason::Cap {
+                    used: self.used,
+                    reserved,
+                    cap: out.cap,
+                }
+            } else {
+                WaitReason::Unspecified
+            };
             place.session = w.session;
             place.since = w.since;
             place.label.clone_from(&w.label);
@@ -387,11 +437,13 @@ impl Scheduler {
         }
     }
 
-    /// Takes one reading and decides whether the next request starts now. At most one starts
-    /// per reading. Allocation-free when nobody is waiting.
-    pub fn step(&mut self, s: &Sample, learned: &dyn Fn(&str) -> Option<u64>) -> Option<Id> {
+    /// Takes one reading and admits every request that fits. Clears `out`, then appends the
+    /// admitted ids in order. Allocation-free when nobody is waiting.
+    pub fn step(&mut self, s: &Sample, learned: &dyn Fn(&str) -> Option<u64>, out: &mut Vec<Id>) {
         let now = s.time;
         self.ram = s.ram;
+        self.tight = s.tight;
+        self.frozen = s.frozen;
         if self.cap.is_none() {
             self.cap = Some(percent(s.ram, START_PERCENT));
             self.quiet_since = now;
@@ -404,16 +456,16 @@ impl Scheduler {
             self.quiet_since = now;
         }
 
-        let at = self.next()?;
-        // Nothing admitted is running: the request goes next however little room there is.
-        // (A frozen job stops every admission below, and a tight reading too.)
-        let alone = self.running.is_empty();
         // Held back by the cap and nothing else, for a minute of quiet: try a little more.
         if !s.tight
             && !s.frozen
-            && !alone
+            && !self.running.is_empty()
             && now - self.quiet_since >= PROBE_AFTER
-            && !self.fits(at, learned)
+            && let Some(at) = self.next()
+            && !self.fits(
+                self.need(&self.waiting[at].signature, learned),
+                self.reserved(now),
+            )
         {
             let max = percent(s.ram, MAX_PERCENT);
             if let Some(cap) = self.cap.as_mut().filter(|cap| **cap < max) {
@@ -421,29 +473,49 @@ impl Scheduler {
             }
             self.quiet_since = now;
         }
-        if s.tight || s.frozen || now - self.last_admission < SPACING {
-            return None;
-        }
-        if !alone && !self.fits(at, learned) {
-            return None;
-        }
+        self.admit_now(now, s.wall, learned, out);
+    }
 
-        let need = self.need(&self.waiting[at].signature, learned);
-        let w = self.waiting.remove(at);
-        self.last_admission = now;
-        self.running.push(Running {
-            id: w.id,
-            session: w.session,
-            label: w.label,
-            signature: w.signature,
-            since: s.wall,
-            waited: s.wall - w.since,
-            need,
-            pgid: None,
-            leader_start_us: 0,
-            peak: 0,
-        });
-        Some(w.id)
+    /// Uses the latest sample's memory and stop conditions, without changing history or the
+    /// learned cap. Before the first sample, nothing starts. Shares the admission rule with
+    /// `step`; `out` is cleared even when nothing can start.
+    pub fn admit_now(
+        &mut self,
+        now: f64,
+        wall: f64,
+        learned: &dyn Fn(&str) -> Option<u64>,
+        out: &mut Vec<Id>,
+    ) {
+        out.clear();
+        self.now = now;
+        if self.cap.is_none() || self.tight || self.frozen {
+            return;
+        }
+        let alone = self.running.is_empty();
+        let mut reserved = self.reserved(now);
+        while let Some(at) = self.next() {
+            let need = self.need(&self.waiting[at].signature, learned);
+            // Forward progress applies only to the first start with nothing already running.
+            if !(alone && out.is_empty()) && !self.fits(need, reserved) {
+                break;
+            }
+            let w = self.waiting.remove(at);
+            self.running.push(Running {
+                id: w.id,
+                session: w.session,
+                label: w.label,
+                signature: w.signature,
+                since: wall,
+                admitted: now,
+                waited: wall - w.since,
+                need,
+                pgid: None,
+                leader_start_us: 0,
+                peak: 0,
+            });
+            out.push(w.id);
+            reserved = reserved.saturating_add(need);
+        }
     }
 }
 
@@ -485,6 +557,14 @@ mod tests {
         q.running().iter().map(|r| r.label.as_str()).collect()
     }
 
+    /// Existing single-admission scenarios also check that no extra request starts.
+    fn step(q: &mut Scheduler, s: &Sample, learned: &dyn Fn(&str) -> Option<u64>) -> Option<Id> {
+        let mut out = Vec::new();
+        q.step(s, learned, &mut out);
+        assert!(out.len() <= 1, "unexpected extra admissions: {out:?}");
+        out.first().copied()
+    }
+
     /// Readings every second from `from` to `to` inclusive at `level`; the last result.
     fn run(
         q: &mut Scheduler,
@@ -494,7 +574,7 @@ mod tests {
         learned: &dyn Fn(&str) -> Option<u64>,
     ) -> Option<Id> {
         (from..=to)
-            .map(|t| q.step(&at(f64::from(t), level), learned))
+            .map(|t| step(q, &at(f64::from(t), level), learned))
             .last()
             .flatten()
     }
@@ -503,7 +583,7 @@ mod tests {
     fn a_command_is_admitted_when_there_is_room() {
         let mut q = Scheduler::new();
         let a = ask(&mut q, 1, "a");
-        assert_eq!(q.step(&calm(0.0), &unknown), Some(a));
+        assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(a));
         assert_eq!(names(&q), ["a"]);
         assert!(q.waiting().is_empty());
         assert_eq!(q.cap(), Some(70 * GIB), "the cap starts at 70% of RAM");
@@ -526,7 +606,7 @@ mod tests {
         };
         let mut q = Scheduler::new();
         ask(&mut q, 1, "first");
-        assert!(q.step(&calm(0.0), &learned).is_some());
+        assert!(step(&mut q, &calm(0.0), &learned).is_some());
         run(&mut q, 1, 10, 45, &learned); // 55 GiB in use, the 5 s average settled
         assert_eq!(q.used(), 55 * GIB);
 
@@ -537,7 +617,7 @@ mod tests {
         q.release(edge);
         let fits = ask(&mut q, 2, "fits");
         assert_eq!(
-            q.step(&at(21.0, 45), &learned),
+            step(&mut q, &at(21.0, 45), &learned),
             Some(fits),
             "55 + 14 = 69 is"
         );
@@ -549,18 +629,26 @@ mod tests {
     fn nothing_is_admitted_while_memory_is_tight_or_a_job_is_frozen() {
         let mut q = Scheduler::new();
         let a = ask(&mut q, 1, "a");
-        assert_eq!(q.step(&at(0.0, 35), &unknown), None, "tight");
+        assert_eq!(step(&mut q, &at(0.0, 35), &unknown), None, "tight");
         let frozen = Sample {
             frozen: true,
             ..calm(1.0)
         };
-        assert_eq!(q.step(&frozen, &unknown), None, "frozen");
+        assert_eq!(step(&mut q, &frozen, &unknown), None, "frozen");
         let pressure = Sample {
             tight: true,
             ..calm(2.0)
         };
-        assert_eq!(q.step(&pressure, &unknown), None, "tight by pressure alone");
-        assert_eq!(q.step(&calm(3.0), &unknown), Some(a), "calm and thawed");
+        assert_eq!(
+            step(&mut q, &pressure, &unknown),
+            None,
+            "tight by pressure alone"
+        );
+        assert_eq!(
+            step(&mut q, &calm(3.0), &unknown),
+            Some(a),
+            "calm and thawed"
+        );
     }
 
     /// The memory in use is the average of the last 5 s, not the last reading: one calm
@@ -570,25 +658,183 @@ mod tests {
         let big = |s: &str| (s == "big").then_some(25 * GIB);
         let mut q = Scheduler::new();
         ask(&mut q, 1, "first");
-        assert!(q.step(&calm(0.0), &big).is_some());
+        assert!(step(&mut q, &calm(0.0), &big).is_some());
         run(&mut q, 1, 10, 45, &big); // 55 GiB in use
         let id = ask(&mut q, 2, "big");
         // 20 GiB in use now, but 4 x 55 + 20 over 5 s is 48, and 48 + 25 does not fit under 70.
-        assert_eq!(q.step(&at(11.0, 80), &big), None);
+        assert_eq!(step(&mut q, &at(11.0, 80), &big), None);
         assert_eq!(q.used(), 48 * GIB);
         // Two readings: (3 x 55 + 2 x 20) / 5 = 41 GiB, and 41 + 25 fits.
-        assert_eq!(q.step(&at(12.0, 80), &big), Some(id));
+        assert_eq!(step(&mut q, &at(12.0, 80), &big), Some(id));
         assert_eq!(q.used(), 41 * GIB);
     }
 
     #[test]
-    fn admissions_are_at_least_three_seconds_apart() {
+    fn two_strangers_that_fit_start_in_the_same_step() {
         let mut q = Scheduler::new();
-        let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 1, "b"));
-        assert_eq!(q.step(&calm(0.0), &unknown), Some(a));
-        assert_eq!(q.step(&calm(1.0), &unknown), None);
-        assert_eq!(q.step(&calm(2.9), &unknown), None);
-        assert_eq!(q.step(&calm(3.0), &unknown), Some(b));
+        let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 2, "b"));
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &unknown, &mut out);
+        assert_eq!(out, [a, b]);
+        assert_eq!(names(&q), ["a", "b"]);
+        assert!(
+            q.running()
+                .iter()
+                .all(|r| r.need == GIB && r.admitted == 0.0)
+        );
+    }
+
+    #[test]
+    fn a_burst_reserves_each_start_until_the_reservations_expire() {
+        let mut q = Scheduler::new();
+        let ids: Vec<_> = (1..=4).map(|s| ask(&mut q, s, "build")).collect();
+        let need = |_: &str| Some(20 * GIB);
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &need, &mut out);
+        assert_eq!(
+            out,
+            ids[..2],
+            "20 used + 40 reserved fits; another 20 does not"
+        );
+        q.step(&calm(RESERVE - 0.1), &need, &mut out);
+        assert!(
+            out.is_empty(),
+            "the output is cleared, and the burst is still reserved"
+        );
+        q.step(&calm(RESERVE), &need, &mut out);
+        assert_eq!(out, ids[2..], "the same memory reading now has room again");
+        assert_eq!(q.used(), 20 * GIB);
+        assert_eq!(
+            q.running().len(),
+            4,
+            "reservations expire while jobs still run"
+        );
+    }
+
+    #[test]
+    fn a_reservation_counts_until_exactly_reserve_seconds_and_ends_on_release() {
+        let mut q = Scheduler::new();
+        let id = ask(&mut q, 1, "build");
+        step(&mut q, &calm(7.0), &unknown);
+        assert_eq!(q.reserved(7.0 + RESERVE - 0.1), GIB);
+        assert_eq!(q.reserved(7.0 + RESERVE), 0);
+        q.release(id);
+        assert_eq!(q.reserved(8.0), 0);
+    }
+
+    #[test]
+    fn arrivals_use_the_last_sample_without_learning_or_probing() {
+        let mut q = Scheduler::new();
+        let first = ask(&mut q, 1, "first");
+        let mut out = vec![999];
+        q.admit_now(0.0, 0.0, &unknown, &mut out);
+        assert!(out.is_empty(), "no admission before the first sample");
+        q.step(&calm(0.0), &unknown, &mut out);
+        assert_eq!(out, [first]);
+        let second = ask(&mut q, 2, "second");
+        q.admit_now(0.1, 0.1, &unknown, &mut out);
+        assert_eq!(out, [second], "no sample between request and admission");
+        assert_eq!(q.running()[1].admitted, 0.1);
+        ask(&mut q, 3, "large");
+        let large = |_: &str| Some(60 * GIB);
+        q.admit_now(PROBE_AFTER + 1.0, 61.0, &large, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(q.cap(), Some(70 * GIB), "arrival never probes the cap");
+        assert_eq!(q.used(), 20 * GIB);
+        assert_eq!(q.history.len, 1, "arrival does not add readings");
+        assert_eq!(q.quiet_since, 0.0);
+    }
+
+    #[test]
+    fn arrivals_obey_the_last_samples_tight_and_frozen_conditions() {
+        for (tight, frozen) in [(true, false), (false, true)] {
+            let mut q = Scheduler::new();
+            let mut out = Vec::new();
+            q.step(
+                &Sample {
+                    tight,
+                    frozen,
+                    ..at(0.0, 35)
+                },
+                &unknown,
+                &mut out,
+            );
+            ask(&mut q, 1, "first");
+            ask(&mut q, 2, "second");
+            q.admit_now(1.0, 1.0, &unknown, &mut out);
+            assert!(out.is_empty());
+            assert_eq!(q.waiting().len(), 2);
+            q.step(&calm(2.0), &unknown, &mut out);
+            assert_eq!(
+                out.len(),
+                2,
+                "the next calm sample clears the stop condition"
+            );
+        }
+    }
+
+    #[test]
+    fn the_head_explains_its_wait_and_nothing_passes_it() {
+        let mut q = Scheduler::new();
+        let first = ask(&mut q, 1, "large");
+        let head = ask(&mut q, 2, "large");
+        let behind = ask(&mut q, 3, "small");
+        let need = |s: &str| (s == "large").then_some(30 * GIB);
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &need, &mut out);
+        assert_eq!(out, [first], "the small request cannot pass the head");
+        let mut view = Snapshot::default();
+        q.snapshot(&need, &mut view);
+        assert_eq!((view.waiting[0].id, view.waiting[1].id), (head, behind));
+        assert_eq!(
+            view.waiting[0].reason,
+            WaitReason::Cap {
+                used: 20 * GIB,
+                reserved: 30 * GIB,
+                cap: 70 * GIB,
+            }
+        );
+        assert_eq!(view.waiting[1].reason, WaitReason::Behind);
+        for (tight, frozen, reason) in [
+            (true, false, WaitReason::Tight),
+            (false, true, WaitReason::Frozen),
+        ] {
+            q.step(
+                &Sample {
+                    tight,
+                    frozen,
+                    ..calm(1.0)
+                },
+                &need,
+                &mut out,
+            );
+            assert!(out.is_empty());
+            q.snapshot(&need, &mut view);
+            assert_eq!(view.waiting[0].reason, reason);
+            assert_eq!(view.waiting[1].reason, WaitReason::Behind);
+        }
+    }
+
+    #[test]
+    fn probing_counts_recent_reservations_as_memory_in_use() {
+        let mut q = Scheduler::new();
+        let need = |_: &str| Some(30 * GIB);
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &need, &mut out);
+        let first = ask(&mut q, 1, "first");
+        q.step(&calm(PROBE_AFTER - 1.0), &need, &mut out);
+        assert_eq!(out, [first]);
+        ask(&mut q, 2, "second");
+        q.step(&calm(PROBE_AFTER), &need, &mut out);
+        assert!(
+            out.is_empty(),
+            "20 used + 30 reserved + 30 needed exceeds even the probe"
+        );
+        assert_eq!(
+            q.cap(),
+            Some(75 * GIB),
+            "only the reservation holds the head back"
+        );
     }
 
     /// With nothing running the next command starts although it does not fit (a machine that
@@ -599,17 +845,17 @@ mod tests {
         let big = |_: &str| Some(30 * GIB);
         let mut q = Scheduler::new();
         let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 1, "b"));
-        assert_eq!(q.step(&at(0.0, 35), &big), None, "never while tight");
+        assert_eq!(step(&mut q, &at(0.0, 35), &big), None, "never while tight");
         // 55 + 30 is over the cap, which the tight reading set to 65.
         assert_eq!(
-            q.step(&at(1.0, 45), &big),
+            step(&mut q, &at(1.0, 45), &big),
             Some(a),
             "alone: forward progress"
         );
         assert_eq!(run(&mut q, 2, 20, 45, &big), None, "now it has to fit");
         assert_eq!(q.waiting().len(), 1);
         q.release(a);
-        assert_eq!(q.step(&at(21.0, 45), &big), Some(b), "alone again");
+        assert_eq!(step(&mut q, &at(21.0, 45), &big), Some(b), "alone again");
     }
 
     /// The cap is what was in use over the last 15 s whenever a reading is tight: here ten
@@ -619,9 +865,9 @@ mod tests {
         let mut q = Scheduler::new();
         run(&mut q, 0, 9, 80, &unknown);
         assert_eq!(q.cap(), Some(70 * GIB));
-        q.step(&at(10.0, 25), &unknown);
+        step(&mut q, &at(10.0, 25), &unknown);
         assert_eq!(q.cap(), Some(25 * GIB), "(10 x 20 + 75) / 11");
-        q.step(&at(11.0, 25), &unknown);
+        step(&mut q, &at(11.0, 25), &unknown);
         assert_eq!(q.cap(), Some(350 * GIB / 12), "(10 x 20 + 2 x 75) / 12");
         run(&mut q, 12, 40, 25, &unknown);
         assert_eq!(
@@ -638,12 +884,12 @@ mod tests {
         let need = |s: &str| (s == "b").then_some(20 * GIB);
         let mut q = Scheduler::new();
         ask(&mut q, 1, "a");
-        assert!(q.step(&calm(0.0), &need).is_some());
+        assert!(step(&mut q, &calm(0.0), &need).is_some());
         run(&mut q, 1, 10, 45, &need); // 55 GiB in use, the 5 s average settled
         let b = ask(&mut q, 2, "b");
         // 55 + 20 = 75 does not fit under 70, nor (equal) under 75.
         for t in 11..=119 {
-            assert_eq!(q.step(&at(f64::from(t), 45), &need), None, "t = {t}");
+            assert_eq!(step(&mut q, &at(f64::from(t), 45), &need), None, "t = {t}");
             let cap = match t {
                 0..=59 => 70,
                 _ => 75,
@@ -651,7 +897,7 @@ mod tests {
             assert_eq!(q.cap(), Some(cap * GIB), "t = {t}");
         }
         assert_eq!(
-            q.step(&at(120.0, 45), &need),
+            step(&mut q, &at(120.0, 45), &need),
             Some(b),
             "80 GiB: 55 + 20 fits"
         );
@@ -663,7 +909,7 @@ mod tests {
         let huge = |_: &str| Some(95 * GIB);
         let mut q = Scheduler::new();
         ask(&mut q, 1, "a");
-        assert!(q.step(&calm(0.0), &huge).is_some());
+        assert!(step(&mut q, &calm(0.0), &huge).is_some());
         // Nobody waiting: nothing is blocked, so the cap stays where it is.
         run(&mut q, 1, 200, 45, &huge);
         assert_eq!(q.cap(), Some(70 * GIB));
@@ -671,7 +917,7 @@ mod tests {
         ask(&mut q, 2, "b");
         let mut caps = Vec::new();
         for t in 201..=600 {
-            assert_eq!(q.step(&at(f64::from(t), 45), &huge), None);
+            assert_eq!(step(&mut q, &at(f64::from(t), 45), &huge), None);
             caps.push(q.cap().unwrap() / GIB);
         }
         assert_eq!(caps.iter().max(), Some(&90), "never above 90% of RAM");
@@ -686,11 +932,11 @@ mod tests {
         let need = |_: &str| Some(40 * GIB);
         let mut q = Scheduler::new();
         ask(&mut q, 1, "a");
-        assert!(q.step(&calm(0.0), &need).is_some());
+        assert!(step(&mut q, &calm(0.0), &need).is_some());
         ask(&mut q, 2, "b");
         run(&mut q, 1, 99, 45, &need);
         assert_eq!(q.cap(), Some(75 * GIB), "probed once, at 60 s");
-        q.step(&at(100.0, 35), &need);
+        step(&mut q, &at(100.0, 35), &need);
         let learned = q.cap().unwrap();
         assert_eq!(learned, (14 * 55 + 65) * GIB / 15, "the last 15 s of use");
         run(&mut q, 101, 159, 45, &need);
@@ -699,7 +945,7 @@ mod tests {
             Some(learned),
             "no probe 59 s after the tight reading"
         );
-        q.step(&at(160.0, 45), &need);
+        step(&mut q, &at(160.0, 45), &need);
         assert_eq!(q.cap(), Some(learned + 5 * GIB));
     }
 
@@ -707,7 +953,7 @@ mod tests {
     fn what_was_learned_about_a_command_replaces_the_default_need() {
         let mut q = Scheduler::new();
         ask(&mut q, 1, "first");
-        assert!(q.step(&calm(0.0), &unknown).is_some());
+        assert!(step(&mut q, &calm(0.0), &unknown).is_some());
         run(&mut q, 1, 10, 55, &unknown); // 45 GiB in use, the 5 s average settled
         ask(&mut q, 2, "bun run test");
         let need = |q: &Scheduler, learned: &dyn Fn(&str) -> Option<u64>| {
@@ -727,7 +973,7 @@ mod tests {
             "held back by what it was seen to need"
         );
         assert!(
-            q.step(&at(21.0, 55), &unknown).is_some(),
+            step(&mut q, &at(21.0, 55), &unknown).is_some(),
             "admitted with the default"
         );
     }
@@ -741,7 +987,7 @@ mod tests {
             ram: 4 * GIB,
             ..calm(0.0)
         };
-        let _ = q.step(&small, &unknown);
+        let _ = step(&mut q, &small, &unknown);
         let cap = q.cap().unwrap();
         assert_eq!(cap, 4 * GIB * 70 / 100);
         ask(&mut q, 2, "b");
@@ -769,11 +1015,10 @@ mod tests {
             view.waiting.iter().map(|w| w.label.clone()).collect()
         };
         assert_eq!(order(&q), ["a1", "b1", "a2", "a3"]);
-        for (t, expect) in [(0.0, "a1"), (3.0, "b1"), (6.0, "a2"), (9.0, "a3")] {
-            let id = q.step(&calm(t), &unknown).expect("admitted");
-            assert_eq!(q.running().last().unwrap().id, id);
-            assert_eq!(q.running().last().unwrap().label, expect, "t = {t}");
-        }
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &unknown, &mut out);
+        assert_eq!(names(&q), ["a1", "b1", "a2", "a3"]);
+        assert_eq!(out, q.running().iter().map(|r| r.id).collect::<Vec<_>>());
     }
 
     /// A session that already has a command running goes behind one that has none, however
@@ -782,24 +1027,14 @@ mod tests {
     fn the_session_with_fewer_commands_running_goes_first_and_ties_go_to_the_older() {
         let mut q = Scheduler::new();
         ask(&mut q, 1, "running");
-        assert!(q.step(&calm(0.0), &unknown).is_some());
+        assert!(step(&mut q, &calm(0.0), &unknown).is_some());
         ask(&mut q, 1, "old");
         ask(&mut q, 2, "new");
         ask(&mut q, 3, "newest");
-        assert_eq!(
-            q.step(&calm(3.0), &unknown).map(|_| names(&q)[1]),
-            Some("new")
-        );
-        // Sessions 1 and 2 have one running each, session 3 none.
-        assert_eq!(
-            q.step(&calm(6.0), &unknown).map(|_| names(&q)[2]),
-            Some("newest")
-        );
-        // Now every session has one: the older request, "old", is next.
-        assert_eq!(
-            q.step(&calm(9.0), &unknown).map(|_| names(&q)[3]),
-            Some("old")
-        );
+        let mut out = Vec::new();
+        q.step(&calm(1.0), &unknown, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(names(&q), ["running", "new", "newest", "old"]);
     }
 
     /// Within one session the order never changes, whoever else comes and goes, and the
@@ -827,9 +1062,9 @@ mod tests {
         // past anybody.
         assert!(matches!(q.release(ids[1]), Some(Released::Waiting(_))));
         assert_eq!(positions(&q), [(ids[0], 1), (ids[2], 2), (ids[3], 3)]);
-        for (t, id) in [(0.0, ids[0]), (3.0, ids[2]), (6.0, ids[3])] {
-            assert_eq!(q.step(&calm(t), &unknown), Some(id));
-        }
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &unknown, &mut out);
+        assert_eq!(out, [ids[0], ids[2], ids[3]]);
     }
 
     #[test]
@@ -837,7 +1072,7 @@ mod tests {
         let mut q = Scheduler::new();
         let a = ask(&mut q, 1, "a");
         assert!(!q.started(a, 4242, 7), "not admitted yet");
-        assert_eq!(q.step(&calm(0.0), &unknown), Some(a));
+        assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(a));
         assert!(q.started(a, 4242, 7));
         q.observe(a, 3 * GIB);
         q.observe(a, 2 * GIB);
