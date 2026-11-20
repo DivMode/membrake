@@ -519,7 +519,7 @@ impl Broker {
             core.scheduled_at = Instant::now();
             let lost = core.take_notes(&mut notes);
             for &(id, bytes) in &self.seen {
-                core.sched.observe(id, bytes);
+                core.sched.observe(id, bytes, sample.time);
             }
             let sizes = &core.sizes;
             let learned = |signature: &str| sizes.get(signature);

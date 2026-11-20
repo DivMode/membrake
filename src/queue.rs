@@ -22,7 +22,9 @@
 //!   come, first served.
 //! - When the next one does not fit, nothing behind it starts.
 //! - Each start reserves its expected need for 10 s, until its memory has had time to enter
-//!   the 5 s average. All requests that fit with those reservations start in one step.
+//!   the 5 s average, and after that the part of its need it has not yet been seen to use,
+//!   for as long as it runs: a lint or test run that grows for a minute still holds the
+//!   memory it will reach. All requests that fit with those reservations start in one step.
 //!   Arrivals use the last sample's state to start immediately, without waiting for a sample.
 //! - If no admitted command is running and nothing is frozen, the next one starts even if it
 //!   does not fit, or it would wait for a machine that never gets any quieter. Never while
@@ -35,6 +37,7 @@ pub const GIB: u64 = 1 << 30;
 /// Memory in use is averaged over this long when deciding whether a command fits (seconds).
 pub const USED_WINDOW: f64 = 5.0;
 /// Allow five seconds for a start's memory to appear, plus a full window to enter the average.
+/// For this long a start reserves its whole need; afterwards, what its peak has not reached.
 pub const RESERVE: f64 = USED_WINDOW + 5.0;
 /// The cap is learned from the memory in use averaged over this long (seconds).
 pub const CAP_WINDOW: f64 = 15.0;
@@ -152,6 +155,22 @@ pub struct Running {
     pub leader_start_us: u64,
     /// The most memory its group has been seen to use.
     pub peak: u64,
+    /// Engine seconds when `peak` last rose.
+    pub peak_at: f64,
+    /// The highest peak that had been held for a full `USED_WINDOW`, so is in the average.
+    pub shown: u64,
+}
+
+impl Running {
+    /// The most memory its group has used that has had a full `USED_WINDOW` to enter the
+    /// 5 s average of memory in use; a newer, higher peak counts only once it has.
+    fn shown_at(&self, now: f64) -> u64 {
+        if now - self.peak_at >= USED_WINDOW {
+            self.peak
+        } else {
+            self.shown
+        }
+    }
 }
 
 /// What `Scheduler::release` took out.
@@ -328,10 +347,15 @@ impl Scheduler {
         true
     }
 
-    /// The admitted command's group is using `bytes` right now.
-    pub fn observe(&mut self, id: Id, bytes: u64) {
-        if let Some(job) = self.running.iter_mut().find(|r| r.id == id) {
-            job.peak = job.peak.max(bytes);
+    /// The admitted command's group is using `bytes` at engine time `now`, the sample's own
+    /// time (the scheduler's clock has not moved to it yet when the broker measures).
+    pub fn observe(&mut self, id: Id, bytes: u64, now: f64) {
+        if let Some(job) = self.running.iter_mut().find(|r| r.id == id)
+            && bytes > job.peak
+        {
+            job.shown = job.shown_at(now);
+            job.peak = bytes;
+            job.peak_at = now;
         }
     }
 
@@ -356,10 +380,18 @@ impl Scheduler {
     }
 
     fn reserved(&self, now: f64) -> u64 {
-        self.running
-            .iter()
-            .filter(|r| now - r.admitted < RESERVE)
-            .fold(0u64, |sum, r| sum.saturating_add(r.need))
+        self.running.iter().fold(0u64, |sum, r| {
+            let held = if now - r.admitted < RESERVE {
+                r.need
+            } else if r.peak == 0 {
+                // Never measured (its group not yet reported, or not readable): the 10 s
+                // reservation alone, so a job membrake cannot see never holds the queue.
+                0
+            } else {
+                r.need.saturating_sub(r.shown_at(now))
+            };
+            sum.saturating_add(held)
+        })
     }
 
     fn fits(&self, need: u64, reserved: u64) -> bool {
@@ -496,7 +528,7 @@ impl Scheduler {
         while let Some(at) = self.next() {
             let need = self.need(&self.waiting[at].signature, learned);
             // Forward progress applies only to the first start with nothing already running.
-            if !(alone && out.is_empty()) && !self.fits(need, reserved) {
+            if !(self.fits(need, reserved) || alone && out.is_empty()) {
                 break;
             }
             let w = self.waiting.remove(at);
@@ -512,6 +544,8 @@ impl Scheduler {
                 pgid: None,
                 leader_start_us: 0,
                 peak: 0,
+                peak_at: now,
+                shown: 0,
             });
             out.push(w.id);
             reserved = reserved.saturating_add(need);
@@ -605,8 +639,9 @@ mod tests {
             _ => None,
         };
         let mut q = Scheduler::new();
-        ask(&mut q, 1, "first");
+        let first = ask(&mut q, 1, "first");
         assert!(step(&mut q, &calm(0.0), &learned).is_some());
+        q.observe(first, GIB, 0.0); // its group has reached its need: nothing left reserved
         run(&mut q, 1, 10, 45, &learned); // 55 GiB in use, the 5 s average settled
         assert_eq!(q.used(), 55 * GIB);
 
@@ -684,8 +719,11 @@ mod tests {
         );
     }
 
+    /// A gate's lint and test runs reach their peak 30-60 s after they start. On 2026-11-20 a
+    /// burst admitted 70 GB of expected need into a 57.5 GB cap because each reservation
+    /// lapsed after 10 s while memory in use had not moved yet.
     #[test]
-    fn a_burst_reserves_each_start_until_the_reservations_expire() {
+    fn a_burst_stays_reserved_until_its_memory_shows() {
         let mut q = Scheduler::new();
         let ids: Vec<_> = (1..=4).map(|s| ask(&mut q, s, "build")).collect();
         let need = |_: &str| Some(20 * GIB);
@@ -696,30 +734,67 @@ mod tests {
             ids[..2],
             "20 used + 40 reserved fits; another 20 does not"
         );
-        q.step(&calm(RESERVE - 0.1), &need, &mut out);
+        for id in &ids[..2] {
+            q.observe(*id, GIB, 1.0); // sampled every second: small while they start
+        }
+        q.step(&calm(RESERVE + 30.0), &need, &mut out);
         assert!(
             out.is_empty(),
-            "the output is cleared, and the burst is still reserved"
+            "the burst is still growing, so it is still reserved"
         );
-        q.step(&calm(RESERVE), &need, &mut out);
-        assert_eq!(out, ids[2..], "the same memory reading now has room again");
-        assert_eq!(q.used(), 20 * GIB);
+        for id in &ids[..2] {
+            q.observe(*id, 20 * GIB, RESERVE + 30.0);
+        }
+        q.step(&calm(RESERVE + 30.0 + USED_WINDOW - 0.1), &need, &mut out);
+        assert!(
+            out.is_empty(),
+            "a peak just reached is not yet in the 5 s average, so it frees nothing"
+        );
+        q.step(&calm(RESERVE + 30.0 + USED_WINDOW), &need, &mut out);
         assert_eq!(
-            q.running().len(),
-            4,
-            "reservations expire while jobs still run"
+            out,
+            ids[2..],
+            "with the burst's memory shown, the same reading has room again"
         );
     }
 
     #[test]
-    fn a_reservation_counts_until_exactly_reserve_seconds_and_ends_on_release() {
+    fn a_reservation_holds_its_whole_need_then_what_its_peak_has_not_reached() {
         let mut q = Scheduler::new();
         let id = ask(&mut q, 1, "build");
         step(&mut q, &calm(7.0), &unknown);
-        assert_eq!(q.reserved(7.0 + RESERVE - 0.1), GIB);
-        assert_eq!(q.reserved(7.0 + RESERVE), 0);
+        q.observe(id, GIB / 4, 7.0);
+        assert_eq!(
+            q.reserved(7.0 + RESERVE - 0.1),
+            GIB,
+            "the whole need until it can enter the average"
+        );
+        assert_eq!(q.reserved(7.0 + RESERVE), GIB - GIB / 4);
+        q.observe(id, 2 * GIB, 30.0);
+        assert_eq!(
+            q.reserved(30.0 + USED_WINDOW - 0.1),
+            GIB - GIB / 4,
+            "a new peak frees room only once it is in the average"
+        );
+        assert_eq!(
+            q.reserved(30.0 + USED_WINDOW),
+            0,
+            "a peak past its need holds nothing"
+        );
         q.release(id);
         assert_eq!(q.reserved(8.0), 0);
+    }
+
+    /// A job membrake never measures (its group never reported, or not readable) keeps only
+    /// the 10 s reservation, as before reservations followed peaks, so it cannot hold the
+    /// queue for as long as it runs.
+    #[test]
+    fn an_unmeasured_job_reserves_only_its_first_ten_seconds() {
+        let mut q = Scheduler::new();
+        ask(&mut q, 1, "build");
+        step(&mut q, &calm(7.0), &unknown);
+        assert_eq!(q.reserved(7.0 + RESERVE - 0.1), GIB);
+        assert_eq!(q.reserved(7.0 + RESERVE), 0);
     }
 
     #[test]
@@ -1074,8 +1149,8 @@ mod tests {
         assert!(!q.started(a, 4242, 7), "not admitted yet");
         assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(a));
         assert!(q.started(a, 4242, 7));
-        q.observe(a, 3 * GIB);
-        q.observe(a, 2 * GIB);
+        q.observe(a, 3 * GIB, 1.0);
+        q.observe(a, 2 * GIB, 2.0);
         let Some(Released::Running(job)) = q.release(a) else {
             panic!("it was running");
         };
