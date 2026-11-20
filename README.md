@@ -408,9 +408,11 @@ Requests wait in order, and the next one starts only when **all** of this holds:
   for a command nothing is known about, `min(1 GiB, cap / 5)`. `reserved` is, for
   each running command, its whole expected need for its first 10 s (five seconds
   for a start's memory to appear, plus five to fill the average), and after that
-  the part of its need its group has not yet been seen to use. A command that
-  grows for a minute keeps its room until it gets there. Each admission adds its
-  need before the next request is considered.
+  the part of its need its group has not yet been seen to use, counting a new
+  peak only once it has had 5 s to enter the average. A command that grows for a
+  minute keeps its room until it gets there. A command membrake never manages to
+  measure keeps only the first 10 s, so it cannot hold the queue while it runs.
+  Each admission adds its need before the next request is considered.
 
 Every request that fits starts in the same step, in queue order; when the next
 one does not fit, nothing behind it starts. A new arrival can start immediately
