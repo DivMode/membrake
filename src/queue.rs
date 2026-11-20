@@ -503,7 +503,7 @@ impl Scheduler {
         while let Some(at) = self.next() {
             let need = self.need(&self.waiting[at].signature, learned);
             // Forward progress applies only to the first start with nothing already running.
-            if !(alone && out.is_empty()) && !self.fits(need, reserved) {
+            if !(self.fits(need, reserved) || alone && out.is_empty()) {
                 break;
             }
             let w = self.waiting.remove(at);
