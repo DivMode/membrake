@@ -405,10 +405,12 @@ Requests wait in order, and the next one starts only when **all** of this holds:
 - `used + reserved + need < cap`. `used` is the memory the kernel does not count as
   available (RAM × (100 − `kern.memorystatus_level`) / 100), averaged over the
   last 5 s. `need` is the peak this kind of command was seen to reach before, or,
-  for a command nothing is known about, `min(1 GiB, cap / 5)`. `reserved` is the
-  total expected need of running commands admitted in the last 10 s: five seconds
-  for a start's memory to appear, plus five to fill the average. Each admission
-  adds its need before the next request is considered.
+  for a command nothing is known about, `min(1 GiB, cap / 5)`. `reserved` is, for
+  each running command, its whole expected need for its first 10 s (five seconds
+  for a start's memory to appear, plus five to fill the average), and after that
+  the part of its need its group has not yet been seen to use. A command that
+  grows for a minute keeps its room until it gets there. Each admission adds its
+  need before the next request is considered.
 
 Every request that fits starts in the same step, in queue order; when the next
 one does not fit, nothing behind it starts. A new arrival can start immediately
