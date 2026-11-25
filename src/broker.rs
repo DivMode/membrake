@@ -34,6 +34,7 @@
 //! in the line or report its own completion. Strings and protocol lines are bounded.
 //! Process identities are checked before measuring groups.
 
+use crate::engine::Policy;
 use crate::jobs::{self, AGENT_CLI, Inspector, Probe, Regex};
 use crate::queue::{Id, Released, Reservation, Sample, Scheduler, Snapshot, WaitReason};
 use crate::runner::{age, gb};
@@ -603,12 +604,7 @@ impl Broker {
     pub fn tick(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
         self.begin_sample();
         self.measure(s.time);
-        self.schedule(
-            s,
-            tight,
-            frozen,
-            crate::engine::Policy::default().freeze_occupancy,
-        )
+        self.schedule(s, tight, frozen, &Policy::default())
     }
 
     /// Publish this sample's admission conditions after the engine has acted.
@@ -617,7 +613,7 @@ impl Broker {
         s: &Signals,
         tight: bool,
         frozen: bool,
-        freeze_occupancy: f64,
+        policy: &Policy,
     ) -> Vec<Note> {
         let mut notes = Vec::new();
         let sample = Sample {
@@ -639,7 +635,7 @@ impl Broker {
             let learned = |signature: &str| sizes.demand(signature);
             let now = s.time + self.sample_started.elapsed().as_secs_f64();
             core.sched
-                .step_at(&sample, now, freeze_occupancy, &learned, &mut self.admitted);
+                .step_at(&sample, now, policy, &learned, &mut self.admitted);
             core.sched.snapshot(&learned, &mut self.view);
             lost
         };

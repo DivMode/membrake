@@ -433,18 +433,19 @@ A head whose memory need meets or exceeds the current cap holds an exclusive
 turn. It can start on its own when the queue's running list is empty and memory
 pressure permits a start. It can start beside running jobs when a fresh, calm
 reading shows that background memory plus their reservations plus its own need
-stays below 90% of RAM. After holding the turn for ten minutes it can also
-start on the next fresh, calm reading, regardless of its memory estimate.
+stays below 75% of RAM, the same ceiling as cap probes. After holding the turn
+for ten minutes it can also start on the next fresh, calm reading, regardless
+of its memory estimate.
 The brake still monitors measured pressure. Younger requests wait until the
 exclusive job finishes.
 
-The cap starts at 70% of RAM. When memory is tight it takes the last 15 s
-average of counted memory in use. After a quiet minute with a request blocked
-only by the cap, it rises by 5% of RAM, up to 75%, while compressor occupancy
-is below the freeze threshold (60%). At or above that threshold, the cap
-returns to the average from the last tight reading, or to 70% of RAM if there
-has been no tight reading. A session, used for display, is the nearest agent
-ancestor of the client or its parent process.
+The cap starts at 70% of RAM. After a quiet minute with a request blocked only
+by the cap, it rises by 5% of RAM, up to 75%, even if compressor occupancy is
+still above the freeze threshold (60%). Freeze-tier compressor pressure requires
+both tight memory and occupancy at or above that threshold. When memory is
+tight, including under freeze-tier pressure, the cap returns to the last 15 s
+average of counted memory in use. A session, used for display, is the nearest
+agent ancestor of the client or its parent process.
 
 Profiles use the label together with the command signature. The signature is
 the program name and up to two plain arguments, with directories stripped.
