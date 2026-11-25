@@ -827,6 +827,7 @@ mod tests {
                     wall: s.wall,
                     level: s.level,
                     ram: s.ram,
+                    occupancy: step.occupancy,
                     tight: step.tight,
                     frozen: false,
                 },

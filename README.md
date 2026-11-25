@@ -440,8 +440,11 @@ exclusive job finishes.
 
 The cap starts at 70% of RAM. When memory is tight it takes the last 15 s
 average of counted memory in use. After a quiet minute with a request blocked
-only by the cap, it rises by 5% of RAM, up to 90%. A session, used for display,
-is the nearest agent ancestor of the client or its parent process.
+only by the cap, it rises by 5% of RAM, up to 90%, while compressor occupancy
+is below the freeze threshold (60%). At or above that threshold, the cap
+returns to the average from the last tight reading, or to 70% of RAM if there
+has been no tight reading. A session, used for display, is the nearest agent
+ancestor of the client or its parent process.
 
 Profiles use the label together with the command signature. The signature is
 the program name and up to two plain arguments, with directories stripped.
