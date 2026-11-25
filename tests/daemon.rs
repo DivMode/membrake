@@ -1868,17 +1868,17 @@ fn queue_a_simulated_daemon_admits_and_completes_500_concurrent_clients() {
         complete
     };
     wait_until("500 requests queued at once", 20, || read(false) == 500);
-    script.calm(8);
-    // A learned one-core job starts while committed cores are below the budget (80% of
-    // this host's cores), so a small CI runner completes the burst in more rounds.
+    // A learned one-core job starts while committed cores are below the budget (this
+    // host's cores less the default headroom), so a small CI runner needs more rounds.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u64);
-    let at_once = (cores * 8).div_ceil(10).max(1);
-    let rounds = 500u64.div_ceil(at_once);
-    wait_until(
-        "500 go-aheads and completed requests",
-        10 + rounds / 5,
-        || read(true) == 500,
-    );
+    let share = 100 - u64::from(membrake::queue::DEFAULT_CPU_HEADROOM_PERCENT);
+    let at_once = (cores * share).div_ceil(100).max(1);
+    let deadline = 10 + 500u64.div_ceil(at_once) / 5;
+    // Calm readings for the whole wait: the broker admits only on fresh samples.
+    script.calm(u32::try_from(deadline + 5).unwrap());
+    wait_until("500 go-aheads and completed requests", deadline, || {
+        read(true) == 500
+    });
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
 }
