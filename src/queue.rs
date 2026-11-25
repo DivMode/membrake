@@ -19,7 +19,10 @@ pub const PROBE_AFTER: f64 = 60.0;
 const START_PERCENT: u64 = 70;
 /// Each probe raises the cap by this, as a percentage of RAM...
 const PROBE_PERCENT: u64 = 5;
-/// ...and never above this.
+/// ...and never above this. Live stress runs (#26) showed probes toward 90% letting two
+/// 38 GB reservations run together on a 96 GB host whose other work sat in swap.
+const PROBE_MAX_PERCENT: u64 = 75;
+/// An oversized head may start beside others while everything fits under this.
 const MAX_PERCENT: u64 = 90;
 /// Readings kept: more than `CAP_WINDOW` holds at one a second.
 const HISTORY: usize = 64;
@@ -845,7 +848,7 @@ impl Scheduler {
                         && !self.fits_memory(estimate.need, self.reserved())
                 })
         {
-            let max = percent(s.ram, MAX_PERCENT);
+            let max = percent(s.ram, PROBE_MAX_PERCENT);
             if let Some(cap) = self.cap.as_mut().filter(|cap| **cap < max) {
                 *cap = (*cap + percent(s.ram, PROBE_PERCENT)).min(max);
             }
@@ -2043,31 +2046,27 @@ mod tests {
     /// again every 60 s; the request that fits at last is admitted.
     #[test]
     fn the_cap_is_probed_upwards_while_a_request_is_blocked_by_it() {
-        let need = |s: &str| memory((s == "b").then_some(16 * GIB));
+        let need = |s: &str| memory((s == "b").then_some(15 * GIB));
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
         assert!(step(&mut q, &calm(0.0), &need).is_some());
         run(&mut q, 1, 10, 45, &need); // 55 GiB in use, the 5 s average settled
         let b = ask(&mut q, 2, "b");
-        // 55 + 20 = 75 does not fit under 70, nor (equal) under 75.
-        for t in 11..=119 {
+        // 55 + 18.75 does not fit under 70.
+        for t in 11..=59 {
             assert_eq!(step(&mut q, &at(f64::from(t), 45), &need), None, "t = {t}");
-            let cap = match t {
-                0..=59 => 70,
-                _ => 75,
-            };
-            assert_eq!(q.cap(), Some(cap * GIB), "t = {t}");
+            assert_eq!(q.cap(), Some(70 * GIB), "t = {t}");
         }
         assert_eq!(
-            step(&mut q, &at(120.0, 45), &need),
+            step(&mut q, &at(60.0, 45), &need),
             Some(b),
-            "80 GiB: 55 + 20 fits"
+            "75 GiB: 55 + 18.75 fits"
         );
-        assert_eq!(q.cap(), Some(80 * GIB));
+        assert_eq!(q.cap(), Some(75 * GIB));
     }
 
     #[test]
-    fn probing_stops_at_90_percent_of_ram_and_waits_for_a_blocked_request() {
+    fn probing_stops_at_75_percent_of_ram_and_waits_for_a_blocked_request() {
         let huge = |_: &str| memory(Some(95 * GIB));
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
@@ -2083,9 +2082,9 @@ mod tests {
             assert_eq!(step(&mut q, &at(f64::from(t), 45), &huge), None);
             caps.push(q.cap().unwrap() / GIB);
         }
-        assert_eq!(caps.iter().max(), Some(&90), "never above 90% of RAM");
-        assert_eq!(caps.last(), Some(&90));
-        assert!(caps.contains(&75) && caps.contains(&80) && caps.contains(&85));
+        assert_eq!(caps.iter().max(), Some(&75), "never above 75% of RAM");
+        assert_eq!(caps.last(), Some(&75));
+        assert!(caps.iter().all(|&cap| cap == 70 || cap == 75));
     }
 
     /// Pressure restarts the 60 s: the next probe is 60 s after the last tight reading, from
