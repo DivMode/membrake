@@ -569,6 +569,9 @@ impl Broker {
         let mut core = lock(&self.core);
         for (id, usage) in &self.seen {
             core.sched.observe(*id, usage.bytes, now);
+            if usage.stopped {
+                core.sched.restart_plateau(*id);
+            }
             if let Some(cpu) = usage.cpu_ns {
                 // Pressure actions can wait through a kill grace before the counters are read.
                 core.sched
@@ -1738,7 +1741,14 @@ mod tests {
                 .filter(|r| r.label.starts_with("sibling-"))
                 .collect();
             assert_eq!(learned.len(), 9);
-            assert!(learned.iter().all(|r| r.need == peak + peak / 4));
+            for sibling in learned {
+                assert_eq!(
+                    sibling.need,
+                    peak + peak / 4,
+                    "{} after DONE",
+                    sibling.label
+                );
+            }
         }
         drop(broker);
         let _ = fs::remove_dir_all(&dir);

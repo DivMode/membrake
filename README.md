@@ -402,10 +402,12 @@ conditions:
   reading. Each running job holds the greater of its starting need and 125%
   of its largest observed footprint for its whole run. An unmeasured command
   reserves the greater of 4 GiB and one eighth of the cap. For a signature
-  without a profile, siblings wait until the first run records usage or
-  the daemon samples a running sibling at least 60 s after its admission.
-  In the latter case, each new sibling reserves the greater of the cold
-  default and 125% of the largest peak observed among its running siblings.
+  without a profile, siblings wait until the first run records usage or a
+  running sibling's observed peak plateaus. A plateau requires at least 30 s
+  of footprint samples and no more than 5% growth in the observed peak over
+  the last 30 s. After a plateau, each new sibling reserves the greater of
+  the cold default and 125% of the largest peak observed among its running
+  siblings.
   Other signatures can start or backfill when they fit. If the first command
   fails, or its client disappears without any observed usage, the next
   sibling can take its turn. Learned commands reserve 125% of their recent peak.
