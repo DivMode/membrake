@@ -603,11 +603,22 @@ impl Broker {
     pub fn tick(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
         self.begin_sample();
         self.measure(s.time);
-        self.schedule(s, tight, frozen)
+        self.schedule(
+            s,
+            tight,
+            frozen,
+            crate::engine::Policy::default().freeze_occupancy,
+        )
     }
 
     /// Publish this sample's admission conditions after the engine has acted.
-    pub(crate) fn schedule(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
+    pub(crate) fn schedule(
+        &mut self,
+        s: &Signals,
+        tight: bool,
+        frozen: bool,
+        freeze_occupancy: f64,
+    ) -> Vec<Note> {
         let mut notes = Vec::new();
         let sample = Sample {
             time: s.time,
@@ -615,6 +626,7 @@ impl Broker {
             wall: signals::wall(),
             ram: s.ram,
             level: s.level,
+            occupancy: s.occupancy(),
             tight,
             frozen,
         };
@@ -627,7 +639,7 @@ impl Broker {
             let learned = |signature: &str| sizes.demand(signature);
             let now = s.time + self.sample_started.elapsed().as_secs_f64();
             core.sched
-                .step_at(&sample, now, &learned, &mut self.admitted);
+                .step_at(&sample, now, freeze_occupancy, &learned, &mut self.admitted);
             core.sched.snapshot(&learned, &mut self.view);
             lost
         };
@@ -2191,6 +2203,7 @@ mod tests {
                 wall: signals::wall(),
                 ram: 96 << 30,
                 level: 80,
+                occupancy: 0.0,
                 tight: false,
                 frozen: false,
             };
@@ -2268,6 +2281,7 @@ mod tests {
                 wall: 1.0,
                 ram: 96 * GIB,
                 level: 80,
+                occupancy: 0.0,
                 tight: false,
                 frozen: false,
             },
@@ -2377,6 +2391,7 @@ mod tests {
                     wall: 1.0,
                     ram: 96 << 30,
                     level: 80,
+                    occupancy: 0.0,
                     tight: false,
                     frozen: false,
                 },
