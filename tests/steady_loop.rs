@@ -376,17 +376,25 @@ fn steady_loop_with_one_client_waiting_and_one_running_does_not_allocate() {
         },
         &mut || status().is_some_and(|q| q.waiting.len() == 1),
     );
-    // Warm: the measured peak has stopped moving, so the status file has stopped changing.
+    // Warm: the cold measurement window has ended, and the measured peak has settled.
+    // Reading the new wait reason from the status file confirms the transition was published.
+    let tight = membrake::queue::WaitReason::Tight.to_string();
     let mut still = 0;
-    let mut last = status().map(|q| q.running[0].peak);
+    let mut last = None;
     until(
-        "the measured size to settle",
+        "the wait reason and measured size to settle",
         &mut || {
             tick(35);
         },
         &mut || {
-            let now = status().map(|q| q.running[0].peak);
-            still = if now == last { still + 1 } else { 0 };
+            let now = status()
+                .filter(|q| q.waiting.first().is_some_and(|w| w.reason == tight))
+                .and_then(|q| q.running.first().map(|r| r.peak));
+            still = if now.is_some() && now == last {
+                still + 1
+            } else {
+                0
+            };
             last = now;
             still >= 50
         },

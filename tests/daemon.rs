@@ -1544,6 +1544,103 @@ fn marker_file(dir: &Path, name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+fn sleep_client_in_group(dir: &Path, name: &str, socket: &Path, pgid: i32) -> Client {
+    let stderr = dir.join(format!("{name}.stderr"));
+    let child = Command::new(env!("CARGO_BIN_EXE_membrake"))
+        .env_remove("MEMBRAKE_ADMITTED")
+        .args(["exec", "--socket"])
+        .arg(socket)
+        .args(["--", "sleep", "300"])
+        .stderr(fs::File::create(&stderr).unwrap())
+        .process_group(pgid)
+        .spawn()
+        .unwrap();
+    Client { child, stderr }
+}
+
+#[test]
+fn waiting_exec_clients_do_not_make_their_driver_group_a_victim() {
+    let dir = scratch("waiting-clients-driver");
+    let socket = queue_socket("driver");
+    let mut script = Script::new(&dir);
+    script.tight_and_quiet(3);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    daemon.wait_samples(&dir.join("log"), 3);
+
+    let shell_script = dir.join("wait.zsh");
+    fs::write(&shell_script, "read -r line\n").unwrap();
+    let shell = Sleeper(
+        Command::new("/bin/zsh")
+            .arg("-f")
+            .arg(shell_script)
+            .stdin(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let pgid = shell.pid();
+    let group = Group(vec![shell, Sleeper::spawn_in("300", pgid)]);
+    let clients: Vec<_> = (0..12)
+        .map(|i| sleep_client_in_group(&dir, &format!("client-{i}"), &socket, pgid))
+        .collect();
+    for client in &clients {
+        client.wait_said("queued (position");
+    }
+
+    // The real clients alone push the shell and driver across the minimum. The scan
+    // feeds the engine's victim pool, where this group would be classed as unqueued.
+    let ordinary = group.footprint();
+    let waiting: u64 = clients.iter().map(|c| jobs::footprint(c.pid())).sum();
+    assert!(ordinary > 0 && waiting > ordinary);
+    let min = ordinary + waiting / 2;
+    let rules = jobs::Rules::new(&[], &[], vec![], vec![], 0)
+        .unwrap()
+        .only_matching("waiting-clients-driver", std::process::id() as i32)
+        .unwrap();
+    let candidates = jobs::scan(&rules, min);
+    assert!(
+        candidates.iter().all(|job| job.pgid != pgid),
+        "waiting clients made their driver an unqueued victim: {candidates:?} (minimum {min})"
+    );
+    let visible = jobs::scan(&rules, 0);
+    let driver = visible.iter().find(|job| job.pgid == pgid).unwrap();
+    assert_eq!(driver.procs, 14);
+    assert!(driver.bytes > 0 && driver.bytes < min, "{driver:?}");
+
+    drop(clients);
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_client_only_group_is_ineligible_at_a_zero_minimum() {
+    let dir = scratch("client-only");
+    let socket = queue_socket("client-only");
+    let mut script = Script::new(&dir);
+    script.tight_and_quiet(3);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    daemon.wait_samples(&dir.join("log"), 3);
+
+    let client = sleep_client_in_group(&dir, "client", &socket, 0);
+    client.wait_said("queued (position");
+    let pgid = client.pid();
+    let mut inspector = jobs::Inspector::new();
+    assert_eq!(inspector.pids(pgid).unwrap(), [pgid]);
+    let rules = jobs::Rules::new(&[], &[], vec![], vec![], 0)
+        .unwrap()
+        .only_matching("client-only[.]sock", std::process::id() as i32)
+        .unwrap();
+    let candidates = jobs::scan(&rules, 0);
+    assert!(
+        candidates.iter().all(|job| job.pgid != pgid),
+        "a client-only group was eligible at a zero minimum: {candidates:?}"
+    );
+
+    drop(client);
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// While memory is tight the client is told its place and waits, and its command does not
 /// run; when memory is calm it runs. The command is `touch`, so that "it ran" is a fact on
 /// disk and not the client's say-so.

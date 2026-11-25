@@ -32,8 +32,9 @@ const EVENTS_CAP: u64 = 8 << 20;
 const SYNC_EVERY: Duration = Duration::from_secs(10);
 /// A problem with the samples file is said on stderr at most this often.
 const WARN_EVERY: Duration = Duration::from_secs(60);
-/// Events that may wait for the logger thread. Past this they are dropped.
-const EVENT_QUEUE: usize = 256;
+/// Events that may wait for the logger thread. Past this they are dropped. A burst of
+/// thousands of simultaneous launches is a queue note each, all forwarded in one tick (#31).
+const EVENT_QUEUE: usize = 16_384;
 /// Samples that may wait for the sample thread, and so the number of row buffers there are:
 /// at one a second, a disk that stalls for four minutes costs no sample. Past this a sample
 /// is dropped.
@@ -1192,13 +1193,14 @@ mod tests {
         mkfifo(&log);
         let mut rec = Recorder::new(&dir);
 
+        let sent = EVENT_QUEUE + 1000;
         let started = Instant::now();
-        for i in 0..1000 {
+        for i in 0..sent {
             rec.event(1_700_000_000.0, "warn", &format!("event {i}"));
         }
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "1000 events took {:?} with nobody reading the log",
+            "{sent} events took {:?} with nobody reading the log",
             started.elapsed()
         );
 
@@ -1227,8 +1229,37 @@ mod tests {
         );
         assert_eq!(
             written + reported,
-            1000,
+            sent,
             "{written} written, {reported} dropped"
+        );
+    }
+
+    /// A burst of 2,200 launch notes reaches the event log whole even while the log is not
+    /// being written (#31).
+    #[test]
+    fn a_burst_of_events_is_kept_while_the_log_is_stuck() {
+        let dir = scratch("burst");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(EVENTS_FILE);
+        mkfifo(&log);
+        let mut rec = Recorder::new(&dir);
+        for i in 0..2_200 {
+            rec.event(
+                1_700_000_000.0,
+                "queue",
+                &format!("burst-{i} asks for a turn"),
+            );
+        }
+        let reader = thread::spawn(move || fs::read_to_string(log).unwrap());
+        assert!(rec.flush(Duration::from_secs(10)), "the logger catches up");
+        drop(rec);
+        let text = reader.join().unwrap();
+        assert!(!text.contains("were dropped"), "nothing dropped");
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains(" asks for a turn"))
+                .count(),
+            2_200
         );
     }
 
@@ -1276,7 +1307,16 @@ mod tests {
             text
         };
         let rows = written.lines().filter(|l| !l.starts_with("time\t")).count();
-        let said = fs::read_to_string(&events).unwrap();
+        // The samples thread reports its drops once its queue runs empty, after the flush
+        // answered; the logger thread writes that report a moment later.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let said = loop {
+            let said = fs::read_to_string(&events).unwrap();
+            if said.contains("sample(s) were dropped") || Instant::now() >= deadline {
+                break said;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
         let reported: usize = said
             .lines()
             .filter(|l| l.contains("sample(s) were dropped"))

@@ -9,6 +9,7 @@ use std::ffi::CString;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
+use std::path::Path;
 
 /// Groups led by a user below this uid (root and the system accounts) are never touched,
 /// unless the user is named by `--include-user`. (`--protect-user` only changes the ranking
@@ -53,7 +54,7 @@ pub struct Job {
     /// the process even after pid reuse.
     pub start_us: u64,
     pub uid: u32,
-    /// Sum of `ri_phys_footprint` over the members: Activity Monitor's "Memory".
+    /// Sum of `ri_phys_footprint` over the members other than `membrake exec` clients.
     pub bytes: u64,
     pub procs: u32,
     pub prefer: bool,
@@ -134,6 +135,15 @@ pub struct Member {
     /// The member's complete arguments joined by spaces (`KERN_PROCARGS2`), untruncated: the
     /// only place an interpreter-hosted agent (`node /path/to/codex`) shows.
     pub command: String,
+    exec_subcommand: bool,
+}
+
+impl Member {
+    fn is_exec_client(&self, own_exe: Option<&Path>) -> bool {
+        let exe = Path::new(&self.exe);
+        self.exec_subcommand
+            && (exe.file_name().is_some_and(|name| name == "membrake") || own_exe == Some(exe))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -511,9 +521,8 @@ fn exe_path(pid: i32) -> Probe<String> {
     }
 }
 
-/// A process's complete arguments joined by spaces, from `KERN_PROCARGS2`: every one of them,
-/// however long. An empty string if it has none. Read only for candidates, never every sample.
-fn args_line(pid: i32) -> Probe<String> {
+/// A process's complete arguments from `KERN_PROCARGS2`. Read only for candidates.
+fn process_args(pid: i32) -> Probe<Vec<String>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size = 0usize;
     clear_errno();
@@ -532,7 +541,7 @@ fn args_line(pid: i32) -> Probe<String> {
         return failure("KERN_PROCARGS2");
     }
     if size <= size_of::<i32>() {
-        return Probe::Found(String::new());
+        return Probe::Found(Vec::new());
     }
     let mut buf = vec![0u8; size];
     // SAFETY: `buf` is `size` bytes long.
@@ -570,7 +579,11 @@ fn args_line(pid: i32) -> Probe<String> {
         args.push(String::from_utf8_lossy(&buf[at..end]).into_owned());
         at = end + 1;
     }
-    Probe::Found(args.join(" "))
+    Probe::Found(args)
+}
+
+fn args_line(pid: i32) -> Probe<String> {
+    process_args(pid).map(|args| args.join(" "))
 }
 
 /// The command line as shown to people: one line, cut at 200 characters.
@@ -698,7 +711,7 @@ pub enum Read {
     Unreadable(String),
 }
 
-fn why(probe: &Probe<String>) -> Option<String> {
+fn why<T>(probe: &Probe<T>) -> Option<String> {
     match probe {
         Probe::Unreadable(e) => Some(e.to_string()),
         Probe::Found(_) | Probe::Gone => None,
@@ -708,12 +721,13 @@ fn why(probe: &Probe<String>) -> Option<String> {
 /// A member's facts, None if it exited while being read, Err if it is still there and could
 /// not be read.
 fn read_member(p: &Proc) -> Result<Option<Member>, String> {
-    match (exe_path(p.pid), args_line(p.pid)) {
-        (Probe::Found(exe), Probe::Found(command)) => Ok(Some(Member {
+    match (exe_path(p.pid), process_args(p.pid)) {
+        (Probe::Found(exe), Probe::Found(args)) => Ok(Some(Member {
             name: p.name.clone(),
             exe,
             uid: p.uid,
-            command,
+            exec_subcommand: args.get(1).is_some_and(|arg| arg == "exec"),
+            command: args.join(" "),
         })),
         (exe, command) => match probe(p.pid) {
             Probe::Gone => Ok(None),
@@ -772,8 +786,8 @@ fn leader_and_command(pgid: i32, group: &Facts) -> Option<(&Proc, &str)> {
     Some((leader, group.members[at].command.as_str()))
 }
 
-/// Every eligible group of at least `min_bytes`. The one place that reads the whole process
-/// table.
+/// Every eligible group with a positive footprint of at least `min_bytes`. The one place
+/// that reads the whole process table.
 pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
     let mut groups: HashMap<i32, Vec<Proc>> = HashMap::new();
     for pid in list_pids() {
@@ -785,6 +799,7 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
     }
     let mut insp = Inspector::new();
     let mut jobs = Vec::new();
+    let own_exe = std::env::current_exe().ok();
     for (pgid, procs) in groups {
         let Some(leader) = leader_of(pgid, &procs) else {
             continue;
@@ -792,11 +807,10 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
         if rules.precheck(pgid, leader.uid).is_some() {
             continue;
         }
-        let bytes: u64 = procs.iter().map(|p| footprint(p.pid)).sum();
-        if bytes < min_bytes {
+        if min_bytes > 0 && procs.iter().map(|p| footprint(p.pid)).sum::<u64>() < min_bytes {
             continue;
         }
-        // Heavy enough to matter: read the group afresh from the kernel's list of its members
+        // Potentially heavy enough: read the group afresh from the kernel's list of its members
         // (a process that failed to read above is in no group of `groups`, but is in this
         // list). A member that cannot be read in full makes the group ineligible.
         let Read::Facts(group) = read_group(pgid, &mut insp) else {
@@ -808,6 +822,18 @@ pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
         if let Verdict::Eligible { prefer, protected } =
             rules.classify(pgid, leader.uid, leader.ppid, &group.members, full)
         {
+            // Only complete member facts can identify clients. The quick sum above can
+            // overstate the footprint, so apply the threshold again to the measured workers.
+            let bytes = group
+                .procs
+                .iter()
+                .zip(&group.members)
+                .filter(|(_, member)| !member.is_exec_client(own_exe.as_deref()))
+                .map(|(p, _)| footprint(p.pid))
+                .sum();
+            if bytes == 0 || bytes < min_bytes {
+                continue;
+            }
             jobs.push(Job {
                 pgid,
                 leader_pid: leader.pid,
@@ -1033,6 +1059,7 @@ mod tests {
             exe: exe.into(),
             uid: 501,
             command: name.into(),
+            exec_subcommand: false,
         }
     }
 

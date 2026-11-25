@@ -249,6 +249,8 @@ impl Reply {
                     WaitReason::Tight => line.push_str("\ttight"),
                     WaitReason::Frozen => line.push_str("\tfrozen"),
                     WaitReason::Behind => line.push_str("\tbehind"),
+                    // Older clients read "behind" and stay queued.
+                    WaitReason::Measuring => line.push_str("\tbehind\tmeasuring"),
                     WaitReason::Cap {
                         used,
                         reserved,
@@ -284,6 +286,7 @@ impl Reply {
                     Some("tight") => WaitReason::Tight,
                     Some("frozen") => WaitReason::Frozen,
                     Some("behind") => match fields.next() {
+                        Some("measuring") => WaitReason::Measuring,
                         Some("cpu") => {
                             let committed = fields.next()?.parse().ok()?;
                             fields.next()?;
@@ -423,6 +426,7 @@ mod tests {
             WaitReason::Tight,
             WaitReason::Frozen,
             WaitReason::Behind,
+            WaitReason::Measuring,
             WaitReason::Cap {
                 used: 40 * (1 << 30),
                 reserved: 8 * (1 << 30),

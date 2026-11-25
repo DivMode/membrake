@@ -132,7 +132,7 @@ fn queued_line(position: usize, need: u64, reason: WaitReason) -> String {
             "queued for memory (position {position}, needs {:.1} GB)",
             gib(need)
         ),
-        WaitReason::Tight | WaitReason::Frozen | WaitReason::Cpu { .. } => {
+        WaitReason::Tight | WaitReason::Frozen | WaitReason::Measuring | WaitReason::Cpu { .. } => {
             format!("queued (position {position}): {reason}")
         }
         _ => format!(
@@ -828,6 +828,11 @@ mod tests {
                 1,
                 WaitReason::Frozen,
                 "queued (position 1): a job is frozen",
+            ),
+            (
+                2,
+                WaitReason::Measuring,
+                "queued (position 2): first run of this command is still being measured",
             ),
             (
                 2,

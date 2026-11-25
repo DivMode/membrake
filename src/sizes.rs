@@ -61,6 +61,12 @@ pub struct Demand {
     pub runtime_ms: Option<u64>,
 }
 
+impl Demand {
+    pub(crate) fn has_profile(self) -> bool {
+        self.bytes.is_some() || self.millicores.is_some() || self.runtime_ms.is_some()
+    }
+}
+
 #[derive(Clone)]
 struct Entry {
     memory: Peaks<u64>,
