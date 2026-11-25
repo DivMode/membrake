@@ -25,7 +25,10 @@ const HISTORY: usize = 64;
 const FRESH_SAMPLE_SECONDS: f64 = 2.5;
 const EXCLUSIVE_WAIT_SECONDS: f64 = 600.0;
 const CPU_WINDOW_SECONDS: f64 = 10.0;
-const COLD_MEASUREMENT_SECONDS: f64 = 60.0;
+const COLD_PLATEAU_SECONDS: f64 = 30.0;
+/// Readings a plateau needs inside its window (the sampler runs once a second), so a gap in
+/// sampling cannot pass for a flat peak.
+const COLD_PLATEAU_SAMPLES: usize = 20;
 /// Set the soft admission budget below the machine's logical core count by this share.
 pub const DEFAULT_CPU_HEADROOM_PERCENT: u32 = 20;
 pub(crate) const MILLICORES: u32 = 1000;
@@ -132,6 +135,13 @@ struct Estimate {
     measuring: bool,
 }
 
+#[derive(Clone, Debug)]
+struct Footprint {
+    time: f64,
+    bytes: u64,
+    peak: u64,
+}
+
 /// A command that has been told to start, until it ends.
 #[derive(Clone, Debug)]
 pub struct Running {
@@ -159,7 +169,8 @@ pub struct Running {
     pub leader_start_us: u64,
     /// The most memory its group has been seen to use.
     pub peak: u64,
-    footprint: Option<(f64, u64)>,
+    /// Recent footprint samples, including the last one at or before the window's start.
+    footprints: VecDeque<Footprint>,
     cpu: Cpu,
 }
 
@@ -229,6 +240,19 @@ impl Running {
 
     fn reservation(&self) -> u64 {
         self.need.max(with_margin(self.peak))
+    }
+
+    fn has_plateaued(&self) -> bool {
+        self.footprints.len() >= COLD_PLATEAU_SAMPLES
+            && self
+                .footprints
+                .back()
+                .zip(self.footprints.front())
+                .is_some_and(|(latest, baseline)| {
+                    // One twentieth is the maximum 5% increase from the window's starting peak.
+                    latest.time - baseline.time >= COLD_PLATEAU_SECONDS
+                        && latest.peak - baseline.peak <= baseline.peak / 20
+                })
     }
 
     fn cores(&self, budget: u32) -> u32 {
@@ -521,11 +545,34 @@ impl Scheduler {
     /// The admitted command's group is using `bytes` at engine time `now`, the sample's own
     /// time (the scheduler's clock has not moved to it yet when the broker measures).
     pub fn observe(&mut self, id: Id, bytes: u64, now: f64) {
+        if bytes == 0 {
+            return;
+        }
         if let Some(job) = self.running.iter_mut().find(|r| r.id == id) {
-            if bytes > 0 {
-                job.footprint = Some((now, bytes));
+            while job
+                .footprints
+                .get(1)
+                .is_some_and(|sample| now - sample.time >= COLD_PLATEAU_SECONDS)
+            {
+                job.footprints.pop_front();
             }
             job.peak = job.peak.max(bytes);
+            job.footprints.push_back(Footprint {
+                time: now,
+                bytes,
+                peak: job.peak,
+            });
+        }
+    }
+
+    /// The group was stopped when measured (frozen by the brake, or suspended): a stopped
+    /// group's flat footprint says nothing about whether it has finished growing, so its
+    /// plateau window starts again from this reading. The reading itself stays: it is this
+    /// tick's attributed memory.
+    pub(crate) fn restart_plateau(&mut self, id: Id) {
+        if let Some(job) = self.running.iter_mut().find(|r| r.id == id) {
+            let keep = job.footprints.len().saturating_sub(1);
+            job.footprints.drain(..keep);
         }
     }
 
@@ -542,18 +589,14 @@ impl Scheduler {
             .map_or_else(|| (4 * GIB).max(self.cap.unwrap_or(0) / 8), with_margin);
         let mut measuring = false;
         if !demand.has_profile() {
-            let mut observed_minute = false;
+            let mut plateaued = false;
             let mut peak = 0;
             for sibling in self.running.iter().filter(|r| r.signature == job.signature) {
                 measuring = true;
                 peak = peak.max(sibling.peak);
-                // Use the last footprint reading's engine time, including for socket-side
-                // admissions between samples.
-                observed_minute |= sibling
-                    .footprint
-                    .is_some_and(|(time, _)| time - sibling.admitted >= COLD_MEASUREMENT_SECONDS);
+                plateaued |= sibling.has_plateaued();
             }
-            if observed_minute {
+            if plateaued {
                 measuring = false;
                 need = need.max(with_margin(peak));
             }
@@ -565,7 +608,7 @@ impl Scheduler {
         }
     }
 
-    /// Siblings waiting for a profile or a minute of measurement yield their turn.
+    /// Siblings waiting for a profile or a peak plateau yield their turn.
     fn next_for_admission(&self, learned: &dyn Fn(&str) -> Demand) -> Option<(usize, Estimate)> {
         self.waiting.iter().enumerate().find_map(|(at, job)| {
             let estimate = self.estimate(job, learned);
@@ -755,9 +798,9 @@ impl Scheduler {
         let attributable = self
             .running
             .iter()
-            .filter_map(|job| job.footprint)
-            .filter(|(time, _)| *time == now)
-            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes));
+            .filter_map(|job| job.footprints.back())
+            .filter(|sample| sample.time == now)
+            .fold(0u64, |sum, sample| sum.saturating_add(sample.bytes));
         self.measured_background = measured_memory.saturating_sub(attributable);
         self.history.push(now, measured_memory);
         self.background.push(now, self.measured_background);
@@ -878,7 +921,8 @@ impl Scheduler {
                 pgid: None,
                 leader_start_us: 0,
                 peak: 0,
-                footprint: None,
+                // Room for the baseline and a full window of one-second live samples.
+                footprints: VecDeque::with_capacity(32),
                 cpu: Cpu::default(),
             });
             out.push(w.id);
@@ -1169,39 +1213,110 @@ mod tests {
     }
 
     #[test]
-    fn a_cold_sibling_starts_after_a_minute_of_samples_at_the_observed_peak_reservation() {
+    fn a_cold_sibling_waits_through_two_minutes_of_peak_growth() {
         let mut q = Scheduler::with_cpu_budget(24_000);
         let learned = |_: &str| Demand::default();
-        let first = ask(&mut q, 1, "watch");
+        let first = ask(&mut q, 1, "build");
         assert_eq!(step(&mut q, &calm(0.0), &learned), Some(first));
+        let sibling = ask(&mut q, 2, "build");
+
+        for t in 1..=120_u32 {
+            let time = f64::from(t);
+            q.observe(first, u64::from(t) * (GIB / 4), time);
+            assert_eq!(step(&mut q, &at(time, 60), &learned), None, "at {t} s");
+        }
+        let mut view = Snapshot::default();
+        q.snapshot(&learned, &mut view);
+        assert_eq!(view.waiting[0].id, sibling);
+        assert_eq!(view.waiting[0].reason, WaitReason::Measuring);
+    }
+
+    #[test]
+    fn a_cold_sibling_starts_after_thirty_seconds_of_stable_peak() {
+        let mut q = Scheduler::with_cpu_budget(24_000);
+        let learned = |_: &str| Demand::default();
+        let sample = |time| Sample {
+            ram: 2 * RAM,
+            ..calm(time)
+        };
+        let first = ask(&mut q, 1, "watch");
+        assert_eq!(step(&mut q, &sample(0.0), &learned), Some(first));
         let sibling = ask(&mut q, 2, "watch");
         let peak = 16 * GIB;
 
-        for t in 0..60 {
+        for t in 1..40 {
             let time = f64::from(t);
-            q.observe(first, if t == 0 { peak } else { 2 * GIB }, time);
-            assert_eq!(step(&mut q, &calm(time), &learned), None, "at {t} s");
-            if t == 30 {
-                let mut view = Snapshot::default();
-                q.snapshot(&learned, &mut view);
-                assert_eq!(view.waiting[0].reason, WaitReason::Measuring);
-            }
+            q.observe(first, if t == 10 { peak } else { 2 * GIB }, time);
+            assert_eq!(step(&mut q, &sample(time), &learned), None, "at {t} s");
         }
 
         let mut out = Vec::new();
-        q.admit_now(60.0, 60.0, &learned, &mut out);
+        q.admit_now(40.0, 40.0, &learned, &mut out);
         assert!(
             out.is_empty(),
             "socket time alone does not complete measurement"
         );
 
-        q.observe(first, 2 * GIB, 60.0);
+        q.observe(first, 2 * GIB, 40.0);
         assert_eq!(
-            step(&mut q, &calm(60.0), &learned),
+            step(&mut q, &sample(40.0), &learned),
             Some(sibling),
-            "the first run has been sampled for one minute"
+            "the first run's peak has been stable for 30 s"
         );
         assert_eq!(q.running()[1].need, 20 * GIB, "125% of the 16 GiB peak");
+
+        let third = ask(&mut q, 3, "watch");
+        q.observe(first, peak + peak / 20, 41.0);
+        q.observe(sibling, 18 * GIB, 41.0);
+        assert_eq!(step(&mut q, &sample(41.0), &learned), Some(third));
+        assert_eq!(q.running()[1].reservation(), 45 * GIB / 2);
+        assert_eq!(
+            q.running()[2].need,
+            45 * GIB / 2,
+            "125% of the largest peak, even when it belongs to a newer sibling"
+        );
+    }
+
+    /// A frozen instance's flat footprint is not a plateau: after the brake resumes it, the
+    /// sibling waits for 30 s of running readings.
+    #[test]
+    fn a_frozen_instance_does_not_release_its_cold_sibling() {
+        let mut q = Scheduler::with_cpu_budget(24_000);
+        let learned = |_: &str| Demand::default();
+        let sample = |time| Sample {
+            ram: 2 * RAM,
+            ..calm(time)
+        };
+        let first = ask(&mut q, 1, "huge");
+        assert_eq!(step(&mut q, &sample(0.0), &learned), Some(first));
+        let sibling = ask(&mut q, 2, "huge");
+
+        for t in 1..=10_u32 {
+            q.observe(first, u64::from(t) * 2 * GIB, f64::from(t));
+            assert_eq!(step(&mut q, &sample(f64::from(t)), &learned), None);
+        }
+        // Frozen at 20 GiB for 40 s: every reading is flat, and stopped.
+        for t in 11..=50_u32 {
+            q.observe(first, 20 * GIB, f64::from(t));
+            q.restart_plateau(first);
+            assert_eq!(
+                step(&mut q, &sample(f64::from(t)), &learned),
+                None,
+                "frozen at {t} s"
+            );
+        }
+        // Resumed and flat: 30 s of running readings are needed.
+        for t in 51..80_u32 {
+            q.observe(first, 20 * GIB, f64::from(t));
+            assert_eq!(
+                step(&mut q, &sample(f64::from(t)), &learned),
+                None,
+                "resumed for {} s",
+                t - 50
+            );
+        }
+        q.observe(first, 20 * GIB, 80.0);
+        assert_eq!(step(&mut q, &sample(80.0), &learned), Some(sibling));
     }
 
     #[test]
