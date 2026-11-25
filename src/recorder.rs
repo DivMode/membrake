@@ -1307,7 +1307,16 @@ mod tests {
             text
         };
         let rows = written.lines().filter(|l| !l.starts_with("time\t")).count();
-        let said = fs::read_to_string(&events).unwrap();
+        // The samples thread reports its drops once its queue runs empty, after the flush
+        // answered; the logger thread writes that report a moment later.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let said = loop {
+            let said = fs::read_to_string(&events).unwrap();
+            if said.contains("sample(s) were dropped") || Instant::now() >= deadline {
+                break said;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
         let reported: usize = said
             .lines()
             .filter(|l| l.contains("sample(s) were dropped"))
