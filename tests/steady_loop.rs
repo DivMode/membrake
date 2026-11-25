@@ -104,7 +104,8 @@ impl Drop for Sleeper {
 
 /// With a group frozen and recorded, each sample looks at it (to see whether someone
 /// continued it, or it exited), and that must not allocate either. The group is a real `sleep`
-/// that the runner itself freezes; the readings keep memory tight, so it stays frozen.
+/// that the runner itself freezes. Intermittent pressure keeps it frozen without
+/// triggering a second brake action or completing the recovery hysteresis.
 #[test]
 fn steady_loop_with_a_frozen_group_does_not_allocate() {
     let marker = format!("3600.{:07}", std::process::id());
@@ -134,6 +135,7 @@ fn steady_loop_with_a_frozen_group_does_not_allocate() {
         },
         rules,
         term_seconds: 1.0,
+        cpu_headroom_percent: membrake::queue::DEFAULT_CPU_HEADROOM_PERCENT,
         on_event: None,
     };
     let mut runner = Runner::new(
@@ -142,33 +144,42 @@ fn steady_loop_with_a_frozen_group_does_not_allocate() {
         Recorder::open(&dir.join("log")).unwrap(),
     );
     let mut time = 1000.0;
-    let mut tick = |level: i32, occupancy: f64| {
+    let mut tick = |occupancy: f64, low_swap: bool, pressure: Pressure| {
         let mut s = signals::read().expect("live signals");
         time += 1.0;
         s.time = time;
         s.segments = occupancy;
         s.pages = 0.1;
-        s.level = level;
-        s.pressure = Pressure::Normal;
-        s.headroom = s.ram * 4;
+        s.level = 35;
+        s.pressure = pressure;
+        s.headroom = if low_swap { s.ram - 1 } else { s.ram * 4 };
         runner.tick(&s);
     };
 
     // Two tight samples with the compressor at 65% freeze the group...
-    tick(35, 0.65);
-    tick(35, 0.65);
+    tick(0.65, false, Pressure::Normal);
+    tick(0.65, false, Pressure::Normal);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !jobs::bsd_info(pid).is_some_and(|p| p.stopped) {
         assert!(Instant::now() < deadline, "the group was never stopped");
         std::thread::sleep(Duration::from_millis(10));
     }
-    // ...and tight, quiet readings keep it frozen: nothing to decide, one group to look at.
-    for _ in 0..20 {
-        tick(35, 0.1);
+    // Drain the initial strikes, then rotate between pressure signals so no arm
+    // fires and no further reading counts toward recovery.
+    for _ in 0..4 {
+        tick(0.1, false, Pressure::Normal);
+    }
+    let mut intermittent = |i| match i % 3 {
+        0 => tick(0.65, false, Pressure::Normal),
+        1 => tick(0.1, true, Pressure::Normal),
+        _ => tick(0.1, false, Pressure::Critical),
+    };
+    for i in 0..20 {
+        intermittent(i);
     }
     let before = ALLOCATIONS.with(Cell::get);
-    for _ in 0..200 {
-        tick(35, 0.1);
+    for i in 20..220 {
+        intermittent(i);
     }
     let allocated = ALLOCATIONS.with(Cell::get) - before;
     assert!(
@@ -195,6 +206,7 @@ fn steady_loop_with_the_queue_and_no_clients_does_not_allocate() {
         policy: Policy::default(),
         rules: Rules::new(&[], &[], vec![], vec![], unsafe { libc::getpgrp() }).unwrap(),
         term_seconds: 1.0,
+        cpu_headroom_percent: membrake::queue::DEFAULT_CPU_HEADROOM_PERCENT,
         on_event: None,
     };
     let mut runner = Runner::new(
@@ -304,6 +316,7 @@ fn steady_loop_with_one_client_waiting_and_one_running_does_not_allocate() {
         policy: Policy::default(),
         rules: Rules::new(&[], &[], vec![], vec![], unsafe { libc::getpgrp() }).unwrap(),
         term_seconds: 1.0,
+        cpu_headroom_percent: membrake::queue::DEFAULT_CPU_HEADROOM_PERCENT,
         on_event: None,
     };
     let mut runner = Runner::new(

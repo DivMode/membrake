@@ -2,9 +2,9 @@
 //! ends share. One message per line, fields separated by a tab, version-tagged:
 //!
 //! ```text
-//! client -> daemon   REQUEST  v1  <label>  <signature>
+//! client -> daemon   REQUEST  v1  <label>  <signature>  [first-attempt unix micros]
 //!                    STARTED  <pgid>
-//!                    DONE     <exit code>
+//!                    DONE     <exit code>  [elapsed ms, cpu ns, peak bytes]
 //! daemon -> client   QUEUED   <position>  <need in bytes>  <reason>  (whenever any changes, and
 //!                                                             at least every `KEEP_ALIVE`)
 //!                    GO
@@ -14,17 +14,17 @@
 //! Reasons are `tight`, `frozen`, `behind`, or `cap` followed by used, reserved and cap bytes.
 //! A three-field `QUEUED` from an older daemon has an unspecified reason.
 //!
-//! A client that is waiting is told where it stands at least every `KEEP_ALIVE`, whether or not
-//! that changed, and takes a daemon that says nothing for `SILENCE` to have stopped answering.
-//! That holds while the daemon's sampling loop is scheduling the queue: once it has not for
-//! `SILENCE` (its signals are unreadable, or it is stuck), a waiting client, and any that
-//! asks, is sent `ERROR the queue is not scheduling` instead, and runs its command.
+//! Waiting clients receive regular QUEUED updates. The daemon publishes sampling
+//! liveness separately, so a full socket backlog does not impose a request deadline.
 //!
 //! Nothing a client sends is trusted: the daemon sanitizes every string and bounds every line.
-//! `STARTED` is accepted once, after `GO`, and only for the group of a command that this client
-//! started after it was told to go; anything else is an `ERROR` and the end of the connection.
+//! `STARTED` is sent once, after `GO`. Only a verified child group is sampled. A child that
+//! has already been reaped can still be represented by the usage in `DONE`.
 
 use crate::queue::WaitReason;
+
+pub(crate) const NOT_SCHEDULING: &str = "the queue is not scheduling";
+pub(crate) const TOO_MANY_CLIENTS: &str = "too many clients"; // Older brokers.
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::Duration;
@@ -36,9 +36,9 @@ pub const VERSION: &str = "v1";
 /// The longest line either end accepts.
 pub const MAX_LINE: usize = 1024;
 pub const MAX_LABEL: usize = 80;
-pub const MAX_SIGNATURE: usize = 80;
+pub const MAX_SIGNATURE: usize = 2 * MAX_LABEL + 4;
 /// The longest a client that has been answered waits for the next line, of any kind, before it
-/// takes the daemon to have stopped answering and runs its command.
+/// takes the daemon to have stopped answering and retries.
 pub const SILENCE: Duration = Duration::from_secs(30);
 /// How often at least the daemon tells a waiting client where it stands: a sixth of `SILENCE`
 /// (5 s), so five lines in a row have to be lost for a client to give up on a daemon that is
@@ -79,11 +79,8 @@ pub fn sanitize(text: &str, max: usize) -> String {
     clean.trim().to_string()
 }
 
-/// What kind of command this is, for the learned sizes: the program's name plus up to two of
-/// the arguments after it that are not flags, each with its directories stripped. `bun run
-/// test` and `bun run build` are different jobs; `/opt/bin/tsc -p apps/web --noEmit` is `tsc
-/// web`.
-pub fn signature(argv: &[OsString]) -> String {
+/// A command's program and up to two plain arguments, with directories stripped.
+pub fn command_signature(argv: &[OsString]) -> String {
     let name = |arg: &OsStr| {
         let name = Path::new(arg).file_name().unwrap_or(arg);
         name.to_string_lossy().into_owned()
@@ -96,7 +93,36 @@ pub fn signature(argv: &[OsString]) -> String {
             .take(2)
             .map(|a| name(a)),
     );
-    sanitize(&words.join(" "), MAX_SIGNATURE)
+    sanitize(&words.join(" "), MAX_LABEL)
+}
+
+/// The label is an additional part of the key. A length prefix makes the boundary
+/// unambiguous even when a display label contains punctuation.
+pub fn signature(argv: &[OsString], label: Option<&str>) -> String {
+    let command = command_signature(argv);
+    let label = label.map_or_else(String::new, |label| sanitize(label, MAX_LABEL));
+    if label.is_empty() {
+        command
+    } else {
+        format!("#{}:{label}{command}", label.len())
+    }
+}
+
+/// The command-signature portion of a labeled key, for reading pre-upgrade profiles.
+pub(crate) fn legacy_signature(signature: &str) -> Option<&str> {
+    let (length, parts) = signature.strip_prefix('#')?.split_once(':')?;
+    let length: usize = length.parse().ok()?;
+    if !(1..=MAX_LABEL).contains(&length) {
+        return None;
+    }
+    parts.get(length..).filter(|command| !command.is_empty())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub elapsed_ms: u64,
+    pub cpu_ns: u64,
+    pub peak_bytes: u64,
 }
 
 /// Removes and returns the first complete line of `buf`, without its newline.
@@ -115,21 +141,36 @@ pub enum Message {
     Request {
         label: String,
         signature: String,
+        first_attempt_us: Option<u64>,
     },
     /// The command is running as this process group.
     Started(i32),
     /// The command has ended with this exit code.
-    Done(i32),
+    Done(i32, Option<Completion>),
 }
 
 impl Message {
     pub fn line(&self) -> String {
         match self {
-            Message::Request { label, signature } => {
-                format!("REQUEST\t{VERSION}\t{label}\t{signature}\n")
+            Message::Request {
+                label,
+                signature,
+                first_attempt_us,
+            } => {
+                let mut line = format!("REQUEST\t{VERSION}\t{label}\t{signature}");
+                if let Some(at) = first_attempt_us {
+                    use std::fmt::Write as _;
+                    let _ = write!(line, "\t{at}");
+                }
+                line.push('\n');
+                line
             }
             Message::Started(pgid) => format!("STARTED\t{pgid}\n"),
-            Message::Done(code) => format!("DONE\t{code}\n"),
+            Message::Done(code, None) => format!("DONE\t{code}\n"),
+            Message::Done(code, Some(stats)) => format!(
+                "DONE\t{code}\t{}\t{}\t{}\n",
+                stats.elapsed_ms, stats.cpu_ns, stats.peak_bytes
+            ),
         }
     }
 
@@ -153,10 +194,28 @@ impl Message {
                 Ok(Message::Request {
                     label: sanitize(label, MAX_LABEL),
                     signature: sanitize(signature, MAX_SIGNATURE),
+                    first_attempt_us: fields.next().and_then(|at| at.parse().ok()),
                 })
             }
             Some("STARTED") => Ok(Message::Started(number(fields.next())?)),
-            Some("DONE") => Ok(Message::Done(number(fields.next())?)),
+            Some("DONE") => {
+                let code = number(fields.next())?;
+                let stats = if let Some(elapsed) = fields.next() {
+                    let value = |field: Option<&str>| {
+                        field
+                            .and_then(|field| field.parse::<u64>().ok())
+                            .ok_or_else(|| "malformed completion".to_string())
+                    };
+                    Some(Completion {
+                        elapsed_ms: value(Some(elapsed))?.max(1),
+                        cpu_ns: value(fields.next())?,
+                        peak_bytes: value(fields.next())?,
+                    })
+                } else {
+                    None
+                };
+                Ok(Message::Done(code, stats))
+            }
             _ => Err("unknown message".into()),
         }
     }
@@ -198,6 +257,13 @@ impl Reply {
                         use std::fmt::Write as _;
                         let _ = write!(line, "\tcap\t{used}\t{reserved}\t{cap}");
                     }
+                    WaitReason::Cpu { committed, budget } => {
+                        // An older client reads "behind" and stays queued. An unknown
+                        // reason would make it treat the daemon as unavailable and start.
+                        use std::fmt::Write as _;
+                        // Keep the former requested-CPU field for clients on the old format.
+                        let _ = write!(line, "\tbehind\tcpu\t{committed}\t0\t{budget}");
+                    }
                 }
                 line.push('\n');
                 line
@@ -217,7 +283,17 @@ impl Reply {
                     None => WaitReason::Unspecified,
                     Some("tight") => WaitReason::Tight,
                     Some("frozen") => WaitReason::Frozen,
-                    Some("behind") => WaitReason::Behind,
+                    Some("behind") => match fields.next() {
+                        Some("cpu") => {
+                            let committed = fields.next()?.parse().ok()?;
+                            fields.next()?;
+                            WaitReason::Cpu {
+                                committed,
+                                budget: fields.next()?.parse().ok()?,
+                            }
+                        }
+                        _ => WaitReason::Behind,
+                    },
                     Some("cap") => WaitReason::Cap {
                         used: fields.next()?.parse().ok()?,
                         reserved: fields.next()?.parse().ok()?,
@@ -245,7 +321,7 @@ mod tests {
     /// what tells one kind of heavy job from another, and nothing that varies per run.
     #[test]
     fn a_signature_is_the_program_and_up_to_two_plain_arguments() {
-        let sig = |words: &[&str]| signature(&argv(words));
+        let sig = |words: &[&str]| signature(&argv(words), None);
         assert_eq!(sig(&["bun", "run", "test"]), "bun run test");
         assert_eq!(sig(&["bun", "run", "test", "--watch", "x"]), "bun run test");
         assert_eq!(
@@ -261,6 +337,21 @@ mod tests {
         assert_eq!(sig(&["ls", "."]), "ls .");
     }
 
+    #[test]
+    fn the_learning_key_includes_both_the_label_and_command() {
+        let first = argv(&["vitest", "fixture-1"]);
+        let second = argv(&["vitest", "fixture-2"]);
+        assert_ne!(
+            signature(&first, Some("gate tests")),
+            signature(&second, Some("gate tests"))
+        );
+        assert_ne!(
+            signature(&first, Some("gate tests")),
+            signature(&first, Some("browser tests"))
+        );
+        assert_ne!(signature(&first, None), signature(&second, None));
+    }
+
     /// Every string a client sends is made printable and bounded, so it cannot forge a
     /// log line, break the TSV status file or fill the terminal.
     #[test]
@@ -270,7 +361,10 @@ mod tests {
         assert_eq!(sanitize("  padded  ", 80), "padded");
 
         let line = format!("REQUEST\tv1\t{}\tsig\tstray", "L".repeat(500));
-        let Ok(Message::Request { label, signature }) = Message::parse(&line) else {
+        let Ok(Message::Request {
+            label, signature, ..
+        }) = Message::parse(&line)
+        else {
             panic!("{line}");
         };
         assert_eq!((label.len(), signature.as_str()), (MAX_LABEL, "sig"));
@@ -282,9 +376,18 @@ mod tests {
             Message::Request {
                 label: "tests".into(),
                 signature: "bun run test".into(),
+                first_attempt_us: Some(123),
             },
             Message::Started(4242),
-            Message::Done(-1),
+            Message::Done(-1, None),
+            Message::Done(
+                0,
+                Some(Completion {
+                    elapsed_ms: 5,
+                    cpu_ns: 2_000_000,
+                    peak_bytes: 4096,
+                }),
+            ),
         ] {
             assert_eq!(Message::parse(m.line().trim_end()), Ok(m));
         }
@@ -324,6 +427,10 @@ mod tests {
                 used: 40 * (1 << 30),
                 reserved: 8 * (1 << 30),
                 cap: 48 * (1 << 30),
+            },
+            WaitReason::Cpu {
+                committed: 18000,
+                budget: 24000,
             },
         ] {
             let reply = Reply::Queued {

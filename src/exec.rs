@@ -1,22 +1,15 @@
 //! `membrake exec -- COMMAND ...`: asks the daemon for a turn, waits for the go-ahead, runs
 //! the command, and reports how it ended.
 //!
-//! The client never stands between a command and the machine for longer than the daemon says.
-//! If the socket is missing or refuses, or the daemon sends an error, hangs up, does not answer
-//! the request within `FIRST_ANSWER`, or says nothing at all for `wire::SILENCE` after that (it
-//! tells every client that waits where it stands at least every `wire::KEEP_ALIVE`, for as long
-//! as its sampling loop is scheduling the queue), it says so
-//! on one line of stderr and runs the command at once. A command
-//! started by one that was already admitted (`MEMBRAKE_ADMITTED` is set) is run directly, so
-//! the heavy commands a heavy command starts do not queue behind it.
+//! The client retries while the live broker keeps publishing samples. A nested
+//! command started by admitted work (`MEMBRAKE_ADMITTED` is set) runs directly.
 //!
 //! The command runs in a process group of its own (the job the brake freezes and the queue
-//! measures), at the caller's own priority: no nice, no QoS clamp. The brake guards memory, not
-//! the CPU; a clamp put admitted work on the efficiency cores and stretched its timers (a 20 ms
-//! sleep took 65-95 ms, a CPU loop 1.5-2.8x as long), and wall-clock-paced tests failed under it
-//! on an idle Mac. The exit code is the command's; a command
-//! that dies of a signal gives 128 plus the signal, and 127 and 126 are a command that is not
-//! found and one that cannot be run, as in a shell.
+//! measures), at the caller's own priority: no nice, no QoS clamp. A clamp put admitted work
+//! on the efficiency cores and stretched its timers. A 20 ms sleep took 65–95 ms, a CPU
+//! loop took 1.5–2.8 times as long, and wall-clock-paced tests failed on an idle Mac.
+//! The exit code is the command's: 128 plus the signal if it dies of one, 127 for a
+//! command that is missing, and 126 for a command that cannot run.
 //!
 //! When the command has exited, whatever it left running in that group is stopped if the job
 //! was interrupted (a signal was passed on to it, or the command died of one) or `--reap` was
@@ -34,7 +27,7 @@
 
 use crate::jobs;
 use crate::queue::WaitReason;
-use crate::wire::{self, Message, Reply};
+use crate::wire::{self, Completion, Message, Reply};
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -45,8 +38,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-/// Set in the environment of every command the queue let through (or that ran because the
-/// queue was unavailable). A `membrake exec` inside such a command runs its command directly.
+/// Set in admitted commands so nested calls remain part of the same reservation.
 pub const ADMITTED: &str = "MEMBRAKE_ADMITTED";
 /// How long the daemon has to answer a request at all. Waiting for a turn takes as long as it
 /// takes, but a daemon that never says even where the request stands is broken. After the
@@ -123,8 +115,8 @@ const UNEXPECTED: &str = "the daemon sent something unexpected";
 
 /// Why the wait ended without a go-ahead.
 enum Stopped {
-    /// The queue cannot be used; the command runs at once.
     Unavailable(String),
+    Refused(String),
     /// This process was signalled while it waited: it never ran anything.
     Signalled(i32),
 }
@@ -135,31 +127,16 @@ const QUIET: Duration = Duration::from_secs(2);
 /// The line printed whenever the position or reason changes, after `QUIET`.
 fn queued_line(position: usize, need: u64, reason: WaitReason) -> String {
     let gib = |bytes| bytes as f64 / (1u64 << 30) as f64;
-    let why = match reason {
-        WaitReason::Unspecified => {
-            return format!(
-                "queued for memory (position {position}, needs {:.1} GB)",
-                gib(need)
-            );
-        }
-        WaitReason::Tight => "memory is tight".to_string(),
-        WaitReason::Frozen => "a job is frozen".to_string(),
-        WaitReason::Behind => "behind another request".to_string(),
-        WaitReason::Cap {
-            used,
-            reserved,
-            cap,
-        } => format!(
-            "memory over the cap ({:.1} GB in use + {:.1} GB reserved of a {:.1} GB cap)",
-            gib(used),
-            gib(reserved),
-            gib(cap)
-        ),
-    };
     match reason {
-        WaitReason::Tight | WaitReason::Frozen => format!("queued (position {position}): {why}"),
+        WaitReason::Unspecified => format!(
+            "queued for memory (position {position}, needs {:.1} GB)",
+            gib(need)
+        ),
+        WaitReason::Tight | WaitReason::Frozen | WaitReason::Cpu { .. } => {
+            format!("queued (position {position}): {reason}")
+        }
         _ => format!(
-            "queued (position {position}): {why}, needs {:.1} GB",
+            "queued (position {position}): {reason}, needs {:.1} GB",
             gib(need)
         ),
     }
@@ -167,7 +144,7 @@ fn queued_line(position: usize, need: u64, reason: WaitReason) -> String {
 
 fn connect_error(socket: &Path, e: &io::Error) -> String {
     match e.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+        io::ErrorKind::NotFound => {
             format!("no daemon is listening on {}", socket.display())
         }
         io::ErrorKind::PermissionDenied => format!("no permission to use {}", socket.display()),
@@ -178,20 +155,31 @@ fn connect_error(socket: &Path, e: &io::Error) -> String {
 /// Asks for a turn and waits for `GO`. Prints a line whenever the position changes. Gives up on
 /// a daemon that says nothing for too long: `FIRST_ANSWER` for the first line, `wire::SILENCE`
 /// after each line.
-fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStream, Stopped> {
+fn wait_for_turn(
+    socket: &Path,
+    request: &Message,
+    liveness: &mut Liveness,
+) -> Result<UnixStream, Stopped> {
+    let sig = PENDING.load(Ordering::SeqCst);
+    if sig != 0 {
+        return Err(Stopped::Signalled(sig));
+    }
     let mut stream =
         UnixStream::connect(socket).map_err(|e| Stopped::Unavailable(connect_error(socket, &e)))?;
-    let request = Message::Request {
-        label: label.to_string(),
-        signature: signature.to_string(),
-    };
-    // The timeout is set before the request goes out: once the daemon has read the request it
-    // may hang up at any moment, and macOS refuses setsockopt on a socket whose peer has closed
-    // (EINVAL), which would hide the hang-up behind "Invalid argument".
-    stream
-        .set_read_timeout(Some(LOOK_UP))
-        .and_then(|()| stream.write_all(request.line().as_bytes()))
-        .map_err(|e| Stopped::Unavailable(e.to_string()))?;
+    // Older brokers can send a refusal while the request is being written.
+    if let Err(e) = stream.set_read_timeout(Some(LOOK_UP))
+        && e.raw_os_error() != Some(libc::EINVAL)
+    {
+        return Err(Stopped::Unavailable(e.to_string()));
+    }
+    if let Err(e) = stream.write_all(request.line().as_bytes())
+        && !matches!(
+            e.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        )
+    {
+        return Err(Stopped::Unavailable(e.to_string()));
+    }
 
     let asked = Instant::now();
     let silence = wire::timing().silence;
@@ -200,8 +188,12 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
     let mut told = false;
     let mut position = None;
     let mut shown = None;
+    let mut shown_text = String::new();
     let mut input = Vec::new();
     loop {
+        if let Some(why) = liveness.failure(socket, false) {
+            return Err(Stopped::Refused(why));
+        }
         let sig = PENDING.load(Ordering::SeqCst);
         if sig != 0 {
             return Err(Stopped::Signalled(sig));
@@ -218,8 +210,13 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
                     told = true;
                     position = Some((now, need, reason));
                 }
-                Some(Reply::Error(why)) => return Err(Stopped::Unavailable(why)),
-                None => return Err(Stopped::Unavailable(UNEXPECTED.into())),
+                Some(Reply::Error(why))
+                    if why == wire::TOO_MANY_CLIENTS || why == wire::NOT_SCHEDULING =>
+                {
+                    return Err(Stopped::Unavailable(why));
+                }
+                Some(Reply::Error(why)) => return Err(Stopped::Refused(why)),
+                None => return Err(Stopped::Refused(UNEXPECTED.into())),
             }
         }
         if let Some((now, need, reason)) = position
@@ -227,7 +224,11 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
             && shown != position
         {
             shown = position;
-            say(&queued_line(now, need, reason));
+            let text = queued_line(now, need, reason);
+            if shown_text != text {
+                say(&text);
+                shown_text = text;
+            }
         }
         if !told && heard.elapsed() > FIRST_ANSWER {
             return Err(Stopped::Unavailable("the daemon did not answer".into()));
@@ -236,7 +237,7 @@ fn wait_for_turn(socket: &Path, label: &str, signature: &str) -> Result<UnixStre
             return Err(Stopped::Unavailable("the daemon stopped answering".into()));
         }
         if input.len() > wire::MAX_LINE {
-            return Err(Stopped::Unavailable(UNEXPECTED.into()));
+            return Err(Stopped::Refused(UNEXPECTED.into()));
         }
         let mut chunk = [0u8; 256];
         match stream.read(&mut chunk) {
@@ -392,7 +393,8 @@ fn spawn(command: &[OsString]) -> Result<i32, NotRun> {
 }
 
 /// Waits until the command has exited, and leaves it unreaped: a zombie keeps its pid, and so
-/// its group's number, until `release` collects it. Says whether a signal ended it.
+/// its group's number, until `release` collects it. Returns the exit code and whether it
+/// died from a signal.
 fn wait_for_exit(pid: i32) -> Result<bool, String> {
     loop {
         // SAFETY: zeroed siginfo is a valid out-parameter.
@@ -418,12 +420,14 @@ fn wait_for_exit(pid: i32) -> Result<bool, String> {
 
 /// Collects the command, and with it the hold on its group's number, and gives its exit code.
 /// The group is unpublished first, so no signal handler sends to the number after this.
-fn release(pid: i32) -> i32 {
+fn release(pid: i32, elapsed: Duration) -> (i32, Option<Completion>) {
     GROUP.store(0, Ordering::SeqCst);
     let mut status = 0;
+    // SAFETY: wait4 populates this out-parameter for the child we started.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     loop {
-        // SAFETY: `status` is a valid out-parameter.
-        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        // SAFETY: both out-parameters are valid for the duration of the call.
+        let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
         if rc == pid {
             break;
         }
@@ -432,16 +436,30 @@ fn release(pid: i32) -> i32 {
                 "cannot wait for the command: {}",
                 io::Error::last_os_error()
             ));
-            return 1;
+            return (1, None);
         }
     }
-    if libc::WIFEXITED(status) {
+    let ns = |t: libc::timeval| {
+        (t.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((t.tv_usec as u64).saturating_mul(1000))
+    };
+    let stats = Completion {
+        elapsed_ms: elapsed
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .clamp(1, u128::from(u64::MAX)) as u64,
+        cpu_ns: ns(usage.ru_utime).saturating_add(ns(usage.ru_stime)),
+        peak_bytes: usage.ru_maxrss.max(0) as u64,
+    };
+    let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
         128 + libc::WTERMSIG(status)
     } else {
         1
-    }
+    };
+    (code, Some(stats))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -638,7 +656,8 @@ fn reap(group: i32, stop: bool) -> Option<libc::sigset_t> {
 }
 
 /// Runs the command to its end and reports it to the daemon, if there is one on the line.
-fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always: bool) -> i32 {
+fn run_command(command: &[OsString], stream: UnixStream, reap_always: bool) -> i32 {
+    let mut daemon = Some(stream);
     let tell = |daemon: &mut Option<UnixStream>, message: Message| {
         if let Some(stream) = daemon.as_mut()
             && stream.write_all(message.line().as_bytes()).is_err()
@@ -646,11 +665,12 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
             *daemon = None;
         }
     };
+    let began = Instant::now();
     let pid = match spawn(command) {
         Ok(pid) => pid,
         Err(NotRun { code, why }) => {
             say(&format!("{}: {why}", command[0].to_string_lossy()));
-            tell(&mut daemon, Message::Done(code));
+            tell(&mut daemon, Message::Done(code, None));
             return code;
         }
     };
@@ -663,24 +683,27 @@ fn run_command(command: &[OsString], mut daemon: Option<UnixStream>, reap_always
         FORWARDED.store(true, Ordering::SeqCst);
     }
     tell(&mut daemon, Message::Started(pid));
-    let held: Option<libc::sigset_t> = match wait_for_exit(pid) {
-        Ok(signalled) => reap(
-            pid,
-            reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
-        ),
-        // Not known to have exited, so its group's number is not known to be held: the group
-        // is unpublished before anything else, and nothing is sent to it.
+    let (elapsed, held) = match wait_for_exit(pid) {
+        Ok(signalled) => {
+            let elapsed = began.elapsed();
+            let held = reap(
+                pid,
+                reap_always || signalled || FORWARDED.load(Ordering::SeqCst),
+            );
+            (elapsed, held)
+        }
+        // The group's number is no longer known to be held.
         Err(why) => {
             GROUP.store(0, Ordering::SeqCst);
             say(&format!("cannot wait for the command: {why}"));
-            None
+            (began.elapsed(), None)
         }
     };
-    let code = release(pid);
+    let (code, stats) = release(pid, elapsed);
     if let Some(before) = held {
         restore_signals(&before);
     }
-    tell(&mut daemon, Message::Done(code));
+    tell(&mut daemon, Message::Done(code, stats));
     code
 }
 
@@ -704,15 +727,86 @@ pub fn run(args: Args) -> i32 {
         return not_run.code;
     }
     install_signal_handlers();
-    let signature = wire::signature(&command);
-    let label = wire::sanitize(label.as_deref().unwrap_or(&signature), wire::MAX_LABEL);
-    match wait_for_turn(&socket, &label, &signature) {
-        Ok(stream) => run_command(&command, Some(stream), reap_always),
-        Err(Stopped::Unavailable(why)) => {
-            say(&format!("queue unavailable ({why}); running now"));
-            run_command(&command, None, reap_always)
+    let request = Message::Request {
+        label: wire::sanitize(
+            label
+                .as_deref()
+                .unwrap_or(&wire::command_signature(&command)),
+            wire::MAX_LABEL,
+        ),
+        signature: wire::signature(&command, label.as_deref()),
+        first_attempt_us: Some((crate::signals::wall() * 1e6) as u64),
+    };
+    let mut liveness = Liveness::new();
+    let mut reported = String::new();
+    let mut backoff = Duration::from_millis(50);
+    loop {
+        match wait_for_turn(&socket, &request, &mut liveness) {
+            Ok(stream) => return run_command(&command, stream, reap_always),
+            Err(Stopped::Refused(why)) => {
+                say(&why);
+                return 1;
+            }
+            Err(Stopped::Unavailable(why)) => {
+                if let Some(failure) = liveness.failure(&socket, true) {
+                    say(&format!("queue unavailable ({why}); {failure}"));
+                    return 1;
+                }
+                if reported != why {
+                    reported = why;
+                    say(&format!("queue waiting ({reported}); retrying"));
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+            }
+            Err(Stopped::Signalled(sig)) => return 128 + sig,
         }
-        Err(Stopped::Signalled(sig)) => 128 + sig,
+    }
+}
+
+struct Liveness {
+    latest: f64,
+    next_check: f64,
+    limit: f64,
+}
+
+impl Liveness {
+    fn new() -> Self {
+        let now = crate::signals::uptime();
+        // Tests shorten the heartbeat limit with the existing liveness fixture knob.
+        let limit = std::env::var("MEMBRAKE_TEST_RETRY_MS")
+            .ok()
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map_or(60.0, |ms| Duration::from_millis(ms).as_secs_f64());
+        Self {
+            latest: now,
+            next_check: now,
+            limit,
+        }
+    }
+
+    fn failure(&mut self, socket: &Path, force: bool) -> Option<String> {
+        let now = crate::signals::uptime();
+        if !force && now < self.next_check {
+            return None;
+        }
+        self.next_check = now + self.limit.min(1.0) / 2.0;
+        if !crate::broker::daemon_alive(socket) {
+            return Some(format!(
+                "no live daemon owns {}; command did not start",
+                socket.display()
+            ));
+        }
+        self.latest = crate::broker::heartbeat(socket)
+            .filter(|&stamp| stamp <= now)
+            .unwrap_or(self.latest);
+        (now - self.latest > self.limit).then(|| {
+            format!(
+                "daemon heartbeat is stale (over {} s); command did not start",
+                self.limit
+            )
+        })
     }
 }
 

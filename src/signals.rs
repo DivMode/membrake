@@ -33,11 +33,11 @@ impl Pressure {
     }
 }
 
-/// One raw reading. The derived values (fill rate, tightness) belong to the engine.
+/// One raw reading. Pressure decisions belong to the engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Signals {
     /// Engine time: seconds of awake uptime (`CLOCK_UPTIME_RAW`). It never steps and does not
-    /// advance while the Mac sleeps, so fill rates, deadlines and the maximum freeze time
+    /// advance while the Mac sleeps, so deadlines and the maximum freeze time
     /// count only time the machine was running.
     pub time: f64,
     /// Seconds since the Unix epoch, for log lines and the recorder only.

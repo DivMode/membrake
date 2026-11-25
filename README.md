@@ -87,44 +87,49 @@ job. The rest of this section is the brake.
 ```mermaid
 stateDiagram-v2
     direction LR
-    Running --> Frozen: memory tight and compressor ≥ 60%<br/>(newest job first, one per 10 s)
-    Running --> Frozen: heading for the cliff: ≥ 85%,<br/>full in < 60 s, swap nearly gone<br/>(every job at once)
-    Frozen --> Running: memory recovered<br/>(one job at a time, oldest first)
-    Frozen --> Killed: still heading for the cliff with<br/>nothing left to freeze, or frozen<br/>15 min while still tight
-    Running --> Killed: at the cliff: compressor ≥ 92%<br/>or swap headroom < 2 GB
+    Running --> Frozen: measured pressure persists
+    Frozen --> Running: five calm readings without sustained freeze pressure
+    Frozen --> Killed: measured kill pressure persists through the settle period
+    Running --> Killed: the measured cliff
 ```
 
-1. **Brake.** When memory is genuinely tight and the compressor is filling, it
-   freezes (`SIGSTOP`) the **newest** eligible job, then another every 10 s
-   while memory keeps climbing. A frozen job stops growing; its memory is
-   compressed or swapped once instead of thrashing, and nothing is lost.
-2. **Brake hard.** If the Mac is heading for the cliff (compressor ≥ 85%, full
-   in under a minute, or swap almost out of room), it freezes **every** running
-   eligible job at once, even in the middle of the 10 s pause that follows an
-   earlier freeze. Freezing is instant and loses no work, so it always comes
-   before killing.
-3. **Release.** When memory recovers, it resumes frozen jobs one at a time,
-   oldest first, so the newest (the likeliest runaway) comes back last and they
-   don't all regrow at once.
-4. **Stop.** Only when the Mac is still heading for the cliff with nothing left
-   to freeze, or is already at it, it kills the **biggest** eligible job, frozen
-   jobs first. A job that has been frozen for 15 minutes while memory is still
-   tight is killed too, whatever else is going on.
-   - Heading for the cliff: `SIGSTOP`, then `SIGTERM` and `SIGCONT` so the job
-     can shut down, up to 5 s of grace (`--term-seconds`), then `SIGKILL`.
-   - At the cliff (compressor ≥ 92%, or swap headroom under 2 GB, with memory
-     tight) the Mac has seconds left, so there is no grace by design: `SIGSTOP`,
-     then `SIGKILL` at once, with no `SIGTERM`.
+1. **Freeze.** With tight memory, two readings at 60% compressor occupancy or
+   swap headroom below RAM can freeze an eligible runaway. At this tier the
+   brake ranks only groups it can still freeze. If there is no eligible runaway
+   and the brake holds none, it logs once. At 85%
+   occupancy, below 4 GB of swap headroom, or with sustained critical kernel pressure, the brake
+   can freeze eligible groups in the highest-priority class during the settle
+   period. At the kill tiers, frozen groups still count when choosing which
+   class to act on.
+2. **Resume.** Five calm readings resume the first group. An isolated pressure
+   reading pauses the count. Sustained pressure that fully trips a freeze arm
+   resets it. Subsequent groups resume oldest first, spaced by the settle period.
+   The queue's low-memory admission gate still applies.
+3. **Kill.** At sustained measured kill pressure the brake can send
+   `SIGTERM` with up to 5 s of grace (`--term-seconds`) before `SIGKILL`.
+   With tight memory and occupancy at 92% or swap headroom below 2 GB,
+   it sends `SIGKILL` immediately. An overdue frozen job can bypass the
+   settle period after 15 minutes of freezing once a freeze arm fully trips.
+   The same victim ranking applies. After the `SIGTERM` grace period, the brake
+   checks the kill thresholds that fired, or the freeze tier for an overdue
+   kill. If the triggering pressure has cleared, the brake leaves the group
+   running and logs the abandoned kill.
+
+The first victim class includes unqueued heavy groups and jobs that exceed
+a learned reservation. The brake ranks by excess bytes, using an unqueued
+group's whole footprint. Cold jobs above their default reservation rank next.
+Jobs within their starting reservation are eligible only at the kill tiers
+and rank last, newest first. The samples log records the starting reservations
+so replay uses the same ranking.
 
 ### What it watches
 
-| Signal | Source | Why this one |
+| Signal | Source | Use |
 |---|---|---|
-| Compressor occupancy | `vm.compressor.segment.*`, `vm.compressor.pages_compressed*` | The real cliff: the kernel declares memory exhausted at 98% |
-| Time to full | Occupancy over the last ~10 s | Catches fast fills while occupancy is still moderate |
-| Swap headroom | `statfs` on the swap volume, `vm.swapusage` | The second cliff: swap can't grow on a full disk |
-| Free memory | `kern.memorystatus_level` | Gates the compressor signals: segments are freed lazily, so occupancy alone lies after a crunch |
-| Pressure level | `kern.memorystatus_vm_pressure_level` | Backstop only |
+| Compressor occupancy | `vm.compressor.segment.*`, `vm.compressor.pages_compressed*` | Freeze and kill thresholds |
+| Swap headroom | `statfs` on the swap volume, `vm.swapusage` | Freeze and kill thresholds |
+| Free memory | `kern.memorystatus_level` | Gates compressor and swap thresholds |
+| Pressure level | `kern.memorystatus_vm_pressure_level` | Sustained critical pressure can trigger a kill |
 
 ### What it never touches
 
@@ -139,9 +144,10 @@ stateDiagram-v2
   shell-led group it is part of.
 - Anything it cannot inspect in full. A group with a process whose owner, path
   or arguments cannot be read is left alone.
-- Users you protect with `--protect-user` (for example your CI runner account):
-  never frozen, killed only if nothing else is left. This only ranks jobs that
-  are eligible already; it does not make a system account's jobs eligible.
+- Users you protect with `--protect-user` (for example your CI runner account)
+  are exempt from freezes and kills. That exemption takes priority even when
+  a protected job is the runaway. At the cliff, the brake may act on a healthy
+  unprotected job while a protected runaway remains active.
 
 Eligibility is checked again on the group as it is, not only when it was
 scanned: after the record of a stop is written and just before the `SIGSTOP`,
@@ -216,27 +222,14 @@ or killed, and is continued if it was frozen.
   with no job, with a frozen, recorded one, and with the queue serving one
   running command and one waiting client. Acting does allocate (scanning the
   process table, signalling, logging an event, writing a changed status file).
-  The sampling thread never waits for the queue's socket thread: it only tries
-  the lock they share, and leaves the queue's share of a sample for the next one
-  if the socket thread has it. A job frozen past the limit while memory is still
-  tight is killed on the first sample it is overdue, whatever the settle period,
-  however often new jobs are being frozen, and even when an emergency arm fires on
-  that sample: the emergency's kill is then the overdue job, ahead of any other,
-  with no grace like any emergency kill. The daemon lifts itself out of jetsam
-  band 0 so macOS can't kill the guard first.
-- The queue never blocks work and is never in the way of the brake. If the daemon
-  is missing, refuses, sends an error, hangs up, does not answer the request within
-  10 s, or says nothing at all for 30 s after that, `membrake exec` runs the command
-  at once. A running daemon tells every waiting client where it stands at least
-  every 5 s, whether or not that changed, so only a daemon that has stopped
-  answering is ever given up on. The daemon only ever measures the groups of admitted
-  commands and never signals them, and what a client says about its command is
-  checked against the kernel: the group's leader must be a child of the process
-  that connected (still that process, by its pid and start time), of the same user,
-  started after the go-ahead. Frozen work holds the queue until the brake has
-  resumed or killed it, however long that takes; a record membrake cannot resolve
-  holds it for 300 s in total, and then stays recorded and retried without holding
-  anyone.
+  The sampling thread refreshes verified group identities and reservations
+  before choosing a victim. The daemon lifts itself out of jetsam band 0 so
+  macOS can't kill the guard first.
+- A running daemon tells waiting clients where they stand at least every 5 s
+  while it is scheduling. The broker accepts connections in batches and keeps
+  waiting and admitted clients connected. A record for a frozen group the brake
+  cannot resolve holds the queue for 300 s in total and remains recorded for
+  subsequent retries.
 - Samples and events are recorded (a stalled disk drops what does not fit, and
   the log says how many), and `membrake replay` runs a recording back through
   the policy, which is how the policy is tested.
@@ -299,13 +292,14 @@ membrake replay samples.tsv    # run a recording back through the policy
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--protect-user NAME` | — | Never freeze this user's jobs; kill them only last. Ranking only: it does not make a system account eligible (repeatable) |
+| `--protect-user NAME` | — | Exempt this user's jobs from freezes and kills (repeatable) |
 | `--include-user NAME` | — | Treat this system account's jobs (uid below 500) as eligible (repeatable) |
-| `--prefer REGEX` | — | Freeze and kill matching jobs first |
+| `--prefer REGEX` | — | Prefer matching jobs when victim class and excess are tied |
 | `--never REGEX` | agents, terminals | Never touch matching jobs (adds to the built-in list) |
 | `--min-job-gb GB` | `1` | Ignore jobs smaller than this |
 | `--settle-seconds S` | `10` | Spacing between freezes, resumes and kills |
-| `--max-freeze-minutes M` | `15` | Kill a job frozen this long while memory is still tight |
+| `--cpu-headroom-percent PERCENT` | `20` | Share of logical cores subtracted from the soft CPU budget, which has a one-core minimum |
+| `--max-freeze-minutes M` | `15` | Allow an overdue kill once a freeze arm fully trips |
 | `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` (none at the cliff) |
 | `--on-event CMD` | — | Run on every freeze, resume and kill, with `MEMBRAKE_*` variables |
 | `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded, and the queue's `queue.tsv` and `sizes.tsv` |
@@ -328,10 +322,8 @@ yourself or message the coding agent whose job was frozen.
 The brake deals with memory that has already run short. The queue keeps heavy
 commands from starting into a machine that has no room for them, so the brake
 has less to do. Run a heavy command (a type-check, a test run, a build) as
-`membrake exec -- <command>`: the daemon starts it when there is memory headroom
-for it. Admission is by **memory, not by a fixed count**, so the Mac uses its
-memory fully and does not swap. A fixed count wastes a 96 GB machine on small
-jobs and still swaps on big ones.
+`membrake exec -- <command>`. The daemon uses the command's estimated memory
+and the running jobs' CPU commitments to decide when to start it.
 
 ```sh
 membrake exec -- bun run test
@@ -393,91 +385,77 @@ the process table for its own leftovers reached every process group on the machi
 
 ### When a command starts
 
-Requests wait in order, and the next one starts only when **all** of this holds:
+Requests are ordered by the time of their first connection attempt. A
+reconnecting request keeps that timestamp. The scheduler uses the following
+conditions:
 
-- memory is not tight (the brake's own test), and the brake holds no frozen job
-  (from the moment it freezes one until it has resumed or killed it, however long
-  that takes): the queue and the brake are one ordered system. The exception is
-  a record membrake cannot resolve, such as a group it can no longer inspect or
-  a `SIGCONT` that keeps failing. It stays recorded and is retried on every sample,
-  but it holds the queue for 300 s in total, however often memory is tight again
-  meanwhile, and the daemon logs once when it stops;
-- `used + reserved + need < cap`. `used` is the memory the kernel does not count as
-  available (RAM × (100 − `kern.memorystatus_level`) / 100), averaged over the
-  last 5 s. `need` is the peak this kind of command was seen to reach before, or,
-  for a command nothing is known about, `min(1 GiB, cap / 5)`. `reserved` is, for
-  each running command, its whole expected need for its first 10 s (five seconds
-  for a start's memory to appear, plus five to fill the average), and after that
-  the part of its need its group has not yet been seen to use, counting a new
-  peak only once it has had 5 s to enter the average. A command that grows for a
-  minute keeps its room until it gets there. A command membrake never manages to
-  measure keeps only the first 10 s, so it cannot hold the queue while it runs.
-  Each admission adds its need before the next request is considered.
+- Reliable memory readings must show that memory has recovered, and the brake
+  must hold no frozen job. An unresolved stop record holds admission for up to
+  300 s while the brake continues trying to resume it.
+- `background + reserved + need < cap`. Background is the last 5 s of
+  measured memory in use, less the admitted footprints measured with each
+  reading. Each running job holds the greater of its starting need and 125%
+  of its largest observed footprint for its whole run. An unmeasured command
+  reserves the greater of 4 GiB and one eighth of the cap. Multiple unmeasured
+  commands can start together when their defaults fit. Learned commands
+  reserve 125% of their recent peak.
+- CPU budget defaults to 80% of logical cores, with a minimum of one core.
+  `--cpu-headroom-percent` sets the budget as a share below the machine's core
+  count. A request may start while running jobs commit fewer cores than the
+  budget, regardless of its own CPU demand. A new signature starts with up to
+  two committed cores. A learned signature starts with its peak demand. After
+  a job has 10 s of CPU samples, its commitment is the highest per-interval
+  demand observed over the last 10 s. Commitments have a one-core minimum and
+  are capped at the budget. Starting a job can take the total over the budget
+  and slow the running jobs.
 
-Every request that fits starts in the same step, in queue order; when the next
-one does not fit, nothing behind it starts. A new arrival can start immediately
-using the latest sample's memory and tight/frozen state, without waiting for
-another sample. Before the first sample, requests wait for that sample.
+The oldest request gets a reservation for its earliest estimated start. With
+EASY backfilling, a younger request can start if it fits immediately and its
+learned runtime, plus a margin of 25% or 250 ms (whichever is greater), ends by
+that reservation. Completion is predicted from the current clock. If no
+credible completion gives the head a start time, a backfill must fit the
+current commitments and leave the head's share reserved against other backfills.
 
-If nothing admitted is running and nothing is frozen, the next command starts
-even when it does not fit, so one big job is never stuck behind a busy machine.
-Never while memory is tight.
+A head whose memory need meets or exceeds the current cap holds an exclusive
+turn. It can start on its own when the queue's running list is empty and memory
+pressure permits a start. It can start beside running jobs when a fresh, calm
+reading shows that background memory plus their reservations plus its own need
+stays below 90% of RAM. After holding the turn for ten minutes it can also
+start on the next fresh, calm reading, regardless of its memory estimate.
+The brake still monitors measured pressure. Younger requests wait until the
+exclusive job finishes.
 
-A waiting client is told why: memory is tight, a job is frozen, its expected need
-does not fit under the cap (with memory in use and reserved shown separately), or
-it is behind another waiting request. With an older daemon it shows its position
-and expected need as before.
+The cap starts at 70% of RAM. When memory is tight it takes the last 15 s
+average of counted memory in use. After a quiet minute with a request blocked
+only by the cap, it rises by 5% of RAM, up to 90%. A session, used for display,
+is the nearest agent ancestor of the client or its parent process.
 
-The `cap` is learned, as in Buck2: it starts at 70% of RAM, and whenever memory
-is tight it becomes the memory in use averaged over the last 15 s, which is what
-the machine could hold when it ran short. A cap learned too low would stay low
-for good, so after 60 s without pressure, while a request waits only for the cap,
-it rises by 5% of RAM, at most to 90%, and again every 60 s.
+Profiles use the label together with the command signature. The signature is
+the program name and up to two plain arguments, with directories stripped.
+The daemon retains the largest memory peak and per-interval CPU peak from its
+five most recent observations, plus the longest successful runtime. CPU peaks
+use the elapsed time between counter measurements and are capped at the
+machine's logical core count. For a command that ends between samples, the
+client sends its child's CPU time,
+maximum RSS and elapsed time in `DONE`, using `wait4`. Up to 1000 profiles
+live in `sizes.tsv`. A labeled command uses its legacy command-signature
+profile until it learns a profile of its own.
 
-Between agents the queue takes turns: the next request is the oldest one of the
-session with the fewest commands running, so one agent's backlog does not starve
-another's single command. A session is the nearest ancestor of `membrake exec`
-that is an agent CLI (`claude`, `codex`), else its parent process.
+`membrake status` shows the cap, measured background use, running jobs and
+current reservations, and waiting jobs' positions and reasons.
 
-Sizes are learned per command signature, the program plus up to two plain
-arguments (`bun run test`, `tsc web`). The daemon measures the peak footprint of
-each admitted command's process group and keeps a moving average in
-`sizes.tsv` in the state directory, for up to 1000 signatures. The client says
-which group its command runs as, once, after it was told to go; the daemon
-accepts it only if the group's leader is a child of that client (the process that
-connected: the daemon noted its pid and start time when it accepted the
-connection, and a pid that has since gone to another process is not it), of the
-same user, started after the go-ahead, and measures only that process's group. Any
-other group, or a second report, is an error and a closed connection, and
-nothing is learned from it.
+### When the queue is unavailable
 
-`membrake status` shows the queue: the learned cap and the memory in use, who
-waits (place, session, label, need) and what runs.
+A live daemon owns a lock on its socket's adjacent `.pid` file and publishes
+awake uptime to an adjacent `.heartbeat` file on each successful sample. A
+heartbeat under 15 s old confirms that the sampler is active. While the
+heartbeat advances, clients can stay queued or retry a full backlog
+indefinitely, keeping the timestamp of their first attempt. They back off
+between retries. A free pidfile lock or a heartbeat older than 60 s produces
+a diagnostic and a nonzero exit.
 
-### It never blocks work
-
-If the socket is missing or refuses, the daemon sends an error, hangs up, does not
-answer the request within 10 s, or says nothing at all for 30 s after that,
-`membrake exec` prints one line and runs the command at once. While a client waits
-for its turn the daemon tells it where it stands at least every 5 s, whether or not
-that changed, so 30 s of silence is a daemon that has stopped answering, not a long
-wait; waiting for a turn is never a reason to give up, however long it takes. Those
-lines come from the daemon's socket thread, a thread of its own, so on their own they
-would show only that the daemon is up, not that its sampling loop is making progress:
-they are sent only while the loop is scheduling the queue. If it has not done so for
-30 s (its signals are unreadable, or it is stuck), every client that waits is sent
-`ERROR the queue is not scheduling` instead and runs its command, and so is any that
-asks, until the loop is scheduling again. The line reads:
-
-```text
-membrake: queue unavailable (no daemon is listening on /var/run/membrake.sock); running now
-```
-
-A closed connection gives up a place at any time: kill a waiting `membrake exec`
-and the next one moves up. Inside an admitted command (`MEMBRAKE_ADMITTED` is
-set) `membrake exec` runs its command directly, so a heavy command's heavy
-children do not queue behind it. `membrake run --dry-run` admits every client at
-once and logs what the queue would have decided.
+Inside an admitted command, a nested `membrake exec` shares the parent's
+reservation. `membrake run --dry-run` grants turns immediately and logs what the queue would have decided.
 
 ### Trust model
 
@@ -485,11 +463,10 @@ The daemon listens on `/var/run/membrake.sock` (`--socket PATH`), mode 0666, so
 that any local user can ask for a turn. That is a **single-user Mac** trust
 model: any local user can take a place in the line, and so can hold it. What the
 daemon trusts is only what the kernel says about the other end (its pid and uid).
-Every string a client sends is made printable and bounded, at most 64 clients are
-served at once (a connection past that is told so and hung up on, so its command
-runs at once, and a flood of them cannot keep the daemon from the clients it
-has), and the daemon only measures the groups of admitted commands, it never
-signals them. Do not use it on a Mac that other people log in to.
+Client strings are printable and bounded. The daemon checks the reported
+group's leader against the socket peer's identity before measuring it.
+Completion usage comes from the client, so only trusted local users should
+share this queue.
 
 The scheduler is ported from the design of
 [Buck2](https://github.com/facebook/buck2)'s local resource control (Apache
@@ -628,11 +605,9 @@ membrake exec --label "full check" -- ./scripts/verify.sh
 
 ### CI runners on the same Mac
 
-Self-hosted runners have a fixed number of slots, so they are not queued. Give
-their account to the brake as `--protect-user NAME`: their jobs are never
-frozen and are killed only when nothing else is left. `membrake exec` does not
-lower a command's CPU priority: the brake guards memory, and work under it runs
-at full speed until memory, not the CPU, says stop.
+Self-hosted runners have a fixed number of slots. Use `--protect-user NAME`
+to exempt their account from freezes and kills. Admitted commands run at the
+caller's CPU priority.
 
 ### People in a terminal
 

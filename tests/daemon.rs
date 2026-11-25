@@ -486,7 +486,6 @@ impl Script {
             // The derived columns are informational; the daemon reads the raw ones.
             let step = Step {
                 occupancy,
-                eta: f64::INFINITY,
                 tight: level <= 40,
                 actions: Vec::new(),
             };
@@ -563,17 +562,17 @@ fn events(log: &Path) -> String {
     fs::read_to_string(log.join("events.log")).unwrap_or_default()
 }
 
-/// The whole life of a job through the real daemon: the newest eligible group is frozen when
+/// The whole life of a job through the real daemon: the biggest eligible group is frozen when
 /// memory gets tight, resumed when it calms, and at the cliff the biggest eligible group is
 /// killed. A decoy that is newer and bigger than all of them, but outside the filter, is
 /// never touched. The events log tells the same story in order.
 #[test]
-fn simulated_pressure_freezes_the_newest_group_resumes_it_and_kills_the_biggest() {
+fn simulated_pressure_freezes_resumes_and_kills_the_biggest_group() {
     let dir = scratch("lifecycle");
     let (state, log) = (dir.join("state"), dir.join("log"));
     let mine = marker();
     let mut big = Group::spawn(&mine, 3); // oldest, and the biggest of the eligible groups
-    let mut small = Group::spawn(&mine, 1); // the newest eligible group
+    let mut small = Group::spawn(&mine, 1); // newer and smaller
     let mut decoy = Group::spawn(&marker(), 5); // newer and bigger, but not eligible
     assert!(big.start_us() < small.start_us() && small.start_us() < decoy.start_us());
     assert!(
@@ -584,16 +583,16 @@ fn simulated_pressure_freezes_the_newest_group_resumes_it_and_kills_the_biggest(
     let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
     daemon.wait_started(&log);
 
-    // Two tight readings are two strikes: the newest eligible group is frozen.
+    // Two tight readings are two strikes: the largest eligible group is frozen.
     script.tight(2);
     daemon.wait_samples(&log, 2);
-    assert!(small.settles(true), "the newest eligible group is stopped");
-    assert!(big.running() && decoy.running());
+    assert!(big.settles(true), "the biggest eligible group is stopped");
+    assert!(small.running() && decoy.running());
 
     // Calm for the settle period and the five calm samples resume needs.
     script.calm(10);
     daemon.wait_samples(&log, 12);
-    assert!(small.settles(false), "it is resumed");
+    assert!(big.settles(false), "it is resumed");
 
     // The cliff: the biggest eligible group is killed, at once.
     script.cliff(1);
@@ -605,8 +604,8 @@ fn simulated_pressure_freezes_the_newest_group_resumes_it_and_kills_the_biggest(
     assert_eq!(
         actions(&log),
         [
-            action("freeze", &small),
-            action("resume", &small),
+            action("freeze", &big),
+            action("resume", &big),
             action("kill", &big)
         ],
         "{}",
@@ -924,7 +923,8 @@ fn a_blocked_event_log_does_not_stop_the_brake() {
     mkfifo(&log.join("events.log"));
     let mine = marker();
     let mut first = Group::spawn(&mine, 1);
-    let mut second = Group::spawn(&mine, 1);
+    let mut second = Group::spawn(&mine, 3);
+    assert!(second.footprint() > first.footprint());
     let mut script = Script::new(&dir);
     let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
 
@@ -932,11 +932,11 @@ fn a_blocked_event_log_does_not_stop_the_brake() {
     daemon.wait_samples(&log, 2);
     assert!(
         second.settles(true),
-        "the newest is frozen with the log blocked"
+        "the largest is frozen with the log blocked"
     );
     script.cliff(1);
     daemon.wait_samples(&log, 3);
-    assert!(second.exited(), "and, frozen, it is killed first");
+    assert!(second.exited(), "the largest is killed at the cliff");
     assert!(first.alive() && first.running());
     assert!(
         daemon.terminate().success(),
@@ -1261,7 +1261,10 @@ fn state_permissions_are_set_explicitly_and_repaired() {
     assert_eq!(mode(&state.join("membrake.lock")), 0o600, "the lock");
     // The queue's socket is open to every user and its status file readable by all, whatever
     // the umask. The status file is written by the first sample.
+    wait_for_the_queue(&dir.join("q.sock"));
     assert_eq!(mode(&dir.join("q.sock")), 0o666, "the queue socket");
+    assert_eq!(mode(&dir.join("q.sock.pid")), 0o644, "the queue pidfile");
+    assert_eq!(mode(&dir.join("q.sock.heartbeat")), 0o644, "the heartbeat");
     let status = state.join("queue.tsv");
     let deadline = Instant::now() + Duration::from_secs(20);
     while !status.exists() {
@@ -1369,6 +1372,8 @@ impl AsRef<Path> for TempSocket {
 impl Drop for TempSocket {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(self.0.with_extension("sock.pid"));
+        let _ = fs::remove_file(self.0.with_extension("sock.heartbeat"));
     }
 }
 
@@ -1636,64 +1641,55 @@ fn queue_a_client_killed_while_waiting_releases_its_turn() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// With no daemon the command runs at once, after one line saying why, and its exit code is
-/// still passed on. The same when the "daemon" answers with an error, and when it hangs up.
 #[test]
-fn queue_a_client_fails_open_when_the_daemon_cannot_be_used() {
-    let dir = scratch("qopen");
-
-    let nobody = queue_socket("nobody");
-    let mut client = Client::spawn(&dir, "none", &nobody, &[], &["sh", "-c", "exit 3"]);
-    assert_eq!(client.code(), Some(3));
-    let said = client.said();
+fn queue_a_missing_or_stale_socket_fails_without_running_the_command() {
+    let dir = scratch("qclosed");
+    let socket = queue_socket("stale");
+    let marker = marker_file(&dir, "ran");
+    let mut absent = Client::spawn(&dir, "absent", &socket, &[], &["touch", &marker]);
+    assert_eq!(absent.code(), Some(1));
     assert!(
-        said.starts_with("membrake: queue unavailable (no daemon is listening on")
-            && said.trim_end().ends_with("; running now"),
-        "{said}"
-    );
-
-    // A socket nobody listens on any more is the same as none.
-    let stale = queue_socket("stale");
-    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
-    let mut client = Client::spawn(&dir, "stale", &stale, &[], &["sh", "-c", "exit 4"]);
-    assert_eq!(client.code(), Some(4));
-    assert!(
-        client.said().contains("queue unavailable"),
+        absent.said().contains("no daemon is listening"),
         "{}",
-        client.said()
+        absent.said()
     );
 
-    // A daemon that errors, and one that hangs up on the request.
-    let broken = queue_socket("broken");
-    let listener = std::os::unix::net::UnixListener::bind(&broken).unwrap();
-    let server = std::thread::spawn(move || {
-        for reply in [Some("ERROR\tboom\n"), None] {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut line = [0u8; 64];
-            let _ = stream.read(&mut line);
-            if let Some(reply) = reply {
-                stream.write_all(reply.as_bytes()).unwrap();
-            }
-        }
-    });
-    let mut client = Client::spawn(&dir, "error", &broken, &[], &["sh", "-c", "exit 5"]);
-    assert_eq!(client.code(), Some(5));
-    assert!(
-        client.said().contains("queue unavailable (boom)"),
-        "{}",
-        client.said()
+    let mut script = Script::new(&dir);
+    script.tight_and_quiet(1);
+    let mut daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    assert!(socket.exists(), "the killed daemon left its socket");
+    assert!(socket.with_extension("sock.pid").exists());
+    let mut stale = Client::spawn_with(
+        &dir,
+        "stale",
+        &socket,
+        &[],
+        &["touch", &marker],
+        false,
+        &[("MEMBRAKE_TEST_RETRY_MS", "800")],
     );
-    let mut client = Client::spawn(&dir, "hangup", &broken, &[], &["sh", "-c", "exit 6"]);
-    assert_eq!(client.code(), Some(6));
+    assert_eq!(stale.code(), Some(1));
     assert!(
-        client
-            .said()
-            .contains("queue unavailable (the daemon closed the connection)"),
+        stale.said().contains("no live daemon owns"),
         "{}",
-        client.said()
+        stale.said()
     );
-    server.join().unwrap();
+    assert!(!stale.said().contains("retrying"), "{}", stale.said());
+    assert!(!Path::new(&marker).exists());
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Mark the private test listener live so a real client retries it.
+fn mark_listener_alive(socket: &Path) -> fs::File {
+    let file = fs::File::create(socket.with_extension("sock.pid")).unwrap();
+    // SAFETY: this descriptor belongs to the test listener's fixture.
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    file
 }
 
 /// The times of the keep-alive, shortened for the tests (see `membrake::wire::timing`): a
@@ -1702,15 +1698,278 @@ fn queue_a_client_fails_open_when_the_daemon_cannot_be_used() {
 const SHORT: &[(&str, &str)] = &[("MEMBRAKE_TEST_SILENCE_MS", "4000")];
 const SILENCE: Duration = Duration::from_millis(4000);
 
-/// A daemon that answers once and then says nothing, with the connection open, is a daemon
-/// that has stopped answering: the client runs its command instead of waiting for ever, and
-/// says why. (A real daemon that stopped answering, because it hung or its socket thread
-/// died, looks like this to a client.)
 #[test]
-fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer() {
+fn queue_a_client_waits_for_a_connection_slot_when_the_daemon_is_full() {
+    let dir = scratch("qfull");
+    let socket = queue_socket("full");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _live = mark_listener_alive(&socket);
+    let marker = marker_file(&dir, "ran");
+    let mut client = Client::spawn(&dir, "full", &socket, &[], &["touch", &marker]);
+    let (mut refused, _) = listener.accept().unwrap();
+    refused.write_all(b"ERROR\ttoo many clients\n").unwrap();
+    drop(refused);
+    client.wait_said("queue waiting (too many clients); retrying");
+    assert!(!Path::new(&marker).exists());
+    let (mut admitted, _) = listener.accept().unwrap();
+    admitted.write_all(b"GO\n").unwrap();
+    assert_eq!(client.code(), Some(0));
+    assert!(Path::new(&marker).exists());
+    assert!(!client.said().contains("unavailable"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn queue_a_concurrent_burst_retries_a_full_kernel_backlog_and_all_get_go() {
+    use membrake::broker::{Broker, Options};
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let dir = scratch("qbbacklog");
+    let alias = queue_socket("burst");
+    let crowded = queue_socket("crowded");
+    let available = queue_socket("available");
+    let switch = queue_socket("switch");
+    let listener = UnixListener::bind(&crowded).unwrap();
+    // SAFETY: this listener is owned by the test. A small backlog makes refusal deterministic.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+    let mut held = Vec::new();
+    loop {
+        match UnixStream::connect(&crowded) {
+            Ok(client) => held.push(client),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+            Err(e) => panic!("could not fill the test backlog: {e}"),
+        }
+        assert!(
+            held.len() < 32,
+            "the test listener never refused a connection"
+        );
+    }
+    symlink(&crowded.0, &alias.0).unwrap();
+    let _live = mark_listener_alive(&alias);
+    let mut broker = Broker::start(Options {
+        socket: available.0.clone(),
+        state_dir: dir.clone(),
+        dry_run: false,
+    })
+    .unwrap();
+    let mut clients: Vec<_> = (0..12)
+        .map(|i| {
+            let name = format!("client-{i}");
+            let marker = marker_file(&dir, &format!("ran-{i}"));
+            (
+                Client::spawn(&dir, &name, &alias, &[], &["touch", &marker]),
+                marker,
+            )
+        })
+        .collect();
+    for (client, marker) in &clients {
+        wait_until("the refused client to retry", 20, || {
+            assert!(!Path::new(marker).exists(), "a command ran without GO");
+            client.said().contains("retrying")
+        });
+    }
+    symlink(&available.0, &switch.0).unwrap();
+    fs::rename(&switch.0, &alias.0).unwrap();
+    let mut s = membrake::signals::read().unwrap();
+    s.level = 80;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        s.time = membrake::signals::uptime();
+        broker.tick(&s, false, false);
+        if clients
+            .iter_mut()
+            .all(|(c, _)| c.child.try_wait().unwrap().is_some())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "all waiting clients should finish"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for (client, marker) in &mut clients {
+        assert_eq!(client.code(), Some(0));
+        assert!(Path::new(marker).exists());
+        assert!(!client.said().contains("unavailable"), "{}", client.said());
+    }
+    drop(broker);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn queue_a_simulated_daemon_admits_and_completes_500_concurrent_clients() {
+    use std::io::ErrorKind::WouldBlock;
+    use std::os::unix::net::UnixStream;
+
+    let dir = scratch("q500");
+    let socket = queue_socket("500");
+    let mut script = Script::new(&dir);
+    script.tight_and_quiet(3);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    daemon.wait_samples(&dir.join("log"), 3);
+
+    let mut clients = Vec::new();
+    for i in 0..500 {
+        let mut stream = None;
+        wait_until("a burst connection", 10, || {
+            match UnixStream::connect(&socket) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => false,
+                Err(e) => panic!("client {i}: {e}"),
+            }
+        });
+        let mut stream = stream.unwrap();
+        writeln!(stream, "REQUEST\tv1\tburst-{i}\tburst").unwrap();
+        stream.set_nonblocking(true).unwrap();
+        clients.push((stream, Vec::new(), false, false, false));
+    }
+    let mut read = |allow_go: bool| {
+        let mut complete = 0;
+        for (i, (stream, input, queued, went, done)) in clients.iter_mut().enumerate() {
+            if *done {
+                complete += 1;
+                continue;
+            }
+            let mut buf = [0; 1024];
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    assert!(*went, "client {i} disconnected before GO");
+                    *done = true;
+                }
+                Ok(n) => input.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == WouldBlock => {}
+                Err(e) => panic!("client {i}: {e}"),
+            }
+            while let Some(line) = membrake::wire::take_line(input) {
+                match membrake::wire::Reply::parse(&line) {
+                    Some(membrake::wire::Reply::Queued { .. }) => *queued = true,
+                    Some(membrake::wire::Reply::Go) => {
+                        assert!(
+                            allow_go && *queued && !*went,
+                            "unexpected GO for client {i}"
+                        );
+                        *went = true;
+                        stream.write_all(b"DONE\t0\n").unwrap();
+                    }
+                    _ => panic!("client {i}: {line}"),
+                }
+            }
+            if if allow_go { *done } else { *queued } {
+                complete += 1;
+            }
+        }
+        complete
+    };
+    wait_until("500 requests queued at once", 20, || read(false) == 500);
+    script.calm(8);
+    wait_until("500 go-aheads and completed requests", 25, || {
+        read(true) == 500
+    });
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn review3_kernel_backlog_wait_outlives_the_old_timeout_while_heartbeat_advances() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = scratch("heartbeat-backlog");
+    let socket = queue_socket("heartbeat-backlog");
+    let listener = UnixListener::bind(&socket).unwrap();
+    // SAFETY: the listener and every connection belong to this fixture.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+    let mut held = Vec::new();
+    for _ in 0..32 {
+        match UnixStream::connect(&socket) {
+            Ok(client) => held.push(client),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(UnixStream::connect(&socket).is_err());
+    let _live = mark_listener_alive(&socket);
+    let path = socket.with_extension("sock.heartbeat");
+    let file = fs::File::create(path).unwrap();
+    let publish = || {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&membrake::signals::uptime().to_ne_bytes(), 0)
+            .unwrap();
+    };
+    publish();
+    let marker = marker_file(&dir, "ran");
+    let mut client = Client::spawn_with(
+        &dir,
+        "c",
+        &socket,
+        &[],
+        &["touch", &marker],
+        false,
+        &[("MEMBRAKE_TEST_RETRY_MS", "500")],
+    );
+    let started = Instant::now();
+    wait_until("the old retry limit to pass under saturation", 5, || {
+        publish();
+        assert!(client.running(), "{}", client.said());
+        assert!(!Path::new(&marker).exists());
+        client.said().contains("retrying") && started.elapsed() >= Duration::from_millis(1500)
+    });
+    // Open the test listener's backlog and serve the same request.
+    listener.set_nonblocking(true).unwrap();
+    for _ in 0..held.len() {
+        listener.accept().unwrap();
+    }
+    wait_until("the retried request to arrive", 5, || {
+        publish();
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.write_all(b"GO\n").unwrap();
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("{e}"),
+        }
+    });
+    assert_eq!(client.code(), Some(0), "{}", client.said());
+    assert!(Path::new(&marker).exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn queue_a_live_daemon_that_never_schedules_fails_within_the_retry_budget() {
+    let dir = scratch("qstalled-deadline");
+    let socket = queue_socket("stalled-deadline");
+    let script = Script::new(&dir);
+    let timing = [
+        ("MEMBRAKE_TEST_SILENCE_MS", "150"),
+        ("MEMBRAKE_TEST_RETRY_MS", "400"),
+    ];
+    let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, &timing);
+    let marker = marker_file(&dir, "ran");
+    let mut client =
+        Client::spawn_with(&dir, "c", &socket, &[], &["touch", &marker], false, &timing);
+    wait_until("the client's heartbeat deadline", 5, || !client.running());
+    assert_eq!(client.code(), Some(1));
+    assert!(
+        client.said().contains("daemon heartbeat is stale"),
+        "{}",
+        client.said()
+    );
+    assert!(!Path::new(&marker).exists());
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A client that hears silence reconnects as long as the daemon's socket exists.
+#[test]
+fn queue_a_client_retries_when_the_daemon_goes_silent_after_its_first_answer() {
     let dir = scratch("qsilent");
     let socket = queue_socket("silent");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let live = mark_listener_alive(&socket);
     let (release, released) = std::sync::mpsc::channel::<()>();
     let (answered, answers) = std::sync::mpsc::channel::<Instant>();
     let server = std::thread::spawn(move || {
@@ -1732,12 +1991,8 @@ fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer(
         false,
         SHORT,
     );
-    assert_eq!(
-        client.code(),
-        Some(7),
-        "it ran its command: {}",
-        client.said()
-    );
+    client.wait_said("queue waiting (the daemon stopped answering); retrying");
+    assert!(client.running());
     // The limit runs from the first answer, so that is where the silence is measured from.
     let answered_at = answers.recv().unwrap();
     assert!(
@@ -1745,13 +2000,9 @@ fn queue_a_client_fails_open_when_the_daemon_goes_silent_after_its_first_answer(
         "not before the daemon had been silent for the whole limit: {:?}",
         answered_at.elapsed()
     );
-    assert!(
-        client
-            .said()
-            .contains("membrake: queue unavailable (the daemon stopped answering); running now"),
-        "{}",
-        client.said()
-    );
+    drop(live);
+    fs::remove_file(&socket.0).unwrap();
+    assert_eq!(client.code(), Some(1));
     release.send(()).unwrap();
     server.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
@@ -1821,6 +2072,14 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     assert!(!Path::new(&ran).exists(), "and its command has not run");
 
     script.calm(8);
+    wait_until("the first client to get GO", 10, || {
+        let mut chunk = [0u8; 256];
+        if let Ok(n) = listener.read(&mut chunk) {
+            input.extend_from_slice(&chunk[..n]);
+        }
+        std::iter::from_fn(|| membrake::wire::take_line(&mut input)).any(|line| line == "GO")
+    });
+    listener.write_all(b"DONE\t0\n").unwrap();
     assert_eq!(client.code(), Some(0));
     assert!(Path::new(&ran).exists());
     assert!(!client.said().contains("unavailable"), "{}", client.said());
@@ -1828,92 +2087,46 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The lines that keep a client waiting come from the daemon's socket thread, which shows that
-/// the daemon is up, not that its sampling loop is scheduling anything. Here the loop is
-/// alive and never does: every reading is unreadable, so it never reaches the queue, and no
-/// turn will ever be given. Past the silence limit the clients that wait are told so
-/// (`ERROR`, which the real one takes as the queue being unavailable and runs its command)
-/// instead of being told their place for ever, and so is one that asks while it lasts; once
-/// the readings are good again the queue serves clients as before.
 #[test]
-fn queue_clients_are_sent_away_while_the_sampling_loop_is_not_scheduling() {
+fn queue_keeps_places_while_samples_are_unreadable_then_recovers() {
     let dir = scratch("qstalled");
     let socket = queue_socket("stalled");
+    let options = [("MEMBRAKE_TEST_SILENCE_MS", "600")];
     let mut script = Script::new(&dir);
     script.tight_and_quiet(3);
     let log = dir.join("log");
-    let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, SHORT);
+    let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, &options);
     daemon.wait_samples(&log, 3);
 
-    // Two clients wait: one that only listens, and a real one.
-    let mut listener = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-    listener
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
-    listener.write_all(b"REQUEST\tv1\tlistener\tsig\n").unwrap();
     let ran = marker_file(&dir, "ran");
-    let mut client = Client::spawn_with(&dir, "c", &socket, &[], &["touch", &ran], false, SHORT);
-    client.wait_said("position 2");
-
-    // From here on the readings are unreadable, one every eighth of the silence limit (the loop
-    // is alive), until the listener has been told, which takes the silence limit.
-    let (mut input, mut lines) = (Vec::new(), Vec::new());
-    let started = Instant::now();
-    let mut fed = started;
-    script.unreadable(1);
-    while !lines.iter().any(|l: &String| l.starts_with("ERROR")) {
-        assert!(
-            started.elapsed() < SILENCE * 4,
-            "never sent away: {lines:?}, {}",
-            client.said()
-        );
-        if fed.elapsed() >= SILENCE / 8 {
-            script.unreadable(1);
-            fed = Instant::now();
-        }
-        let mut chunk = [0u8; 256];
-        if let Ok(n) = listener.read(&mut chunk) {
-            input.extend_from_slice(&chunk[..n]);
-        }
-        while let Some(line) = membrake::wire::take_line(&mut input) {
-            lines.push(line);
-        }
-    }
-    assert_eq!(
-        lines.last().map(String::as_str),
-        Some("ERROR\tthe queue is not scheduling"),
-        "{lines:?}"
+    let mut first = Client::spawn_with(
+        &dir,
+        "first",
+        &socket,
+        &[],
+        &["touch", &ran],
+        false,
+        &options,
     );
-    assert_eq!(client.code(), Some(0), "{}", client.said());
-    assert!(Path::new(&ran).exists(), "the real client ran its command");
-    assert!(
-        client
-            .said()
-            .contains("queue unavailable (the queue is not scheduling); running now"),
-        "{}",
-        client.said()
+    first.wait_said("position 1");
+    script.unreadable(4);
+    let late_ran = marker_file(&dir, "late-ran");
+    let mut late = Client::spawn_with(
+        &dir,
+        "late",
+        &socket,
+        &[],
+        &["touch", &late_ran],
+        false,
+        &options,
     );
+    late.wait_said("position 2");
+    assert!(first.running() && late.running());
+    assert!(!Path::new(&ran).exists() && !Path::new(&late_ran).exists());
 
-    // A client that asks while the loop is still not scheduling is sent away at once.
-    let mut late = std::os::unix::net::UnixStream::connect(&socket).unwrap();
-    late.set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    late.write_all(b"REQUEST\tv1\tlate\tsig\n").unwrap();
-    let mut said = [0u8; 256];
-    let n = late.read(&mut said).unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&said[..n]),
-        "ERROR\tthe queue is not scheduling\n"
-    );
-
-    // Good readings again: an ordinary client waits for its turn and runs.
-    script.calm(3);
-    daemon.wait_samples(&log, 6);
-    let again = marker_file(&dir, "again");
-    let mut served = Client::spawn_with(&dir, "s", &socket, &[], &["touch", &again], false, SHORT);
-    assert_eq!(served.code_while_calm(&mut script), Some(0));
-    assert!(Path::new(&again).exists());
-    assert!(!served.said().contains("unavailable"), "{}", served.said());
+    assert_eq!(first.code_while_calm(&mut script), Some(0));
+    assert_eq!(late.code_while_calm(&mut script), Some(0));
+    assert!(Path::new(&ran).exists() && Path::new(&late_ran).exists());
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1945,30 +2158,33 @@ fn queue_a_nested_call_runs_directly() {
 }
 
 /// `status` shows the learned cap and the memory in use, who waits (with place, session,
-/// label and need) and what runs.
+/// label and need) and what runs. CPU alone holds a request even on calm samples.
 #[test]
 fn queue_status_lists_the_waiting_and_the_admitted() {
     let dir = scratch("qstat");
     let socket = queue_socket("stat");
     let mut script = Script::new(&dir);
-    script.calm(10);
+    script.tight_and_quiet(10);
     let (state, log) = (dir.join("state"), dir.join("log"));
+    fs::create_dir_all(&state).unwrap();
+    let full_machine = std::thread::available_parallelism().map_or(1, |n| n.get()) * 1000;
+    let ran = marker_file(&dir, "beta-ran");
+    let signature = membrake::wire::signature(&["sleep".into(), "300".into()], Some("alpha"));
+    fs::write(
+        state.join("sizes.tsv"),
+        format!("{signature}\t1\t1\t{full_machine}\n"),
+    )
+    .unwrap();
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
 
-    let started = marker_file(&dir, "started");
     let mut running = Client::spawn(
         &dir,
         "run",
         &socket,
         &["--label", "alpha"],
-        &["sh", "-c", &format!("touch {started}; exec sleep 300")],
+        &["sleep", "300"],
     );
-    wait_until("alpha to run", 20, || Path::new(&started).exists());
-    // The daemon reads its script at its own pace: beta must ask only once it has read
-    // that memory is tight, or a calm reading could still admit it.
-    script.tight(3);
-    daemon.wait_samples(&log, 13);
-    let ran = marker_file(&dir, "beta-ran");
+    running.wait_said("position 1)");
     let waiting = Client::spawn(
         &dir,
         "wait",
@@ -1976,9 +2192,10 @@ fn queue_status_lists_the_waiting_and_the_admitted() {
         &["--label", "beta"],
         &["touch", &ran],
     );
-    waiting.wait_said("position 1");
-    script.tight(3);
-    daemon.wait_samples(&log, 16);
+    waiting.wait_said("position 2)");
+    script.calm(3);
+    waiting.wait_said("position 1): CPU budget");
+    daemon.wait_samples(&log, 13);
     // The status file is written by a thread of its own, behind the sample that changed it.
     wait_until(
         "the status file to show alpha running and beta waiting",
@@ -2013,7 +2230,7 @@ fn queue_status_lists_the_waiting_and_the_admitted() {
     assert!(
         queue
             .lines()
-            .any(|l| l.contains("waiting   #1") && l.contains("needs") && l.contains("beta")),
+            .any(|l| l.contains("waiting   #1") && l.contains("beta") && l.contains("[CPU budget")),
         "{queue}"
     );
     assert!(!Path::new(&ran).exists());
@@ -2121,6 +2338,37 @@ fn queue_the_learned_size_is_written_after_the_command_is_done() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn queue_learns_cpu_from_a_successful_command_between_samples() {
+    let dir = scratch("qshort");
+    let socket = queue_socket("short");
+    let state = dir.join("state");
+    let log = dir.join("log");
+    let mut script = Script::new(&dir);
+    script.calm(1);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    daemon.wait_samples(&log, 1);
+    let mut short = Client::spawn(
+        &dir,
+        "short",
+        &socket,
+        &["--label", "quick"],
+        &["/usr/bin/true"],
+    );
+    assert_eq!(short.code(), Some(0));
+    wait_until("a CPU profile for the completed command", 10, || {
+        fs::read_to_string(state.join("sizes.tsv"))
+            .ok()
+            .is_some_and(|text| {
+                let key = membrake::wire::signature(&["/usr/bin/true".into()], Some("quick"));
+                let demand = membrake::sizes::Sizes::parse(&text).0.demand(&key);
+                demand.millicores.is_some() && demand.bytes.is_some() && demand.runtime_ms.is_some()
+            })
+    });
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The queue and the brake are one ordered system: while the brake holds a job frozen nothing
 /// is admitted, however calm memory looks, and the queue goes on as soon as it is resumed.
 #[test]
@@ -2141,16 +2389,16 @@ fn queue_nothing_is_admitted_while_a_job_is_frozen() {
     let ran = marker_file(&dir, "ran");
     let mut client = Client::spawn(&dir, "c", &socket, &[], &["touch", &ran]);
     client.wait_said("queued (position 1)");
-    // Calm, but inside the 10 s the brake waits before it resumes anything.
-    script.calm(8);
-    daemon.wait_samples(&log, 10);
+    // Four calm readings are short of the five needed to resume.
+    script.calm(4);
+    daemon.wait_samples(&log, 6);
     assert!(
         client.running() && !Path::new(&ran).exists(),
         "held while frozen"
     );
     assert!(!group.running(), "still frozen");
 
-    script.calm(8);
+    script.calm(1);
     assert!(group.settles(false), "the brake resumed it");
     assert_eq!(client.code(), Some(0));
     assert!(Path::new(&ran).exists());
@@ -2724,6 +2972,9 @@ fn until(go: &str) -> String {
 fn exec_stops_what_an_interrupted_command_left_running() {
     let dir = scratch("reap-interrupted");
     let nobody = queue_socket("reap-interrupted");
+    let mut script_samples = Script::new(&dir);
+    script_samples.calm(5);
+    let _daemon = queue_daemon(&script_samples, &dir, &nobody, NOTHING);
     let file = marker_file(&dir, "left");
     let script = format!("{} sleep 60", leftover("trap \"\" TERM;", &file));
     let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
@@ -2752,6 +3003,9 @@ fn exec_stops_what_an_interrupted_command_left_running() {
 fn exec_stops_what_a_command_that_died_of_a_signal_left_running() {
     let dir = scratch("reap-died");
     let nobody = queue_socket("reap-died");
+    let mut script_samples = Script::new(&dir);
+    script_samples.calm(5);
+    let _daemon = queue_daemon(&script_samples, &dir, &nobody, NOTHING);
     let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
     let script = format!("{} {} kill -TERM $$", leftover("", &file), until(&go));
     let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
@@ -2778,6 +3032,9 @@ fn exec_stops_what_a_command_that_died_of_a_signal_left_running() {
 fn exec_with_reap_stops_what_a_finished_command_left_running() {
     let dir = scratch("reap-finished");
     let nobody = queue_socket("reap-finished");
+    let mut script_samples = Script::new(&dir);
+    script_samples.calm(5);
+    let _daemon = queue_daemon(&script_samples, &dir, &nobody, NOTHING);
     let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
     let script = format!("{} {} true", leftover("", &file), until(&go));
     let mut client = Client::spawn(&dir, "c", &nobody, &["--reap"], &["sh", "-c", &script]);
@@ -2805,6 +3062,9 @@ fn exec_with_reap_stops_what_a_finished_command_left_running() {
 fn exec_without_reap_leaves_a_finished_commands_leftovers_and_says_so() {
     let dir = scratch("reap-not");
     let nobody = queue_socket("reap-not");
+    let mut script_samples = Script::new(&dir);
+    script_samples.calm(5);
+    let _daemon = queue_daemon(&script_samples, &dir, &nobody, NOTHING);
     let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
     let script = format!("{} {} true", leftover("", &file), until(&go));
     let mut client = Client::spawn(&dir, "c", &nobody, &[], &["sh", "-c", &script]);
@@ -2827,6 +3087,9 @@ fn exec_without_reap_leaves_a_finished_commands_leftovers_and_says_so() {
 fn exec_with_nothing_left_ends_at_once() {
     let dir = scratch("reap-nothing");
     let nobody = queue_socket("reap-nothing");
+    let mut script_samples = Script::new(&dir);
+    script_samples.calm(5);
+    let _daemon = queue_daemon(&script_samples, &dir, &nobody, NOTHING);
     for options in [&[][..], &["--reap"][..]] {
         let started = Instant::now();
         let mut client = Client::spawn(&dir, "c", &nobody, options, &["sh", "-c", "exit 7"]);
@@ -2851,6 +3114,9 @@ fn exec_with_nothing_left_ends_at_once() {
 fn exec_does_not_follow_a_process_that_left_the_group() {
     let dir = scratch("reap-left-group");
     let nobody = queue_socket("reap-left-group");
+    let mut script_samples = Script::new(&dir);
+    script_samples.calm(5);
+    let _daemon = queue_daemon(&script_samples, &dir, &nobody, NOTHING);
     let (file, go) = (marker_file(&dir, "left"), marker_file(&dir, "go"));
     // The process leaves the group first and only then writes its pid. The system's perl by
     // its path: the Nix build that runs these tests has none on PATH.

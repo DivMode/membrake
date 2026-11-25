@@ -37,6 +37,9 @@ pub trait SignalSource {
     /// be no more (shutdown was requested); `Err` is a source that is broken, not a reading
     /// that failed: the runner thaws everything and stops.
     fn next_reading(&mut self) -> Result<Option<Reading>, String>;
+    fn recheck_pressure(&mut self, previous: Signals) -> Option<Signals> {
+        Some(previous)
+    }
 }
 
 /// The kernel, read straight from sysctl and statfs.
@@ -53,6 +56,10 @@ impl Live {
 }
 
 impl SignalSource for Live {
+    fn recheck_pressure(&mut self, _previous: Signals) -> Option<Signals> {
+        signals::read().ok()
+    }
+
     fn next_reading(&mut self) -> Result<Option<Reading>, String> {
         match self.next_tick {
             None => self.next_tick = Some(signals::uptime()),
@@ -88,6 +95,7 @@ pub struct Scripted {
     /// The line being read; kept across polls because a writer may be half way through it.
     line: Vec<u8>,
     number: usize,
+    pending: Option<Reading>,
 }
 
 impl Scripted {
@@ -99,6 +107,7 @@ impl Scripted {
             input: BufReader::new(file),
             line: Vec::new(),
             number: 0,
+            pending: None,
         })
     }
 }
@@ -111,6 +120,38 @@ pub fn refuse_root(uid: u32, euid: u32) -> Result<(), String> {
     Ok(())
 }
 
+impl Scripted {
+    fn poll_reading(&mut self) -> Result<Option<Reading>, String> {
+        match self.input.read_until(b'\n', &mut self.line) {
+            Err(e) => return Err(format!("cannot read the script: {e}")),
+            Ok(_) if self.line.ends_with(b"\n") => {}
+            Ok(_) => return Ok(None),
+        }
+        self.number += 1;
+        let text = String::from_utf8_lossy(&self.line);
+        let text = text.trim_end_matches(['\n', '\r']);
+        let row = if text.is_empty() || text.starts_with("time\t") {
+            None
+        } else {
+            Some(
+                recorder::parse_scripted(text)
+                    .map_err(|e| format!("script line {}: {e}", self.number))?,
+            )
+        };
+        self.line.clear();
+        Ok(row.map(|row| match row {
+            ScriptedRow::Signals(s) => Ok(s),
+            ScriptedRow::Unreadable { time } => Err(Unreadable {
+                time,
+                error: ReadError {
+                    what: "scripted reading",
+                    source: io::Error::other("unreadable this tick"),
+                },
+            }),
+        }))
+    }
+}
+
 impl SignalSource for Scripted {
     fn next_reading(&mut self) -> Result<Option<Reading>, String> {
         loop {
@@ -118,36 +159,20 @@ impl SignalSource for Scripted {
                 return Ok(None);
             }
             std::thread::sleep(SCRIPT_PAUSE);
-            match self.input.read_until(b'\n', &mut self.line) {
-                Err(e) => return Err(format!("cannot read the script: {e}")),
-                Ok(_) if self.line.ends_with(b"\n") => {}
-                Ok(_) => continue,
+            if let Some(reading) = self.pending.take() {
+                return Ok(Some(reading));
             }
-            self.number += 1;
-            let text = String::from_utf8_lossy(&self.line);
-            let text = text.trim_end_matches(['\n', '\r']);
-            let row = if text.is_empty() || text.starts_with("time\t") {
-                None
-            } else {
-                Some(
-                    recorder::parse_scripted(text)
-                        .map_err(|e| format!("script line {}: {e}", self.number))?,
-                )
-            };
-            self.line.clear();
-            match row {
-                None => {}
-                Some(ScriptedRow::Signals(s)) => return Ok(Some(Ok(s))),
-                Some(ScriptedRow::Unreadable { time }) => {
-                    return Ok(Some(Err(Unreadable {
-                        time,
-                        error: ReadError {
-                            what: "scripted reading",
-                            source: io::Error::other("unreadable this tick"),
-                        },
-                    })));
-                }
+            if let Some(reading) = self.poll_reading()? {
+                return Ok(Some(reading));
             }
+        }
+    }
+
+    fn recheck_pressure(&mut self, previous: Signals) -> Option<Signals> {
+        self.pending = self.poll_reading().ok()?;
+        match self.pending.as_ref() {
+            Some(reading) => reading.as_ref().ok().copied(),
+            None => Some(previous),
         }
     }
 }

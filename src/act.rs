@@ -1123,6 +1123,27 @@ pub fn kill(
     term_seconds: f64,
     allowed: &mut dyn FnMut() -> Option<String>,
 ) -> Result<Killed, ActError> {
+    kill_with_pressure(
+        state,
+        job,
+        scanned,
+        immediate,
+        term_seconds,
+        allowed,
+        || Some(true),
+    )
+}
+
+/// Rechecks pressure after a non-emergency grace period before escalating.
+pub(crate) fn kill_with_pressure(
+    state: &mut State,
+    job: &Job,
+    scanned: f64,
+    immediate: bool,
+    term_seconds: f64,
+    allowed: &mut dyn FnMut() -> Option<String>,
+    pressure: impl FnOnce() -> Option<bool>,
+) -> Result<Killed, ActError> {
     let pgid = job.pgid;
     let mut id = match state.record(pgid) {
         Some(rec) => Identity::of_record(rec),
@@ -1202,6 +1223,16 @@ pub fn kill(
             let _ = state.remove(pgid);
             return Ok(Killed::Exited);
         }
+    }
+    if !immediate
+        && let Some(why) = match pressure() {
+            Some(true) => None,
+            Some(false) => Some("measured pressure cleared during SIGTERM grace"),
+            None => Some("could not re-check measured pressure after SIGTERM grace"),
+        }
+    {
+        let _ = resume(state, pgid);
+        return Ok(Killed::Spared(why.into()));
     }
     let deadline = signals::uptime() + KILL_WAIT;
     loop {
@@ -2916,6 +2947,32 @@ mod tests {
             took >= Duration::from_secs(1) && took < Duration::from_secs(8),
             "SIGTERM was ignored, so the 1 s grace period must pass first: {took:?}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review3_cleared_pressure_during_grace_spares_a_live_group() {
+        let dir = scratch("kill-pressure-cleared");
+        let sleeper = Sleeper::spawn_in(0, true);
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        let started = std::time::Instant::now();
+        let result = kill_with_pressure(
+            &mut state,
+            &job,
+            signals::wall(),
+            false,
+            0.1,
+            &mut || None,
+            || {
+                assert!(started.elapsed() >= Duration::from_millis(100));
+                Some(false)
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, Killed::Spared(why) if why.contains("pressure cleared")));
+        assert!(matches!(jobs::probe(job.pgid), jobs::Probe::Found(p) if !p.stopped));
+        assert!(state.records().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

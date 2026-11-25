@@ -146,6 +146,7 @@ pub struct RunOptions {
     pub rules: Rules,
     /// Grace between SIGTERM and SIGKILL for a non-emergency kill.
     pub term_seconds: f64,
+    pub cpu_headroom_percent: u32,
     pub on_event: Option<String>,
 }
 
@@ -348,17 +349,20 @@ fn run_loop<S: SignalSource>(
     let start = r.start_line(protection);
     r.rec.event(wall, "start", &start);
     if let Some(socket) = &location.socket {
-        // Without a queue the brake is unchanged and every `membrake exec` runs at once.
-        match Broker::start(broker::Options {
-            socket: socket.clone(),
-            state_dir: location.state_dir.clone(),
-            dry_run: location.dry_run,
-        }) {
+        // The brake keeps working if the queue cannot start.
+        match Broker::start_with_cpu_headroom(
+            broker::Options {
+                socket: socket.clone(),
+                state_dir: location.state_dir.clone(),
+                dry_run: location.dry_run,
+            },
+            r.opts.cpu_headroom_percent,
+        ) {
             Ok(queue) => r.serve_queue(queue),
             Err(e) => r.rec.event(
                 signals::wall(),
                 "warn",
-                &format!("not serving the queue (clients run at once): {e}"),
+                &format!("not serving the queue: {e}"),
             ),
         }
     }
@@ -373,7 +377,7 @@ fn run_loop<S: SignalSource>(
             Ok(Some(Ok(s))) => {
                 unreadable_since = None;
                 failsafe_fired = false;
-                r.tick(&s);
+                r.tick_with_pressure(&s, || source.recheck_pressure(s));
             }
             Ok(Some(Err(Unreadable { time: now, error }))) => {
                 let since = *unreadable_since.get_or_insert(now);
@@ -436,7 +440,7 @@ impl Runner {
     fn start_line(&self, protection: &str) -> String {
         let p = &self.opts.policy;
         format!(
-            "membrake {} pid {}{}: freezes the newest job of at least {:.1}GB at {:.0}% compressor occupancy, \
+            "membrake {} pid {}{}: freezes eligible jobs of at least {:.1}GB at {:.0}% compressor occupancy, \
              kills at {:.0}%; {protection}",
             env!("CARGO_PKG_VERSION"),
             std::process::id(),
@@ -516,33 +520,44 @@ impl Runner {
     /// One sample: ask the engine, send every signal that leads to, and only then describe
     /// them. Allocation-free when there is nothing to do, frozen jobs included.
     pub fn tick(&mut self, s: &Signals) {
+        self.tick_with_pressure(s, || Some(*s));
+    }
+
+    fn tick_with_pressure(&mut self, s: &Signals, mut recheck: impl FnMut() -> Option<Signals>) {
         let mut shown: Option<Vec<Job>> = None;
         // When the process table was read: the bound of the identity of every group this
         // tick signals. Taken once, here, never worked out at the moment a signal goes out.
         let mut scanned = s.wall;
         let rules = &self.opts.rules;
         let min = self.opts.policy.min_job_bytes;
-        let step = self.engine.step(s, || {
+        if let Some(queue) = self.queue.as_mut() {
+            queue.begin_sample();
+        }
+        let queue = self.queue.as_mut();
+        let step = self.engine.step_with_candidates(s, || {
             scanned = signals::wall();
             let jobs = jobs::scan(rules, min);
             shown = Some(jobs.clone());
-            jobs
+            (jobs, queue.map_or(&[][..], Broker::refresh_reservations))
         });
         for action in &step.actions {
-            self.perform(action, s, scanned);
+            self.perform_with_pressure(action, s, scanned, &mut recheck);
         }
         self.complete_records(s);
         self.check_frozen(s);
         self.retry_unresolved(s);
         self.update_hold(s);
         if let Some(queue) = self.queue.as_mut() {
-            for (kind, text) in queue.tick(s, step.tight, self.held) {
+            queue.measure(s.time);
+            for (kind, text) in queue.schedule(s, step.tight, self.held) {
                 self.events.push(Event::note(s.wall, kind, text));
             }
         }
         // All signals of this tick are sent. Now say so.
         self.log_events();
-        self.rec.sample(s, &step, shown.as_deref());
+        let reservations = self.queue.as_ref().map_or(&[][..], Broker::reservations);
+        self.rec
+            .sample_with_admissions(s, &step, shown.as_deref(), reservations);
         self.rec.sync_events();
     }
 
@@ -568,15 +583,25 @@ impl Runner {
     /// Carries out one action: signals only, no logging. What there is to say goes into
     /// `self.events`, to be logged when the whole tick's signals are out. `scanned` is the
     /// wall-clock time the process table was read for this sample.
+    #[cfg(test)]
     fn perform(&mut self, action: &Action, s: &Signals, scanned: f64) {
-        let (job, immediate) = match action {
+        self.perform_with_pressure(action, s, scanned, &mut || Some(*s));
+    }
+
+    fn perform_with_pressure(
+        &mut self,
+        action: &Action,
+        s: &Signals,
+        scanned: f64,
+        recheck: &mut dyn FnMut() -> Option<Signals>,
+    ) {
+        let job = match action {
             Action::Stall { .. } | Action::Warn { .. } => {
                 let (kind, text) = describe(action);
                 self.events.push(Event::note(s.wall, kind, text));
                 return;
             }
-            Action::Freeze { job, .. } | Action::Resume { job } => (job, false),
-            Action::Kill { job, immediate, .. } => (job, *immediate),
+            Action::Freeze { job, .. } | Action::Resume { job } | Action::Kill { job, .. } => job,
         };
         let Some(state) = self.state.as_mut() else {
             let (kind, text) = describe(action);
@@ -595,16 +620,21 @@ impl Runner {
                 act::freeze(state, job, scanned, &mut allowed).map(|()| Done::Complete)
             }
             Action::Resume { .. } => act::resume(state, job.pgid).map(|()| Done::Complete),
-            _ => {
-                let result = act::kill(
+            Action::Kill {
+                immediate,
+                threshold,
+                ..
+            } => {
+                let result = act::kill_with_pressure(
                     state,
                     job,
                     scanned,
-                    immediate,
+                    *immediate,
                     self.opts.term_seconds,
                     &mut allowed,
+                    || recheck().map(|fresh| threshold.still_tripped(&fresh, &self.opts.policy)),
                 );
-                // The wait was ours, not a stall, and the fill rate before it is stale.
+                // The wait was ours, so it is not a sampling stall.
                 self.engine.resync();
                 result.map(|killed| match killed {
                     Killed::Exited => Done::Complete,
@@ -612,6 +642,7 @@ impl Runner {
                     Killed::Spared(why) => Done::Spared(why),
                 })
             }
+            Action::Stall { .. } | Action::Warn { .. } => unreachable!(),
         };
         let still_recorded = state.record(job.pgid).is_some();
         let unrecorded = state.pending().contains(&job.pgid);
@@ -843,7 +874,7 @@ pub(crate) fn gb(bytes: u64) -> String {
 }
 
 /// Prints the live signals, the jobs frozen according to the state file, and the next
-/// candidates in the order membrake would freeze them. Needs no privileges; it lists what
+/// eligible groups visible to the caller. Needs no privileges; it lists what
 /// the calling user can see.
 pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), String> {
     let s = signals::read().map_err(|e| format!("cannot read the signals: {e}"))?;
@@ -906,7 +937,7 @@ pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), St
     }
 
     let mut jobs = jobs::scan(rules, policy.min_job_bytes);
-    // Freeze order: preferred first, then newest; protected users' jobs are never frozen.
+    // Show newer groups first within their configured preference.
     jobs.sort_by_key(|j| {
         (
             j.protected,
@@ -922,10 +953,7 @@ pub fn status(policy: &Policy, rules: &Rules, state_dir: &Path) -> Result<(), St
         );
     } else {
         let shown = jobs.len().min(5);
-        println!(
-            "candidates  {shown} of {} in freeze order (newest first):",
-            jobs.len()
-        );
+        println!("candidates  {shown} of {} eligible groups:", jobs.len());
         println!(
             "  {:<10} {:>8} {:>7}  {:<7} {:<8} command",
             "tier", "size", "age", "group", "uid"
@@ -1014,13 +1042,19 @@ fn print_queue(state_dir: &Path, wall: f64) {
         );
     }
     for w in &queue.waiting {
+        let reason = if w.reason.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", w.reason)
+        };
         println!(
-            "  waiting   #{:<3} session {:<7} needs {:>7}  for {}  {}",
+            "  waiting   #{:<3} session {:<7} needs {:>7}  for {}  {}{}",
             w.position,
             w.session,
             gb(w.need),
             age(wall - w.since),
-            w.label
+            w.label,
+            reason
         );
     }
 }
@@ -1093,6 +1127,7 @@ mod tests {
             policy: Policy::default(),
             rules: Rules::new(&[], &[], vec![], vec![], 0).unwrap(),
             term_seconds: 1.0,
+            cpu_headroom_percent: crate::queue::DEFAULT_CPU_HEADROOM_PERCENT,
             on_event: None,
         };
         let state = State::open(&dir.join("state")).unwrap();
@@ -1234,6 +1269,7 @@ mod tests {
             // tests as a build user with such a uid, and the kill is judged by the rules.
             rules: Rules::new(&[], &[], vec![], vec![unsafe { libc::getuid() }], 0).unwrap(),
             term_seconds: 1.0,
+            cpu_headroom_percent: crate::queue::DEFAULT_CPU_HEADROOM_PERCENT,
             on_event: None,
         };
         let state = State::open(&dir.join("state")).unwrap();
@@ -1388,6 +1424,9 @@ mod tests {
                 job: job.clone(),
                 immediate: true,
                 reason: "test".into(),
+                threshold: crate::engine::KillThreshold::Arms(vec![
+                    crate::engine::Arm::KillOccupancyNow,
+                ]),
             },
             &s,
             s.wall,
@@ -1401,6 +1440,52 @@ mod tests {
         let said = events(&mut r, &dir);
         assert!(said.contains(" kill "), "{said}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review4_kill_grace_rechecks_the_threshold_that_triggered_the_kill() {
+        for overdue in [false, true] {
+            let dir = scratch("kill-threshold");
+            let mut sleeper = Sleeper::spawn_in(0, true);
+            let job = sleeper.job(1);
+            let mut r = runner_with_frozen(&dir, &job);
+            let step = if overdue {
+                r.engine.resync();
+                r.engine.step(&signals_at(1002.0), || vec![job.clone()])
+            } else {
+                for time in 102..111 {
+                    r.engine
+                        .step(&signals_at(f64::from(time)), || vec![job.clone()]);
+                }
+                let mut s = signals_at(111.0);
+                s.segments = 0.86;
+                r.engine.step(&s, || vec![job.clone()]);
+                s.time = 112.0;
+                r.engine.step(&s, || vec![job.clone()])
+            };
+            assert!(
+                matches!(
+                    step.actions.as_slice(),
+                    [Action::Kill {
+                        immediate: false,
+                        ..
+                    }]
+                ),
+                "{step:?}"
+            );
+            let s = signals_at(1003.0);
+            r.perform_with_pressure(&step.actions[0], &s, s.wall, &mut || Some(s));
+            let said = events(&mut r, &dir);
+            assert_eq!(sleeper.0.try_wait().unwrap().is_some(), overdue, "{said}");
+            if !overdue {
+                assert!(
+                    said.contains("measured pressure cleared during SIGTERM grace"),
+                    "{said}"
+                );
+                assert!(sleeper.settles(false));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// Nothing is logged until the whole tick's signals are out: after the actions are
