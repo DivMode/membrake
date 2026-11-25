@@ -924,7 +924,12 @@ fn a_blocked_event_log_does_not_stop_the_brake() {
     let mine = marker();
     let mut first = Group::spawn(&mine, 1);
     let mut second = Group::spawn(&mine, 3);
-    assert!(second.footprint() > first.footprint());
+    // Freshly spawned members may not have started yet.
+    wait_until(
+        "the three-member group to outweigh the one-member group",
+        10,
+        || second.footprint() > first.footprint(),
+    );
     let mut script = Script::new(&dir);
     let daemon = Daemon::simulate(&script.path, &only(&mine), &state, &log);
 
