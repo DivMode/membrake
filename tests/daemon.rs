@@ -1854,7 +1854,9 @@ fn queue_a_simulated_daemon_admits_and_completes_500_concurrent_clients() {
                             "unexpected GO for client {i}"
                         );
                         *went = true;
-                        stream.write_all(b"DONE\t0\n").unwrap();
+                        // As `membrake exec` reports it: exit code, elapsed ms, CPU ns and
+                        // peak bytes, so the burst's command is learned as small after one run.
+                        stream.write_all(b"DONE\t0\t5\t1000000\t1048576\n").unwrap();
                     }
                     _ => panic!("client {i}: {line}"),
                 }
@@ -1867,9 +1869,16 @@ fn queue_a_simulated_daemon_admits_and_completes_500_concurrent_clients() {
     };
     wait_until("500 requests queued at once", 20, || read(false) == 500);
     script.calm(8);
-    wait_until("500 go-aheads and completed requests", 25, || {
-        read(true) == 500
-    });
+    // A learned one-core job starts while committed cores are below the budget (80% of
+    // this host's cores), so a small CI runner completes the burst in more rounds.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u64);
+    let at_once = (cores * 8).div_ceil(10).max(1);
+    let rounds = 500u64.div_ceil(at_once);
+    wait_until(
+        "500 go-aheads and completed requests",
+        10 + rounds / 5,
+        || read(true) == 500,
+    );
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
 }
