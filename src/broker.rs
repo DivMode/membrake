@@ -64,8 +64,9 @@ const LISTEN_BACKLOG: libc::c_int = 1024;
 /// loop from the clients it already has.
 const ACCEPTS_PER_PASS: usize = 16;
 /// Notes from the socket thread that wait for the next tick. Past this they are dropped and
-/// counted.
-const MAX_NOTES: usize = 256;
+/// counted. A burst of thousands of simultaneous launches writes a note each within one
+/// tick (#31); each note is a short line, so this bounds the backlog to a few megabytes.
+const MAX_NOTES: usize = 16_384;
 /// File writes that may wait for the thread that does them. Past this they are dropped.
 const FILE_QUEUE: usize = 8;
 /// How long dropping the broker waits for its files to be tidied.
@@ -145,6 +146,12 @@ impl Core {
         let released = self.sched.release(id)?;
         let table = match &released {
             Released::Running(r) => {
+                // A failed first run gives the next sibling a turn to establish the profile.
+                if exit.is_some_and(|code| code != 0)
+                    && !self.sizes.demand(&r.signature).has_profile()
+                {
+                    return Some((released, None));
+                }
                 let completion = completion.filter(|_| exit == Some(0));
                 let cpu = if exit == Some(0) {
                     r.measured_cpu().or_else(|| {
@@ -662,8 +669,8 @@ impl Drop for Broker {
 // The status file
 
 /// The status file, in text. One header line, then one line per fact:
-/// `daemon`, `ram`, `cap` and `used` (bytes), `wait` rows in the order the requests will be
-/// admitted (position, session, wall-clock seconds when it asked, need, reason, label) and `run` rows
+/// `daemon`, `ram`, `cap` and `used` (bytes), `wait` rows in request order
+/// (position, session, wall-clock seconds when it asked, need, reason, label) and `run` rows
 /// (session, wall-clock seconds when it was admitted, process group or 0, peak, label).
 fn render(view: &Snapshot, out: &mut String) {
     let _ = writeln!(
@@ -1677,6 +1684,102 @@ mod tests {
         Arc::make_mut(&mut core.sizes).record_usage("sig", crate::queue::GIB, Some(1000), None);
     }
 
+    #[test]
+    fn one_cold_request_per_signature_runs_until_done_teaches_its_siblings() {
+        let (mut broker, socket, dir) = broker("cold-siblings", false);
+        lock(&broker.core).sched = Scheduler::with_cpu_budget(24_000);
+        let mut siblings: Vec<_> = (0..10)
+            .map(|i| {
+                let mut client = Client::connect(&socket);
+                client.request(&format!("sibling-{i}"));
+                assert!(client.next().starts_with("QUEUED\t"));
+                client
+            })
+            .collect();
+        let mut other = Client::connect(&socket);
+        other.send("REQUEST\tv1\tother\tother-signature\n");
+        assert!(other.next().starts_with("QUEUED\t"));
+
+        broker.tick(&reading(signals::uptime(), 80), false, false);
+        {
+            let core = lock(&broker.core);
+            let running: Vec<_> = core
+                .sched
+                .running()
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect();
+            assert_eq!(running, ["sibling-0", "other"], "admissions before DONE");
+        }
+        assert_eq!(siblings[0].next(), "GO");
+        assert_eq!(other.next(), "GO");
+        assert!(siblings[1].next().ends_with("\tbehind\tmeasuring"));
+
+        let peak = crate::queue::GIB;
+        siblings[0].send(&format!("DONE\t0\t5\t1000000\t{peak}\n"));
+        for client in &mut siblings[1..] {
+            loop {
+                let reply = client.next();
+                if reply == "GO" {
+                    break;
+                }
+                assert!(reply.starts_with("QUEUED\t"), "{reply}");
+            }
+        }
+        {
+            let core = lock(&broker.core);
+            assert_eq!(core.sizes.get("sig"), Some(peak));
+            assert!(core.sched.waiting().is_empty());
+            let view = &mut Snapshot::default();
+            core.sched.snapshot(&|sig| core.sizes.demand(sig), view);
+            let learned: Vec<_> = view
+                .running
+                .iter()
+                .filter(|r| r.label.starts_with("sibling-"))
+                .collect();
+            assert_eq!(learned.len(), 9);
+            assert!(learned.iter().all(|r| r.need == peak + peak / 4));
+        }
+        drop(broker);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_cold_run_or_disconnect_without_usage_lets_the_next_sibling_measure() {
+        let (mut broker, socket, dir) = broker("cold-retry", false);
+        lock(&broker.core).sched = Scheduler::with_cpu_budget(8_000);
+        let now = signals::uptime();
+        broker.tick(&reading(now, 80), false, false);
+
+        let mut first = Client::connect(&socket);
+        first.request("first");
+        assert_eq!(first.next(), "GO");
+        let mut second = Client::connect(&socket);
+        second.request("second");
+        assert!(second.next().ends_with("\tbehind\tmeasuring"));
+        let mut third = Client::connect(&socket);
+        third.request("third");
+        assert!(third.next().ends_with("\tbehind\tmeasuring"));
+
+        {
+            let mut core = lock(&broker.core);
+            let id = core.sched.running()[0].id;
+            core.sched.observe(id, crate::queue::GIB, now);
+        }
+        first.send("DONE\t1\n");
+        assert_eq!(second.next(), "GO");
+        assert!(third.next().ends_with("\tbehind\tmeasuring"));
+        drop(second);
+        assert_eq!(third.next(), "GO");
+
+        let core = lock(&broker.core);
+        assert!(!core.sizes.demand("sig").has_profile());
+        assert_eq!(core.sched.running()[0].label, "third");
+        drop(core);
+        drop(broker);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A connection that is closed gives up its place, at any point: the next client moves
     /// up, and the one that left never starts.
     #[test]
@@ -2542,6 +2645,19 @@ mod tests {
             "test must exercise the previous connection limit"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A burst of 2,200 simultaneous launches loses none of its notes in one tick (#31).
+    #[test]
+    fn a_burst_of_launches_keeps_every_note() {
+        let core = test_core();
+        let mut guard = lock(&core);
+        for i in 0..2_200 {
+            guard.note("queue", format!("burst-{i} asks for a turn"));
+        }
+        let mut notes = Vec::new();
+        assert_eq!(guard.take_notes(&mut notes), 0, "nothing dropped");
+        assert_eq!(notes.len(), 2_200);
     }
 
     /// Notes that pile up while the sampling thread is busy are bounded, and the ones dropped

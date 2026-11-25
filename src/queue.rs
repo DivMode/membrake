@@ -25,6 +25,7 @@ const HISTORY: usize = 64;
 const FRESH_SAMPLE_SECONDS: f64 = 2.5;
 const EXCLUSIVE_WAIT_SECONDS: f64 = 600.0;
 const CPU_WINDOW_SECONDS: f64 = 10.0;
+const COLD_MEASUREMENT_SECONDS: f64 = 60.0;
 /// Set the soft admission budget below the machine's logical core count by this share.
 pub const DEFAULT_CPU_HEADROOM_PERCENT: u32 = 20;
 pub(crate) const MILLICORES: u32 = 1000;
@@ -122,6 +123,13 @@ pub struct Waiting {
     pub signature: String,
     /// Wall-clock seconds when it asked.
     pub since: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Estimate {
+    demand: Demand,
+    need: u64,
+    measuring: bool,
 }
 
 /// A command that has been told to start, until it ends.
@@ -280,6 +288,7 @@ pub enum WaitReason {
     Unspecified,
     Tight,
     Frozen,
+    Measuring,
     Cap {
         used: u64,
         reserved: u64,
@@ -300,6 +309,7 @@ impl std::fmt::Display for WaitReason {
             Self::Unspecified => Ok(()),
             Self::Tight => f.write_str("memory is tight"),
             Self::Frozen => f.write_str("a job is frozen"),
+            Self::Measuring => f.write_str("first run of this command is still being measured"),
             Self::Behind => f.write_str("behind another request"),
             Self::Cap {
                 used,
@@ -326,7 +336,7 @@ impl std::fmt::Display for WaitReason {
 #[derive(Default)]
 pub struct Place {
     pub id: Id,
-    /// Counts from 1, in the order the requests will be admitted if nothing changes.
+    /// Counts from 1 in request order.
     pub position: usize,
     pub need: u64,
     pub reason: WaitReason,
@@ -360,7 +370,7 @@ pub struct Snapshot {
     /// 0 before the first reading.
     pub cap: u64,
     pub used: u64,
-    /// In the order they will be admitted if nothing changes.
+    /// In request order.
     pub waiting: Vec<Place>,
     pub running: Vec<Admitted>,
 }
@@ -525,10 +535,42 @@ impl Scheduler {
         }
     }
 
-    fn need(&self, demand: Demand) -> u64 {
-        demand
+    fn estimate(&self, job: &Waiting, learned: &dyn Fn(&str) -> Demand) -> Estimate {
+        let demand = learned(&job.signature);
+        let mut need = demand
             .bytes
-            .map_or_else(|| (4 * GIB).max(self.cap.unwrap_or(0) / 8), with_margin)
+            .map_or_else(|| (4 * GIB).max(self.cap.unwrap_or(0) / 8), with_margin);
+        let mut measuring = false;
+        if !demand.has_profile() {
+            let mut observed_minute = false;
+            let mut peak = 0;
+            for sibling in self.running.iter().filter(|r| r.signature == job.signature) {
+                measuring = true;
+                peak = peak.max(sibling.peak);
+                // Use the last footprint reading's engine time, including for socket-side
+                // admissions between samples.
+                observed_minute |= sibling
+                    .footprint
+                    .is_some_and(|(time, _)| time - sibling.admitted >= COLD_MEASUREMENT_SECONDS);
+            }
+            if observed_minute {
+                measuring = false;
+                need = need.max(with_margin(peak));
+            }
+        }
+        Estimate {
+            demand,
+            need,
+            measuring,
+        }
+    }
+
+    /// Siblings waiting for a profile or a minute of measurement yield their turn.
+    fn next_for_admission(&self, learned: &dyn Fn(&str) -> Demand) -> Option<(usize, Estimate)> {
+        self.waiting.iter().enumerate().find_map(|(at, job)| {
+            let estimate = self.estimate(job, learned);
+            (!estimate.measuring).then_some((at, estimate))
+        })
     }
 
     fn cpu_need(&self, demand: Demand) -> u32 {
@@ -552,7 +594,7 @@ impl Scheduler {
 
     /// Unknown and overdue jobs promise no release. A known completion only creates a
     /// backfill window if the head can start with every still-committed job present.
-    fn earliest_start(&self, head: Demand) -> Option<f64> {
+    fn earliest_start(&self, head_need: u64) -> Option<f64> {
         let mut completions: Vec<_> = self
             .running
             .iter()
@@ -567,15 +609,15 @@ impl Scheduler {
             left -= 1;
             memory = memory.saturating_sub(job.reservation());
             cpu = cpu.saturating_sub(job.cores(self.cpu_budget));
-            if left == 0 || self.fits(self.need(head), memory, cpu) {
+            if left == 0 || self.fits(head_need, memory, cpu) {
                 return Some(end);
             }
         }
         None
     }
 
-    fn exclusive(&self, demand: Demand) -> bool {
-        self.need(demand) >= self.cap.unwrap_or(u64::MAX)
+    fn exclusive(&self, need: u64) -> bool {
+        need >= self.cap.unwrap_or(u64::MAX)
     }
 
     fn exclusive_admission(
@@ -605,13 +647,12 @@ impl Scheduler {
 
     /// Without a completion estimate, assume every incumbent that can coexist with
     /// the head might still be running when it starts. Backfills must also fit now.
-    fn fits_spare(&self, head_id: Id, head: Demand, candidate: Demand) -> bool {
-        let head_memory = self.need(head);
-        let mut memory = head_memory.saturating_add(self.need(candidate));
-        let mut cpu = self.cpu_need(candidate);
+    fn fits_spare(&self, head_id: Id, head_need: u64, candidate: Estimate) -> bool {
+        let mut memory = head_need.saturating_add(candidate.need);
+        let mut cpu = self.cpu_need(candidate.demand);
         for job in self.running.iter().filter(|job| {
             job.backfill_for == Some(head_id)
-                || self.fits(head_memory, job.reservation(), job.cores(self.cpu_budget))
+                || self.fits(head_need, job.reservation(), job.cores(self.cpu_budget))
         }) {
             memory = memory.saturating_add(job.reservation());
             cpu = cpu.saturating_add(job.cores(self.cpu_budget));
@@ -635,19 +676,24 @@ impl Scheduler {
         refit(&mut out.waiting, self.waiting.len());
         let reserved = self.reserved();
         let committed = self.cpu_committed();
+        let mut head_seen = false;
         for (index, (w, place)) in self.waiting.iter().zip(&mut out.waiting).enumerate() {
             let position = index + 1;
             place.id = w.id;
             place.position = position;
-            let demand = learned(&w.signature);
-            place.need = self.need(demand);
-            place.reason = if position > 1 {
+            let estimate = self.estimate(w, learned);
+            place.need = estimate.need;
+            let behind = head_seen;
+            head_seen |= !estimate.measuring;
+            place.reason = if estimate.measuring {
+                WaitReason::Measuring
+            } else if behind {
                 WaitReason::Behind
             } else if self.tight {
                 WaitReason::Tight
             } else if self.frozen {
                 WaitReason::Frozen
-            } else if !self.exclusive(demand)
+            } else if !self.exclusive(estimate.need)
                 && self.exclusive_turn.is_none()
                 && committed >= self.cpu_budget
             {
@@ -727,11 +773,12 @@ impl Scheduler {
             && !s.frozen
             && !self.running.is_empty()
             && now - self.quiet_since >= PROBE_AFTER
-            && self.waiting.first().is_some_and(|head| {
-                let demand = learned(&head.signature);
-                self.cpu_committed() < self.cpu_budget
-                    && !self.fits_memory(self.need(demand), self.reserved())
-            })
+            && self
+                .next_for_admission(learned)
+                .is_some_and(|(_, estimate)| {
+                    self.cpu_committed() < self.cpu_budget
+                        && !self.fits_memory(estimate.need, self.reserved())
+                })
         {
             let max = percent(s.ram, MAX_PERCENT);
             if let Some(cap) = self.cap.as_mut().filter(|cap| **cap < max) {
@@ -759,18 +806,18 @@ impl Scheduler {
         }
         let mut reserved = self.reserved();
         let mut committed = self.cpu_committed();
-        while let Some(head) = self.waiting.first() {
-            let demand = learned(&head.signature);
+        while let Some((head_at, estimate)) = self.next_for_admission(learned) {
+            let head = &self.waiting[head_at];
             self.exclusive_turn = self
                 .exclusive_turn
                 .filter(|(id, _)| *id == head.id)
-                .or_else(|| self.exclusive(demand).then_some((head.id, now)));
+                .or_else(|| self.exclusive(estimate.need).then_some((head.id, now)));
             if self.tight || self.frozen {
                 break;
             }
             let exclusive = match self.exclusive_turn {
                 Some((_, since)) => {
-                    let Some(rule) = self.exclusive_admission(self.need(demand), reserved, since)
+                    let Some(rule) = self.exclusive_admission(estimate.need, reserved, since)
                     else {
                         break;
                     };
@@ -778,37 +825,40 @@ impl Scheduler {
                 }
                 None => None,
             };
-            let fits = |demand: Demand| self.fits(self.need(demand), reserved, committed);
-            let (at, demand, backfill_for) =
-                if self.running.is_empty() || exclusive.is_some() || fits(demand) {
-                    (0, demand, None)
+            let fits = |need| self.fits(need, reserved, committed);
+            let (at, estimate, backfill_for) =
+                if self.running.is_empty() || exclusive.is_some() || fits(estimate.need) {
+                    (head_at, estimate, None)
                 } else {
-                    let start = self.earliest_start(demand);
-                    let Some(backfill) =
-                        self.waiting
-                            .iter()
-                            .enumerate()
-                            .skip(1)
-                            .find_map(|(at, job)| {
-                                let candidate = learned(&job.signature);
-                                if self.exclusive(candidate) || !fits(candidate) {
-                                    return None;
-                                }
-                                let can_backfill = match start {
-                                    Some(start) => candidate.runtime_ms.is_some_and(|ms| {
-                                        let runtime = ms as f64 / 1000.0;
-                                        now + runtime + (runtime * 0.25).max(0.25) <= start
-                                    }),
-                                    None => self.fits_spare(head.id, demand, candidate),
-                                };
-                                can_backfill.then_some((at, candidate, Some(head.id)))
-                            })
+                    let start = self.earliest_start(estimate.need);
+                    let Some(backfill) = self
+                        .waiting
+                        .iter()
+                        .enumerate()
+                        .skip(head_at + 1)
+                        .find_map(|(at, job)| {
+                            let candidate = self.estimate(job, learned);
+                            if candidate.measuring
+                                || self.exclusive(candidate.need)
+                                || !fits(candidate.need)
+                            {
+                                return None;
+                            }
+                            let can_backfill = match start {
+                                Some(start) => candidate.demand.runtime_ms.is_some_and(|ms| {
+                                    let runtime = ms as f64 / 1000.0;
+                                    now + runtime + (runtime * 0.25).max(0.25) <= start
+                                }),
+                                None => self.fits_spare(head.id, estimate.need, candidate),
+                            };
+                            can_backfill.then_some((at, candidate, Some(head.id)))
+                        })
                     else {
                         break;
                     };
                     backfill
                 };
-            let need = self.need(demand);
+            let Estimate { need, demand, .. } = estimate;
             let cpu_need = self.cpu_need(demand);
             let w = self.waiting.remove(at);
             self.running.push(Running {
@@ -1116,6 +1166,66 @@ mod tests {
         assert_eq!(q.reserved(), 2 * default);
         q.observe(first, 8 * GIB, 1.0);
         assert_eq!(q.reserved(), 10 * GIB + default);
+    }
+
+    #[test]
+    fn a_cold_sibling_starts_after_a_minute_of_samples_at_the_observed_peak_reservation() {
+        let mut q = Scheduler::with_cpu_budget(24_000);
+        let learned = |_: &str| Demand::default();
+        let first = ask(&mut q, 1, "watch");
+        assert_eq!(step(&mut q, &calm(0.0), &learned), Some(first));
+        let sibling = ask(&mut q, 2, "watch");
+        let peak = 16 * GIB;
+
+        for t in 0..60 {
+            let time = f64::from(t);
+            q.observe(first, if t == 0 { peak } else { 2 * GIB }, time);
+            assert_eq!(step(&mut q, &calm(time), &learned), None, "at {t} s");
+            if t == 30 {
+                let mut view = Snapshot::default();
+                q.snapshot(&learned, &mut view);
+                assert_eq!(view.waiting[0].reason, WaitReason::Measuring);
+            }
+        }
+
+        let mut out = Vec::new();
+        q.admit_now(60.0, 60.0, &learned, &mut out);
+        assert!(
+            out.is_empty(),
+            "socket time alone does not complete measurement"
+        );
+
+        q.observe(first, 2 * GIB, 60.0);
+        assert_eq!(
+            step(&mut q, &calm(60.0), &learned),
+            Some(sibling),
+            "the first run has been sampled for one minute"
+        );
+        assert_eq!(q.running()[1].need, 20 * GIB, "125% of the 16 GiB peak");
+    }
+
+    #[test]
+    fn backfill_skips_a_cold_sibling_and_starts_another_signature() {
+        let mut q = Scheduler::with_cpu_budget(24_000);
+        let learned = |signature: &str| match signature {
+            "incumbent" => memory(Some(21 * GIB)),
+            "head" => memory(Some(24 * GIB)),
+            _ => Demand::default(),
+        };
+        let first = ask(&mut q, 1, "cold-a");
+        let incumbent = ask(&mut q, 2, "incumbent");
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &learned, &mut out);
+        assert_eq!(out, [first, incumbent]);
+
+        let head = ask(&mut q, 3, "head");
+        let sibling = ask(&mut q, 1, "cold-a");
+        let other = ask(&mut q, 4, "cold-b");
+        // Either cold request fits now and beside the head after the incumbent exits.
+        q.step(&calm(1.0), &learned, &mut out);
+        assert_eq!(out, [other]);
+        assert_eq!(q.waiting()[0].id, head);
+        assert_eq!(q.waiting()[1].id, sibling);
     }
 
     #[test]

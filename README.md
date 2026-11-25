@@ -116,8 +116,13 @@ stateDiagram-v2
    running and logs the abandoned kill.
 
 The first victim class includes unqueued heavy groups and jobs that exceed
-a learned reservation. The brake ranks by excess bytes, using an unqueued
-group's whole footprint. Cold jobs above their default reservation rank next.
+a learned reservation. The brake ranks by excess bytes and counts the full
+group footprint as excess for unqueued groups. Waiting and relaying
+`membrake exec` clients contribute no bytes to the victim ranking or the
+`--min-job-gb` threshold. A group needs a positive footprint to be eligible,
+even with `--min-job-gb 0`.
+The daemon measures admitted command groups in full for their queue reservations.
+Cold jobs above their starting reservation rank next.
 Jobs within their starting reservation are eligible only at the kill tiers
 and rank last, newest first. The samples log records the starting reservations
 so replay uses the same ranking.
@@ -396,9 +401,14 @@ conditions:
   measured memory in use, less the admitted footprints measured with each
   reading. Each running job holds the greater of its starting need and 125%
   of its largest observed footprint for its whole run. An unmeasured command
-  reserves the greater of 4 GiB and one eighth of the cap. Multiple unmeasured
-  commands can start together when their defaults fit. Learned commands
-  reserve 125% of their recent peak.
+  reserves the greater of 4 GiB and one eighth of the cap. For a signature
+  without a profile, siblings wait until the first run records usage or
+  the daemon samples a running sibling at least 60 s after its admission.
+  In the latter case, each new sibling reserves the greater of the cold
+  default and 125% of the largest peak observed among its running siblings.
+  Other signatures can start or backfill when they fit. If the first command
+  fails, or its client disappears without any observed usage, the next
+  sibling can take its turn. Learned commands reserve 125% of their recent peak.
 - CPU budget defaults to 80% of logical cores, with a minimum of one core.
   `--cpu-headroom-percent` sets the budget as a share below the machine's core
   count. A request may start while running jobs commit fewer cores than the
@@ -409,12 +419,13 @@ conditions:
   are capped at the budget. Starting a job can take the total over the budget
   and slow the running jobs.
 
-The oldest request gets a reservation for its earliest estimated start. With
-EASY backfilling, a younger request can start if it fits immediately and its
-learned runtime, plus a margin of 25% or 250 ms (whichever is greater), ends by
-that reservation. Completion is predicted from the current clock. If no
-credible completion gives the head a start time, a backfill must fit the
-current commitments and leave the head's share reserved against other backfills.
+Requests waiting for the first run's measurement yield their turn. The oldest
+remaining request gets a reservation for its earliest estimated start. With EASY backfilling,
+a younger request can start if it fits immediately and its learned runtime,
+plus a margin of 25% or 250 ms (whichever is greater), ends by that reservation.
+Completion is predicted from the current clock. If no credible completion
+gives the head a start time, a backfill must fit the current commitments and
+leave the head's share reserved against other backfills.
 
 A head whose memory need meets or exceeds the current cap holds an exclusive
 turn. It can start on its own when the queue's running list is empty and memory
