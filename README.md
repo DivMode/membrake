@@ -433,8 +433,9 @@ A head whose memory need meets or exceeds the current cap holds an exclusive
 turn. It can start on its own when the queue's running list is empty and memory
 pressure permits a start. It can start beside running jobs when a fresh, calm
 reading shows that background memory plus their reservations plus its own need
-stays below 90% of RAM. After holding the turn for ten minutes it can also
-start on the next fresh, calm reading, regardless of its memory estimate.
+stays below 75% of RAM, the same ceiling as cap probes. After holding the turn
+for ten minutes it can also start on the next fresh, calm reading, regardless
+of its memory estimate.
 The brake still monitors measured pressure. Younger requests wait until the
 exclusive job finishes.
 

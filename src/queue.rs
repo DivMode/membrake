@@ -17,13 +17,12 @@ pub const CAP_WINDOW: f64 = 15.0;
 pub const PROBE_AFTER: f64 = 60.0;
 /// The cap starts here, as a percentage of RAM.
 const START_PERCENT: u64 = 70;
-/// Each probe raises the cap by this, as a percentage of RAM...
+/// Each probe raises the cap by this percentage of RAM.
 const PROBE_PERCENT: u64 = 5;
-/// ...and never above this. Live stress runs (#26) showed probes toward 90% letting two
-/// 38 GB reservations run together on a 96 GB host whose other work sat in swap.
+/// Ceiling for cap probes and reservation-based admission of oversized heads.
+/// Live stress runs (#26) showed a 90% ceiling letting two 38 GB reservations run
+/// together on a 96 GB host whose other work sat in swap.
 const PROBE_MAX_PERCENT: u64 = 75;
-/// An oversized head may start beside others while everything fits under this.
-const MAX_PERCENT: u64 = 90;
 /// Readings kept: more than `CAP_WINDOW` holds at one a second.
 const HISTORY: usize = 64;
 const FRESH_SAMPLE_SECONDS: f64 = 2.5;
@@ -678,7 +677,7 @@ impl Scheduler {
         reserved: u64,
         since: f64,
     ) -> Option<ExclusiveAdmission> {
-        let max = percent(self.ram, MAX_PERCENT);
+        let max = percent(self.ram, PROBE_MAX_PERCENT);
         if self.running.is_empty() {
             Some(ExclusiveAdmission::Alone)
         } else if self.now - self.sample_time > FRESH_SAMPLE_SECONDS {
@@ -1141,7 +1140,7 @@ mod tests {
         assert_eq!(
             step(&mut q, &at(1.0, 88), &learned),
             None,
-            "10 + 25 + 72.5 exceeds 90"
+            "10 + 25 + 72.5 exceeds the 75 GiB ceiling"
         );
         assert_eq!(
             q.waiting().iter().map(|w| w.id).collect::<Vec<_>>(),
@@ -1177,7 +1176,7 @@ mod tests {
         assert_eq!(
             step(&mut q, &calm(606.0), &learned),
             Some(head),
-            "the first fresh calm reading admits the head even though 20 + 72.5 exceeds 90"
+            "the first fresh calm reading admits the head even though 18 + 25 + 72.5 exceeds 75"
         );
         assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
         assert_eq!(
@@ -1195,7 +1194,7 @@ mod tests {
 
     #[test]
     fn review4_oversized_memory_head_can_start_early_when_reservations_fit() {
-        let learned = |name: &str| memory(Some(if name == "head" { 58 } else { 2 } * GIB));
+        let learned = |name: &str| memory(Some(if name == "head" { 56 } else { 2 } * GIB));
         let mut q = Scheduler::with_cpu_capacity(24000, 30000);
         let watch = ask(&mut q, 1, "watch");
         assert_eq!(step(&mut q, &calm(0.0), &learned), Some(watch));
@@ -1203,9 +1202,9 @@ mod tests {
         let head = ask(&mut q, 2, "head");
         q.observe(watch, 2 * GIB, 1.0);
         assert_eq!(
-            step(&mut q, &at(1.0, 85), &learned),
+            step(&mut q, &at(1.0, 96), &learned),
             Some(head),
-            "13 + 2.5 + 72.5 fits under 90"
+            "2 + 2.5 + 70 fits under the 75 GiB ceiling"
         );
         assert_eq!(
             q.running()[1].exclusive,
@@ -1950,9 +1949,9 @@ mod tests {
     fn an_oversized_head_can_start_beside_others_when_pressure_clears() {
         let learned = |s: &str| match s {
             "small" => memory(Some(8 * GIB)),
-            _ => memory(Some(56 * GIB)),
+            _ => memory(Some(47 * GIB)),
         };
-        // 5 GiB in use: 5 + 10 reserved + 70 needed fits under the 90% ceiling.
+        // 5 GiB in use: 5 + 10 reserved + 58.75 needed fits under the 75 GiB ceiling.
         let quiet = |time, occupancy| Sample {
             occupancy,
             ..at(time, 95)
@@ -1985,36 +1984,35 @@ mod tests {
         );
     }
 
-    /// The ten-minute fallback bounds the wait when reservations exceed 90% of RAM.
     #[test]
-    fn an_oversized_head_waits_at_most_ten_minutes_at_freeze_occupancy() {
-        let learned = |s: &str| match s {
-            "small" => memory(Some(8 * GIB)),
-            _ => memory(Some(61 * GIB)),
+    fn two_large_reservations_wait_for_the_fallback_after_the_cap_drops() {
+        let reservation = 383 * GIB / 10;
+        let learned = |_: &str| memory(Some(reservation * 4 / 5));
+        let reading = |time, level| Sample {
+            ram: 96 * GIB,
+            occupancy: 0.75,
+            ..at(time, level)
         };
-        let quiet = |time, occupancy| Sample {
-            occupancy,
-            ..at(time, 95)
-        };
-        let freeze = Policy::default().freeze_occupancy;
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
-        let small = ask(&mut q, 1, "small");
-        assert_eq!(step(&mut q, &quiet(0.0, 0.0), &learned), Some(small));
-        let big = ask(&mut q, 2, "big");
+        let running = ask(&mut q, 1, "build");
+        assert_eq!(step(&mut q, &reading(0.0, 87), &learned), Some(running));
+        assert_eq!(q.running()[0].reservation(), reservation);
+        let head = ask(&mut q, 2, "build");
+        assert_eq!(step(&mut q, &reading(1.0, 35), &learned), None);
+        assert_eq!(q.cap(), Some(3744 * GIB / 100), "the head is now oversized");
+
+        let timeout = 1.0 + EXCLUSIVE_WAIT_SECONDS;
+        // The two 38.3 GiB reservations alone exceed the 72 GiB ceiling.
+        for time in [2.0, 1.0 + PROBE_AFTER, timeout - 1.0] {
+            assert_eq!(
+                step(&mut q, &reading(time, 90), &learned),
+                None,
+                "the head must still be waiting at t = {time}"
+            );
+        }
         assert_eq!(
-            step(&mut q, &quiet(1.0, freeze), &learned),
-            None,
-            "5 used + 10 reserved + 76.25 needed exceeds the 90% ceiling"
-        );
-        let waited = 1.0 + EXCLUSIVE_WAIT_SECONDS;
-        assert_eq!(
-            step(&mut q, &quiet(waited - 1.0, freeze), &learned),
-            None,
-            "still inside the ten minutes"
-        );
-        assert_eq!(
-            step(&mut q, &quiet(waited, freeze), &learned),
-            Some(big),
+            step(&mut q, &reading(timeout, 90), &learned),
+            Some(head),
             "the fallback ends the wait"
         );
         assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
