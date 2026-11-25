@@ -14,7 +14,7 @@
 //! being scheduled, so it tells them only while the sampling thread is: a thread whose signals
 //! are unreadable, or that is stuck, does not do the queue's work, and once it has not for the
 //! silence limit (`Core::stalled`) the waiting clients are sent away with an error, which they
-//! take as the queue being unavailable, and so is any that asks, until the work resumes.
+//! retry with backoff. New requests receive the same reply until sampling resumes.
 //!
 //! Neither thread touches a file. `queue.tsv` and `sizes.tsv` are written by a thread of their
 //! own (`spool`), fed through a bounded queue that drops what it cannot take. That thread
@@ -31,27 +31,26 @@
 //!
 //! Trust model: the socket is writable by every local user, so any of them may ask for a turn.
 //! That is meant for a Mac with one user. Nothing a client sends can do more than take a place
-//! in the line (its strings are sanitized and bounded, there are at most 64 clients at once,
-//! and a connection beyond that is turned away); admitted groups are only ever measured, never
-//! signalled.
+//! in the line or report its own completion. Strings and protocol lines are bounded.
+//! Process identities are checked before measuring groups.
 
 use crate::jobs::{self, AGENT_CLI, Inspector, Probe, Regex};
-use crate::queue::{Id, Released, Sample, Scheduler, Snapshot, WaitReason};
+use crate::queue::{Id, Released, Reservation, Sample, Scheduler, Snapshot, WaitReason};
 use crate::runner::{age, gb};
 use crate::signals::{self, Signals};
 use crate::sizes::Sizes;
 use crate::spool::Spool;
-use crate::wire::{self, Message, Reply};
+use crate::wire::{self, Completion, Message, Reply};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,8 +58,8 @@ use std::time::{Duration, Instant};
 pub const SIZES_FILE: &str = "sizes.tsv";
 /// What the queue is doing, in the state directory, rewritten when it changes.
 pub const QUEUE_FILE: &str = "queue.tsv";
-/// Clients at once. The daemon has few descriptors to spare and braking needs them more.
-const MAX_CONNECTIONS: usize = 64;
+/// Request a larger backlog for simultaneous launches. XNU caps it at its own limit.
+const LISTEN_BACKLOG: libc::c_int = 1024;
 /// Connections taken in one pass of the socket loop, so that a flood of them cannot keep the
 /// loop from the clients it already has.
 const ACCEPTS_PER_PASS: usize = 16;
@@ -80,7 +79,8 @@ const MAX_OUTPUT: usize = 4 * wire::MAX_LINE;
 pub struct Options {
     pub socket: PathBuf,
     pub state_dir: PathBuf,
-    /// Admit every client at once, log what the queue would have decided, and write no file.
+    /// Admit every client at once and log what the queue would have decided without
+    /// writing queue status or profiles.
     pub dry_run: bool,
 }
 
@@ -98,9 +98,8 @@ struct Core {
     /// Notes that did not fit in `log`.
     lost_notes: u64,
     dry_run: bool,
-    /// When the sampling thread last did the queue's work (see `Broker::tick`): the start,
-    /// until it does. The socket thread keeps clients waiting only while this is recent
-    /// (`stalled`). Monotonic.
+    /// When the sampling thread last did the queue's work (see `Broker::schedule`): the start,
+    /// until it does. The socket thread grants turns only while this is recent. Monotonic.
     scheduled_at: Instant,
 }
 
@@ -108,10 +107,6 @@ fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
     // A panic on the socket thread must not stop the sampling thread.
     core.lock().unwrap_or_else(PoisonError::into_inner)
 }
-
-/// What a client that cannot be kept waiting is told, once the sampling thread has stopped
-/// scheduling; a client takes any error as the queue being unavailable and runs its command.
-const NOT_SCHEDULING: &str = "the queue is not scheduling";
 
 impl Core {
     /// Whether the sampling thread has not done the queue's work for `after`: it is not
@@ -141,14 +136,38 @@ impl Core {
     /// command's peak joins what is known about its signature. Returns what ended, and the
     /// table of sizes if that changed and is to be written. (What to say about it is left to
     /// the caller, who has let go of the core by then.)
-    fn release(&mut self, id: Id) -> Option<(Released, Option<Arc<Sizes>>)> {
+    fn release(
+        &mut self,
+        id: Id,
+        exit: Option<i32>,
+        completion: Option<Completion>,
+    ) -> Option<(Released, Option<Arc<Sizes>>)> {
         let released = self.sched.release(id)?;
         let table = match &released {
-            Released::Running(r) if r.peak > 0 => {
-                Arc::make_mut(&mut self.sizes).record(&r.signature, r.peak);
+            Released::Running(r) => {
+                let completion = completion.filter(|_| exit == Some(0));
+                let cpu = if exit == Some(0) {
+                    r.measured_cpu().or_else(|| {
+                        completion.map(|stats| {
+                            let machine =
+                                std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+                            let cores =
+                                stats.cpu_ns.div_ceil(stats.elapsed_ms.saturating_mul(1000));
+                            cores.min(u64::from(machine) * 1000) as u32
+                        })
+                    })
+                } else {
+                    None
+                };
+                let peak = r.peak.max(completion.map_or(0, |stats| stats.peak_bytes));
+                let runtime = completion.map(|stats| stats.elapsed_ms);
+                if peak == 0 && cpu.is_none() && runtime.is_none() {
+                    return Some((released, None));
+                }
+                Arc::make_mut(&mut self.sizes).record_usage(&r.signature, peak, cpu, runtime);
                 (!self.dry_run).then(|| Arc::clone(&self.sizes))
             }
-            Released::Running(_) | Released::Waiting(_) => None,
+            Released::Waiting(_) => None,
         };
         Some((released, table))
     }
@@ -195,7 +214,7 @@ fn admission_notes(view: &Snapshot, admitted: &[Id], dry_run: bool, out: &mut Ve
             out.push((
                 "queue",
                 format!(
-                    "{}admit {} (session {}) after {}: expects {}, {} in use of a {} cap",
+                    "{}admit {} (session {}) after {}: expects {}, {} in use of a {} cap{}",
                     if dry_run { "dry run, would " } else { "" },
                     job.label,
                     job.session,
@@ -203,6 +222,9 @@ fn admission_notes(view: &Snapshot, admitted: &[Id], dry_run: bool, out: &mut Ve
                     gb(job.need),
                     gb(view.used),
                     gb(view.cap),
+                    job.exclusive.map_or_else(String::new, |rule| {
+                        format!("; exclusive memory turn: {}", rule.reason())
+                    }),
                 ),
             ));
         }
@@ -374,6 +396,10 @@ pub struct Broker {
     core: Arc<Mutex<Core>>,
     stop: Arc<AtomicBool>,
     socket: PathBuf,
+    _pidfile: fs::File,
+    heartbeat: HeartbeatWriter,
+    sampling: Arc<AtomicBool>,
+    sample_started: Instant,
     /// None in a dry run, which writes no file.
     files: Option<Spool<FileWork>>,
     dry_run: bool,
@@ -385,7 +411,8 @@ pub struct Broker {
     /// started.
     groups: Vec<(Id, i32, u64)>,
     /// What this tick measured of them.
-    seen: Vec<(Id, u64)>,
+    seen: Vec<(Id, jobs::GroupUsage)>,
+    reservations: Vec<Reservation>,
     inspector: Inspector,
     /// Where the queue stood at the last tick, copied out of the core.
     view: Snapshot,
@@ -397,9 +424,15 @@ pub struct Broker {
 
 impl Broker {
     /// Loads what was learned, binds the socket and starts the threads that serve it and write
-    /// its files. A failure means no queue: the daemon goes on braking, and clients run at
-    /// once.
+    /// its files. The daemon can keep braking if the queue cannot start.
     pub fn start(opts: Options) -> Result<Broker, String> {
+        Self::start_with_cpu_headroom(opts, crate::queue::DEFAULT_CPU_HEADROOM_PERCENT)
+    }
+
+    pub(crate) fn start_with_cpu_headroom(
+        opts: Options,
+        cpu_headroom_percent: u32,
+    ) -> Result<Broker, String> {
         let mut log = Vec::new();
         let sizes_path = opts.state_dir.join(SIZES_FILE);
         let sizes = match fs::read_to_string(&sizes_path) {
@@ -441,9 +474,12 @@ impl Broker {
                 }
             ),
         ));
+        let pidfile = lock_pidfile(&opts.socket)?;
+        let heartbeat = HeartbeatWriter::open(&opts.socket)?;
         let listener = bind(&opts.socket)?;
+        raise_descriptor_limit();
         let core = Arc::new(Mutex::new(Core {
-            sched: Scheduler::new(),
+            sched: Scheduler::with_cpu_headroom(cpu_headroom_percent),
             sizes: Arc::new(sizes),
             log,
             lost_notes: 0,
@@ -454,22 +490,37 @@ impl Broker {
             .then(|| spawn_files(&opts.state_dir, &core, RETRY_EVERY))
             .transpose()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let sampling = Arc::new(AtomicBool::new(false));
+        let thread_sampling = Arc::clone(&sampling);
         let (thread_core, thread_stop, thread_files) =
             (Arc::clone(&core), Arc::clone(&stop), files.clone());
         thread::Builder::new()
             .name("membrake-queue".into())
-            .spawn(move || serve(&listener, &thread_core, &thread_stop, thread_files))
+            .spawn(move || {
+                serve(
+                    &listener,
+                    &thread_core,
+                    &thread_stop,
+                    &thread_sampling,
+                    thread_files,
+                )
+            })
             .map_err(|e| format!("cannot start the queue thread: {e}"))?;
         Ok(Broker {
             core,
             stop,
             socket: opts.socket,
+            _pidfile: pidfile,
+            heartbeat,
+            sampling,
+            sample_started: Instant::now(),
             files,
             dry_run: opts.dry_run,
             text: String::with_capacity(1024),
             written: String::with_capacity(1024),
             groups: Vec::with_capacity(16),
             seen: Vec::with_capacity(16),
+            reservations: Vec::with_capacity(16),
             inspector: Inspector::new(),
             view: Snapshot::default(),
             admitted: Vec::new(),
@@ -477,28 +528,77 @@ impl Broker {
         })
     }
 
-    /// On how many samples the queue's work was done: the group measuring, the scheduler's
-    /// step, the snapshot. A sample on which the socket thread had the queue does none of it
-    /// and is not counted.
     pub fn scheduled(&self) -> u64 {
         self.scheduled
     }
 
-    /// One sample: measures the admitted groups, decides whether the next request starts, and
-    /// hands the status file to the thread that writes it if it changed. Returns what the
-    /// event log should say. Never waits for the socket thread: if it has the queue, this
-    /// sample's share of the queue's work is left for the next. Allocation-free when nothing
-    /// has changed, whoever is connected.
-    pub fn tick(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
-        let mut notes = Vec::new();
-        // Measured with no lock held: it reads the process table. Only the groups the
-        // clients named and the daemon checked, as the groups they were then.
+    /// Pause socket-side admission immediately. The brake can act before any group
+    /// accounting or queue scheduling.
+    pub(crate) fn begin_sample(&mut self) {
+        self.sampling.store(true, Ordering::Release);
+        self.sample_started = Instant::now();
+        self.reservations.clear();
+        self.heartbeat.publish(signals::uptime());
+    }
+
+    /// Group reads happen outside the scheduler mutex, after pressure actions.
+    pub(crate) fn measure(&mut self, now: f64) {
+        self.groups.clear();
+        {
+            let core = lock(&self.core);
+            self.groups.extend(
+                core.sched
+                    .running()
+                    .iter()
+                    .filter_map(|r| r.pgid.map(|pgid| (r.id, pgid, r.leader_start_us))),
+            );
+        }
         self.seen.clear();
         for &(id, pgid, leader_start_us) in &self.groups {
-            if let Some(bytes) = jobs::group_footprint(&mut self.inspector, pgid, leader_start_us) {
-                self.seen.push((id, bytes));
+            if let Some(usage) = jobs::group_usage(&mut self.inspector, pgid, leader_start_us) {
+                self.seen.push((id, usage));
             }
         }
+        let mut core = lock(&self.core);
+        for (id, usage) in &self.seen {
+            core.sched.observe(*id, usage.bytes, now);
+            if let Some(cpu) = usage.cpu_ns {
+                // Pressure actions can wait through a kill grace before the counters are read.
+                core.sched
+                    .observe_cpu(*id, cpu, usage.stopped, usage.measured_at);
+            }
+        }
+    }
+
+    /// Fetch after scanning candidates so STARTED messages checked during that scan
+    /// also take part in ranking. The returned slice is also what replay records.
+    pub(crate) fn refresh_reservations(&mut self) -> &[Reservation] {
+        let core = lock(&self.core);
+        self.reservations.clear();
+        self.reservations
+            .extend(core.sched.running().iter().filter_map(|r| {
+                Some(Reservation {
+                    pgid: r.pgid?,
+                    start_us: r.leader_start_us,
+                    limit: r.limit(),
+                })
+            }));
+        &self.reservations
+    }
+
+    pub(crate) fn reservations(&self) -> &[Reservation] {
+        &self.reservations
+    }
+
+    pub fn tick(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
+        self.begin_sample();
+        self.measure(s.time);
+        self.schedule(s, tight, frozen)
+    }
+
+    /// Publish this sample's admission conditions after the engine has acted.
+    pub(crate) fn schedule(&mut self, s: &Signals, tight: bool, frozen: bool) -> Vec<Note> {
+        let mut notes = Vec::new();
         let sample = Sample {
             time: s.time,
             // The real clock, whatever drives the samples: it dates what people are shown.
@@ -509,31 +609,19 @@ impl Broker {
             frozen,
         };
         let lost = {
-            let mut guard = match self.core.try_lock() {
-                Ok(guard) => guard,
-                // A panic on the socket thread must not stop the sampling thread.
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => return notes,
-            };
+            let mut guard = lock(&self.core);
             let core = &mut *guard;
-            core.scheduled_at = Instant::now();
+            core.scheduled_at = self.sample_started;
             let lost = core.take_notes(&mut notes);
-            for &(id, bytes) in &self.seen {
-                core.sched.observe(id, bytes, sample.time);
-            }
             let sizes = &core.sizes;
-            let learned = |signature: &str| sizes.get(signature);
-            core.sched.step(&sample, &learned, &mut self.admitted);
-            self.groups.clear();
-            self.groups.extend(
-                core.sched
-                    .running()
-                    .iter()
-                    .filter_map(|r| r.pgid.map(|pgid| (r.id, pgid, r.leader_start_us))),
-            );
+            let learned = |signature: &str| sizes.demand(signature);
+            let now = s.time + self.sample_started.elapsed().as_secs_f64();
+            core.sched
+                .step_at(&sample, now, &learned, &mut self.admitted);
             core.sched.snapshot(&learned, &mut self.view);
             lost
         };
+        self.sampling.store(false, Ordering::Release);
         // From here on the socket thread has the core again.
         self.scheduled += 1;
         if lost > 0 {
@@ -575,12 +663,12 @@ impl Drop for Broker {
 
 /// The status file, in text. One header line, then one line per fact:
 /// `daemon`, `ram`, `cap` and `used` (bytes), `wait` rows in the order the requests will be
-/// admitted (position, session, wall-clock seconds when it asked, need, label) and `run` rows
+/// admitted (position, session, wall-clock seconds when it asked, need, reason, label) and `run` rows
 /// (session, wall-clock seconds when it was admitted, process group or 0, peak, label).
 fn render(view: &Snapshot, out: &mut String) {
     let _ = writeln!(
         out,
-        "queue\tv1\ndaemon\t{}\nram\t{}\ncap\t{}\nused\t{}",
+        "queue\tv2\ndaemon\t{}\nram\t{}\ncap\t{}\nused\t{}",
         std::process::id(),
         view.ram,
         view.cap,
@@ -589,8 +677,8 @@ fn render(view: &Snapshot, out: &mut String) {
     for w in &view.waiting {
         let _ = writeln!(
             out,
-            "wait\t{}\t{}\t{}\t{}\t{}",
-            w.position, w.session, w.since as u64, w.need, w.label
+            "wait\t{}\t{}\t{}\t{}\t{}\t{}",
+            w.position, w.session, w.since as u64, w.need, w.reason, w.label
         );
     }
     for r in &view.running {
@@ -607,6 +695,7 @@ pub struct WaitRow {
     pub session: i32,
     pub since: f64,
     pub need: u64,
+    pub reason: String,
     pub label: String,
 }
 
@@ -631,9 +720,11 @@ pub struct QueueFile {
 impl QueueFile {
     pub fn parse(text: &str) -> Option<QueueFile> {
         let mut lines = text.lines();
-        if lines.next()? != "queue\tv1" {
-            return None;
-        }
+        let has_reason = match lines.next()? {
+            "queue\tv1" => false,
+            "queue\tv2" => true,
+            _ => return None,
+        };
         let mut file = QueueFile {
             daemon: 0,
             ram: 0,
@@ -649,13 +740,21 @@ impl QueueFile {
                 ["ram", v] => file.ram = v.parse().ok()?,
                 ["cap", v] => file.cap = v.parse().ok()?,
                 ["used", v] => file.used = v.parse().ok()?,
-                ["wait", position, session, since, need, label] => file.waiting.push(WaitRow {
-                    position: position.parse().ok()?,
-                    session: session.parse().ok()?,
-                    since: since.parse().ok()?,
-                    need: need.parse().ok()?,
-                    label: label.to_string(),
-                }),
+                ["wait", position, session, since, need, tail] => {
+                    let (reason, label) = if has_reason {
+                        tail.split_once('\t')?
+                    } else {
+                        ("", *tail)
+                    };
+                    file.waiting.push(WaitRow {
+                        position: position.parse().ok()?,
+                        session: session.parse().ok()?,
+                        since: since.parse().ok()?,
+                        need: need.parse().ok()?,
+                        reason: reason.to_string(),
+                        label: label.to_string(),
+                    });
+                }
                 ["run", session, since, pgid, peak, label] => file.running.push(RunRow {
                     session: session.parse().ok()?,
                     since: since.parse().ok()?,
@@ -684,6 +783,152 @@ pub fn read_queue(dir: &Path) -> io::Result<Option<QueueFile>> {
 // ---------------------------------------------------------------------------------------
 // The socket
 
+/// Use the existing hard limit, bounded by the kernel's per-process maximum.
+fn raise_descriptor_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let mut maximum: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&maximum);
+    // SAFETY: valid output buffers, and only this process's soft limit is changed.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0
+            && libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&mut maximum as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+            && maximum > 0
+        {
+            let target = limit.rlim_max.min(maximum as libc::rlim_t);
+            if limit.rlim_cur < target {
+                limit.rlim_cur = target;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    }
+}
+
+fn pidfile_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(".pid");
+    name.into()
+}
+
+fn heartbeat_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(".heartbeat");
+    name.into()
+}
+
+struct HeartbeatWriter {
+    stamp: Arc<AtomicU64>,
+    writer: Spool<()>,
+}
+
+impl HeartbeatWriter {
+    fn open(socket: &Path) -> Result<Self, String> {
+        let path = heartbeat_path(socket);
+        let result = (|| -> io::Result<Self> {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("not a regular file"));
+            }
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+            let initial = signals::uptime().to_bits();
+            file.write_all_at(&initial.to_ne_bytes(), 0)?;
+            let stamp = Arc::new(AtomicU64::new(initial));
+            let latest = Arc::clone(&stamp);
+            let writer = Spool::spawn(
+                "membrake-heartbeat",
+                1,
+                move |()| {
+                    let value = latest.load(Ordering::Acquire);
+                    let _ = file.write_all_at(&value.to_ne_bytes(), 0);
+                },
+                |_| {},
+            )?;
+            Ok(Self { stamp, writer })
+        })();
+        result.map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    fn publish(&self, uptime: f64) {
+        self.stamp.store(uptime.to_bits(), Ordering::Release);
+        let _ = self.writer.try_send(());
+    }
+}
+
+/// Awake uptime of the last sample published by the broker.
+pub(crate) fn heartbeat(socket: &Path) -> Option<f64> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(heartbeat_path(socket))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut stamp = [0u8; 8];
+    file.read_exact_at(&mut stamp, 0).ok()?;
+    let stamp = f64::from_ne_bytes(stamp);
+    (stamp.is_finite() && stamp > 0.0).then_some(stamp)
+}
+
+fn lock_pidfile(socket: &Path) -> Result<fs::File, String> {
+    let path = pidfile_path(socket);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    // SAFETY: file owns the descriptor for the daemon's lifetime.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::WouldBlock {
+            format!("{} is served by another process", socket.display())
+        } else {
+            format!("cannot lock {}: {error}", path.display())
+        });
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .and_then(|_| file.set_len(0))
+        .and_then(|_| writeln!(file, "{}", std::process::id()))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(file)
+}
+
+/// The kernel releases the pidfile lock when its owner exits. No PID lookup can
+/// mistake a restarted or unrelated process for the daemon that owned the socket.
+pub(crate) fn daemon_alive(socket: &Path) -> bool {
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(pidfile_path(socket))
+    else {
+        return false;
+    };
+    // SAFETY: this is a nonblocking shared-lock probe on our own descriptor.
+    file.metadata().is_ok_and(|m| m.is_file())
+        && unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0
+        && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+}
+
 fn bind(path: &Path) -> Result<UnixListener, String> {
     let listener = match UnixListener::bind(path) {
         Ok(listener) => listener,
@@ -709,6 +954,14 @@ fn bind(path: &Path) -> Result<UnixListener, String> {
         }
         Err(e) => return Err(format!("cannot listen on {}: {e}", path.display())),
     };
+    // SAFETY: the listener owns a live, bound Unix socket.
+    if unsafe { libc::listen(listener.as_raw_fd(), LISTEN_BACKLOG) } != 0 {
+        return Err(format!(
+            "cannot set listen backlog on {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
+    }
     // Every local user may ask for a turn (see the trust model above). The umask decides the
     // mode bind gives it, so it is set explicitly.
     fs::set_permissions(path, fs::Permissions::from_mode(0o666))
@@ -856,23 +1109,20 @@ impl Conn {
 /// What the socket thread needs besides the core.
 struct Ctx<'a> {
     core: &'a Mutex<Core>,
+    sampling: &'a AtomicBool,
     agent: Option<Regex>,
     /// None in a dry run, which writes no file.
     files: Option<Spool<FileWork>>,
     dry_run: bool,
     /// A waiting client is told where it stands at least this often.
     keep_alive: Duration,
-    /// Past this long since the sampling thread last did the queue's work (`Core::stalled`),
-    /// waiting clients are sent away instead of being told where they stand, and a client that
-    /// asks is waiting from that moment, so it is too. As long as a client waits in silence
-    /// before it gives up on the daemon: the lines of the socket thread, which can only show
-    /// that it is alive, never hold a client for longer than the silence would have.
+    /// Pause admission once the most recent sample is this old.
     stalled_after: Duration,
 }
 
 impl Ctx<'_> {
     /// One line from a client.
-    fn handle(&self, conn: &mut Conn, line: &str, admitted: &mut Vec<Id>, view: &mut Snapshot) {
+    fn handle(&self, conn: &mut Conn, line: &str) {
         if line.len() > wire::MAX_LINE {
             return conn.refuse("line too long");
         }
@@ -881,7 +1131,14 @@ impl Ctx<'_> {
             Err(why) => return conn.refuse(&why),
         };
         match (message, conn.id) {
-            (Message::Request { label, signature }, None) => {
+            (
+                Message::Request {
+                    label,
+                    signature,
+                    first_attempt_us,
+                },
+                None,
+            ) => {
                 let session = match &self.agent {
                     Some(agent) => jobs::session_of(agent, conn.peer.pid),
                     None => conn.peer.pid,
@@ -895,27 +1152,14 @@ impl Ctx<'_> {
                     "{label} asks for a turn (pid {}, uid {}, session {session})",
                     conn.peer.pid, conn.peer.uid
                 );
+                let now = signals::wall();
+                let wall = first_attempt_us
+                    .filter(|&at| at >= conn.peer.start_us && at <= (now * 1e6) as u64)
+                    .map_or(now, |at| at as f64 / 1e6);
                 let mut guard = lock(self.core);
-                let core = &mut *guard;
-                core.note("queue", text);
-                let wall = signals::wall();
-                conn.id = Some(core.sched.enqueue(session, label, signature, wall));
-                admitted.clear();
-                if !core.stalled(self.stalled_after) {
-                    let learned = |signature: &str| core.sizes.get(signature);
-                    core.sched
-                        .admit_now(signals::uptime(), wall, &learned, admitted);
-                    core.sched.snapshot(&learned, view);
-                }
+                guard.note("queue", text);
+                conn.id = Some(guard.sched.enqueue(session, label, signature, wall));
                 drop(guard);
-                let mut notes = Vec::new();
-                admission_notes(view, admitted, self.dry_run, &mut notes);
-                if !notes.is_empty() {
-                    let mut core = lock(self.core);
-                    for (kind, text) in notes {
-                        core.note(kind, text);
-                    }
-                }
                 if self.dry_run {
                     // A dry run holds nobody: the queue still decides, to be logged, but the
                     // client goes now.
@@ -925,12 +1169,13 @@ impl Ctx<'_> {
             (Message::Request { .. }, Some(_)) => conn.refuse("a connection asks once"),
             (Message::Started(pgid), Some(id)) => self.started(conn, id, pgid),
             (Message::Started(_), None) => conn.refuse("started before a request"),
-            (Message::Done(code), Some(id)) => {
+            (Message::Done(code, completion), Some(id)) if conn.go_at.is_some() => {
                 conn.id = None;
-                self.release(id, Some(code));
+                self.release(id, Some(code), completion);
                 conn.closing = true;
             }
-            (Message::Done(_), None) => conn.refuse("done before a request"),
+            (Message::Done(..), None) => conn.refuse("done before a request"),
+            (Message::Done(..), Some(_)) => conn.refuse("done before the go-ahead"),
         }
     }
 
@@ -948,7 +1193,12 @@ impl Ctx<'_> {
         let Some(go_at) = conn.go_at else {
             return conn.refuse("started before the go-ahead");
         };
-        let leader = match jobs::probe(pgid) {
+        let leader = match jobs::probe_including_exited(pgid) {
+            // The child may already be reaped. DONE still carries the client's own usage.
+            Probe::Gone if pgid > 1 => {
+                conn.started = true;
+                return;
+            }
             Probe::Found(l)
                 if pgid > 1
                     && l.pgid == pgid
@@ -966,8 +1216,8 @@ impl Ctx<'_> {
     }
 
     /// The request ends; hands the sizes to the thread that writes them if they changed.
-    fn release(&self, id: Id, exit: Option<i32>) {
-        let ended = lock(self.core).release(id);
+    fn release(&self, id: Id, exit: Option<i32>, completion: Option<Completion>) {
+        let ended = lock(self.core).release(id, exit, completion);
         let Some((released, table)) = ended else {
             return;
         };
@@ -982,29 +1232,40 @@ impl Ctx<'_> {
 
     /// Tells every waiting client where it stands, and every admitted one to go; if the
     /// sampling thread has stopped scheduling, sends the waiting ones away instead.
-    fn deliver(&self, conns: &mut [Conn], view: &mut Snapshot) {
+    fn deliver(&self, conns: &mut [Conn], view: &mut Snapshot, admitted: &mut Vec<Id>) {
         if conns.iter().all(|c| c.id.is_none()) {
             return;
         }
-        let stalled = {
-            let core = lock(self.core);
-            core.sched
-                .snapshot(&|signature| core.sizes.get(signature), view);
-            core.stalled(self.stalled_after)
-        };
+        {
+            let mut guard = lock(self.core);
+            let core = &mut *guard;
+            let learned = |signature: &str| core.sizes.demand(signature);
+            admitted.clear();
+            if !core.stalled(self.stalled_after) && !self.sampling.load(Ordering::Acquire) {
+                let now = core.sched.sample_time() + core.scheduled_at.elapsed().as_secs_f64();
+                core.sched
+                    .admit_now(now, signals::wall(), &learned, admitted);
+            }
+            core.sched.snapshot(&learned, view);
+        }
+        if !admitted.is_empty() {
+            let mut notes = Vec::new();
+            admission_notes(view, admitted, self.dry_run, &mut notes);
+            let mut core = lock(self.core);
+            for (kind, text) in notes {
+                core.note(kind, text);
+            }
+        }
         for conn in conns.iter_mut() {
             let Some(id) = conn.id.filter(|_| !conn.closing && !conn.dead) else {
                 continue;
             };
             if let Some(w) = view.waiting.iter().find(|w| w.id == id) {
                 let standing = (w.position, w.need, w.reason);
-                if stalled {
-                    conn.refuse(NOT_SCHEDULING);
-                } else if !self.dry_run
+                if !self.dry_run
                     && (conn.told != Some(standing) || conn.told_at.elapsed() >= self.keep_alive)
                 {
-                    // Said again when nothing changed: a client that hears nothing for a
-                    // while takes the daemon to be gone and runs its command.
+                    // A healthy scheduler sends keep-alives even when everything is waiting.
                     conn.told = Some(standing);
                     conn.told_at = Instant::now();
                     conn.say(&Reply::Queued {
@@ -1029,18 +1290,20 @@ fn serve(
     listener: &UnixListener,
     core: &Mutex<Core>,
     stop: &AtomicBool,
+    sampling: &AtomicBool,
     files: Option<Spool<FileWork>>,
 ) {
     crate::act::block_shutdown_signals();
     let dry_run = lock(core).dry_run;
     let ctx = Ctx {
         core,
+        sampling,
         // Without the regex every session is the client's own pid: no turns, but it works.
         agent: Regex::new(AGENT_CLI).ok(),
         files,
         dry_run,
         keep_alive: wire::timing().keep_alive,
-        stalled_after: wire::timing().silence,
+        stalled_after: wire::timing().silence.min(Duration::from_secs(15)),
     };
     let mut conns: Vec<Conn> = Vec::new();
     let mut view = Snapshot::default();
@@ -1088,7 +1351,7 @@ fn serve(
             while !conn.closing
                 && let Some(line) = wire::take_line(&mut conn.input)
             {
-                ctx.handle(conn, &line, &mut admitted, &mut view);
+                ctx.handle(conn, &line);
             }
             if conn.closing {
                 // Told to go away: whatever more it sends is not read.
@@ -1098,7 +1361,7 @@ fn serve(
                 conn.input.clear();
             }
         }
-        ctx.deliver(&mut conns, &mut view);
+        ctx.deliver(&mut conns, &mut view, &mut admitted);
         for conn in &mut conns {
             conn.flush();
         }
@@ -1106,25 +1369,14 @@ fn serve(
             if conn.dead
                 && let Some(id) = conn.id.take()
             {
-                ctx.release(id, None);
+                ctx.release(id, None, None);
             }
             !conn.dead
         });
     }
 }
 
-/// Says the queue is full, once, and hangs up. Never waits: the line fits in the empty socket
-/// buffer of a connection that has only just been made.
-fn turn_away(stream: UnixStream) {
-    if stream.set_nonblocking(true).is_ok() {
-        let _ = (&stream).write(Reply::Error("too many clients".into()).line().as_bytes());
-    }
-}
-
-/// Takes the connections that are waiting, at most `ACCEPTS_PER_PASS` of them: the clients
-/// already here are served between passes, however many more arrive. Past `MAX_CONNECTIONS`
-/// a connection is turned away with an error, which a client takes as the queue being
-/// unavailable and runs its command at once.
+/// Takes a batch of waiting connections so existing clients are served between accepts.
 fn accept_some(
     listener: &UnixListener,
     conns: &mut Vec<Conn>,
@@ -1134,10 +1386,6 @@ fn accept_some(
     for _ in 0..ACCEPTS_PER_PASS {
         match listener.accept() {
             Ok((stream, _)) => {
-                if conns.len() >= MAX_CONNECTIONS {
-                    turn_away(stream);
-                    continue;
-                }
                 // A client the kernel cannot identify is not served.
                 let Ok(peer) = Peer::of(&stream) else {
                     continue;
@@ -1334,7 +1582,7 @@ mod tests {
         let (mut broker, socket, dir) = broker("grant", false);
         let mut client = Client::connect(&socket);
         client.request("tests");
-        assert_eq!(client.next(), format!("QUEUED\t1\t{}", 1u64 << 30));
+        assert_eq!(client.next(), format!("QUEUED\t1\t{}", 4u64 << 30));
 
         // Tight: no go-ahead however long it waits.
         let mut time = 100.0;
@@ -1365,6 +1613,7 @@ mod tests {
     #[test]
     fn clients_that_fit_get_go_on_arrival_without_another_sample() {
         let (mut broker, socket, dir) = broker("arrival", false);
+        give_test_signature_a_cpu_estimate(&broker);
         broker.tick(&reading(signals::uptime(), 80), false, false);
         assert_eq!(broker.scheduled(), 1);
         let mut first = Client::connect(&socket);
@@ -1397,6 +1646,7 @@ mod tests {
     #[test]
     fn a_sample_admits_and_logs_every_client_that_fits() {
         let (mut broker, socket, dir) = broker("batch", false);
+        give_test_signature_a_cpu_estimate(&broker);
         let mut first = Client::connect(&socket);
         first.request("first");
         assert!(first.next().starts_with("QUEUED\t1\t"));
@@ -1419,6 +1669,12 @@ mod tests {
         }
         drop(broker);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn give_test_signature_a_cpu_estimate(broker: &Broker) {
+        let mut core = lock(&broker.core);
+        core.sched = Scheduler::with_cpu_budget(8000);
+        Arc::make_mut(&mut core.sizes).record_usage("sig", crate::queue::GIB, Some(1000), None);
     }
 
     /// A connection that is closed gives up its place, at any point: the next client moves
@@ -1515,7 +1771,7 @@ mod tests {
         assert_eq!(file.waiting[0].label, "build ?[31mred");
         assert_eq!(
             (file.waiting[0].position, file.waiting[0].need),
-            (1, 1 << 30)
+            (1, (file.cap / 8).max(4 << 30))
         );
         assert_eq!(file.ram, 96 << 30);
         assert_eq!(
@@ -1636,6 +1892,27 @@ mod tests {
         client
     }
 
+    #[test]
+    fn a_completion_is_learned_even_if_the_child_was_reaped_before_started_arrived() {
+        let (mut broker, socket, dir) = broker("reaped-before-started", false);
+        let mut time = 0.0;
+        let mut client = go(&mut broker, &mut time, &socket, "short command");
+        let mut child = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        assert!(child.wait().unwrap().success());
+        client.send(&format!("STARTED\t{pgid}\nDONE\t0\t10\t8000000\t4096\n"));
+        assert!(client.hung_up());
+        let demand = lock(&broker.core).sizes.demand("short command");
+        assert_eq!(
+            (demand.bytes, demand.millicores, demand.runtime_ms),
+            (Some(4096), Some(800), Some(10))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The group of a command the client started is accepted, once. A group that is not a
     /// command of this client's is an error and a hung-up connection, and nothing is learned
     /// about it, whichever way it fails to be one: it started before the go-ahead, it is a
@@ -1735,10 +2012,14 @@ mod tests {
         status_until(&mut broker, &mut time, &dir, 80, |f| {
             f.running.first().is_some_and(|r| r.pgid > 1 && r.peak > 0)
         });
-        honest.send("DONE\t0\n");
         let core = Arc::clone(&broker.core);
         tick_until(&mut broker, &mut time, 80, || {
-            lock(&core).sizes.get("sig").is_some()
+            lock(&core).sched.running()[0].measured_cpu().is_some()
+        });
+        honest.send("DONE\t0\n");
+        tick_until(&mut broker, &mut time, 80, || {
+            let demand = lock(&core).sizes.demand("sig");
+            demand.bytes.is_some() && demand.millicores.is_some()
         });
 
         let mut liar = Client::connect(&socket);
@@ -1800,7 +2081,11 @@ mod tests {
                 tight: false,
                 frozen: false,
             };
-            core.sched.step(&sample, &|_| None, &mut Vec::new());
+            core.sched.step(
+                &sample,
+                &|_| crate::sizes::Demand::default(),
+                &mut Vec::new(),
+            );
             assert_eq!(core.sched.running().len(), 1, "admitted");
             id
         };
@@ -1808,6 +2093,7 @@ mod tests {
         let command = Sleeping::spawn();
         let ctx = Ctx {
             core: &core,
+            sampling: &AtomicBool::new(false),
             agent: None,
             files: None,
             dry_run: false,
@@ -1851,37 +2137,77 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // The sampling thread never waits for the socket thread.
-
-    /// The core is held, as the socket thread holds it while it works: the tick returns at
-    /// once and leaves the queue's work for the next sample, which does it.
+    // Reservation identity must be refreshed before an emergency uses a sample.
     #[test]
-    fn a_tick_does_not_wait_for_a_core_that_is_held() {
-        let (mut broker, socket, dir) = broker("held", false);
-        let mut client = Client::connect(&socket);
-        client.request("tests");
-        assert!(client.next().starts_with("QUEUED"));
+    fn a_contended_sample_uses_the_newly_verified_victim_reservations() {
+        use crate::engine::{Action, Engine, Policy};
+        use crate::jobs::Job;
+        use crate::queue::GIB;
 
-        let held = Arc::clone(&broker.core);
-        let guard = lock(&held);
-        let (done, answer) = mpsc::channel();
-        let ticking = thread::spawn(move || {
-            let notes = broker.tick(&reading(700.0, 80), false, false);
-            done.send(()).unwrap();
-            (broker, notes)
+        let (mut broker, _socket, dir) = broker("held", false);
+        let core = Arc::clone(&broker.core);
+        let mut guard = lock(&core);
+        let runaway = guard.sched.enqueue(1, "build".into(), "build".into(), 0.0);
+        let healthy = guard.sched.enqueue(2, "lint".into(), "lint".into(), 0.0);
+        guard.sched.step(
+            &Sample {
+                time: 1.0,
+                wall: 1.0,
+                ram: 96 * GIB,
+                level: 80,
+                tight: false,
+                frozen: false,
+            },
+            &|sig| crate::sizes::Demand {
+                bytes: Some(if sig == "build" { 4 * GIB } else { 12 * GIB }),
+                ..crate::sizes::Demand::default()
+            },
+            &mut Vec::new(),
+        );
+        let build = Sleeping::spawn();
+        let lint = Sleeping::spawn();
+        let identity = |pid| jobs::bsd_info(pid).unwrap().start_us;
+        let mut candidates = Vec::new();
+        for (id, pgid, bytes) in [
+            (runaway, build.pgid(), 6 * GIB),
+            (healthy, lint.pgid(), 8 * GIB),
+        ] {
+            let start_us = identity(pgid);
+            assert!(guard.sched.started(id, pgid, start_us));
+            candidates.push(Job {
+                pgid,
+                leader_pid: pgid,
+                start_us,
+                uid: 501,
+                bytes,
+                procs: 1,
+                prefer: false,
+                protected: false,
+                stopped: false,
+                command: String::new(),
+            });
+        }
+        let (started, ready) = mpsc::channel();
+        let (returned, answer) = mpsc::channel();
+        let sampler = thread::spawn(move || {
+            started.send(()).unwrap();
+            broker.measure(2.0);
+            let mut e = Engine::new(Policy::default());
+            let mut s = reading(2.0, 35);
+            s.segments = 0.93;
+            let step = e.step_with_candidates(&s, || (candidates, broker.refresh_reservations()));
+            returned.send(step.actions).unwrap();
         });
-        let in_time = answer.recv_timeout(Duration::from_secs(3)).is_ok();
+        ready.recv().unwrap();
+        let early = answer.recv_timeout(Duration::from_millis(100));
         drop(guard);
-        assert!(in_time, "the tick waited for the core");
-        let (mut broker, notes) = ticking.join().unwrap();
-        assert!(notes.is_empty(), "{notes:?}");
-        assert!(client.line(Duration::from_millis(300)).is_none());
-
-        // The next sample does what the held one left.
-        let mut time = 700.0;
-        tick_until(&mut broker, &mut time, 80, || {
-            client.line(Duration::from_millis(20)).as_deref() == Some("GO")
-        });
+        let actions =
+            early.unwrap_or_else(|_| answer.recv_timeout(Duration::from_secs(5)).unwrap());
+        sampler.join().unwrap();
+        assert!(
+            matches!(actions.as_slice(), [Action::Kill { job, .. }] if job.pgid == build.pgid()),
+            "{actions:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1890,37 +2216,69 @@ mod tests {
         wire::timing().silence + Duration::from_secs(1)
     }
 
-    /// The lines of the socket thread show that it is alive, not that anything is scheduled.
-    /// Once the sampling thread has not done the queue's work for the silence limit (its
-    /// signals unreadable, or stuck in a file), a waiting client is sent away with an error
-    /// (which it takes as the queue being unavailable and runs its command) instead of being
-    /// told its place for ever, and so is one that asks; when sampling resumes the queue
-    /// serves clients again.
     #[test]
-    fn clients_are_sent_away_while_the_sampling_thread_is_not_scheduling() {
+    fn stalled_sampling_keeps_waiting_clients_in_order_until_readings_return() {
         let (mut broker, socket, dir) = broker("stalled", false);
         let core = Arc::clone(&broker.core);
-        let mut waiting = Client::connect(&socket);
-        waiting.request("first");
-        assert!(waiting.next().starts_with("QUEUED\t1\t"));
         let mut time = 1000.0;
         tick_n(&mut broker, &mut time, 35, 3);
-
-        // The sampling thread stops: its last tick is older than the limit.
+        let mut old = Client::connect(&socket);
+        old.request("first");
+        assert!(old.next().starts_with("QUEUED\t1\t"));
         lock(&core).scheduled_at = Instant::now().checked_sub(past_the_silence()).unwrap();
-        assert_eq!(waiting.next(), "ERROR\tthe queue is not scheduling");
-        assert!(waiting.hung_up());
         let mut late = Client::connect(&socket);
         late.request("second");
-        assert_eq!(late.next(), "ERROR\tthe queue is not scheduling");
-        assert!(late.hung_up());
+        assert!(late.next().starts_with("QUEUED\t2\t"));
+        tick_until(&mut broker, &mut time, 80, || {
+            old.line(Duration::from_millis(50)).as_deref() == Some("GO")
+        });
+        old.send("DONE\t0\n");
+        tick_until(&mut broker, &mut time, 80, || {
+            late.line(Duration::from_millis(50)).as_deref() == Some("GO")
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        // Sampling resumes, and a client that asks is served.
-        let silence = wire::timing().silence;
-        tick_until(&mut broker, &mut time, 80, || !lock(&core).stalled(silence));
-        let mut again = Client::connect(&socket);
-        again.request("third");
-        assert_eq!(again.next(), "GO");
+    #[test]
+    fn review3_socket_backfill_uses_elapsed_time_since_the_sample() {
+        let (broker, socket, dir) = broker("socket-clock", false);
+        {
+            let mut core = lock(&broker.core);
+            core.sched = Scheduler::with_cpu_budget(4000);
+            let sizes = Arc::make_mut(&mut core.sizes);
+            for (name, gib, cpu, runtime) in [
+                ("watch", 8, 2000, None),
+                ("blocker", 16, 1000, Some(10_000)),
+                ("head", 24, 2000, None),
+                ("late", 1, 1000, Some(500)),
+            ] {
+                sizes.record_usage(name, gib << 30, Some(cpu), runtime);
+            }
+            core.sched.enqueue(1, "watch".into(), "watch".into(), 1.0);
+            core.sched
+                .enqueue(1, "blocker".into(), "blocker".into(), 1.0);
+            let sizes = Arc::clone(&core.sizes);
+            core.sched.step(
+                &Sample {
+                    time: 10.0,
+                    wall: 1.0,
+                    ram: 96 << 30,
+                    level: 80,
+                    tight: false,
+                    frozen: false,
+                },
+                &|name| sizes.demand(name),
+                &mut Vec::new(),
+            );
+            core.sched.enqueue(1, "head".into(), "head".into(), 1.0);
+            // At 19.8, a 500 ms job cannot finish by the head's promised 20.0 start.
+            core.scheduled_at = Instant::now()
+                .checked_sub(Duration::from_millis(9800))
+                .unwrap();
+        }
+        let mut client = Client::connect(&socket);
+        client.send("REQUEST\tv1\tlate\tlate\n");
+        assert!(client.next().starts_with("QUEUED\t2\t"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2134,30 +2492,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A connection beyond the 64th is told so and hung up on, not silently dropped, and does
-    /// not take a place: the ones that are served stay served.
+    /// A connection beyond the former 64-client limit is accepted like the others.
     #[test]
-    fn connections_past_the_limit_are_turned_away_with_an_error() {
+    fn connections_past_the_old_limit_are_accepted() {
         let dir = scratch("limit");
         fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("q.sock");
         let listener = bind(&socket).unwrap();
         let (core, mut conns, mut failed) = (test_core(), Vec::new(), false);
-        let held: Vec<UnixStream> = (0..MAX_CONNECTIONS)
+        let held: Vec<UnixStream> = (0..65)
             .map(|_| UnixStream::connect(&socket).unwrap())
             .collect();
-        while conns.len() < MAX_CONNECTIONS {
+        for _ in 0..5 {
             accept_some(&listener, &mut conns, &core, &mut failed);
         }
-        let mut extra = UnixStream::connect(&socket).unwrap();
-        extra
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        accept_some(&listener, &mut conns, &core, &mut failed);
-        assert_eq!(conns.len(), MAX_CONNECTIONS, "no place for it");
-        let mut said = String::new();
-        extra.read_to_string(&mut said).unwrap();
-        assert_eq!(said, "ERROR\ttoo many clients\n");
+        assert_eq!(conns.len(), 65);
         drop(held);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2188,19 +2537,10 @@ mod tests {
         });
         assert_eq!(go.as_deref(), Some("GO"));
         let flood = flooding.join().unwrap();
-        // The ones the daemon could not take are told so, not left to wait for ever.
-        for c in &flood {
-            c.set_nonblocking(true).unwrap();
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !flood.iter().any(|mut c| {
-            let mut line = [0u8; 64];
-            c.read(&mut line)
-                .is_ok_and(|n| line[..n].starts_with(b"ERROR\ttoo many clients"))
-        }) {
-            assert!(Instant::now() < deadline, "no connection was turned away");
-            thread::sleep(Duration::from_millis(20));
-        }
+        assert!(
+            flood.len() > 64,
+            "test must exercise the previous connection limit"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

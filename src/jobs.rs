@@ -388,7 +388,7 @@ fn failure<T>(what: &str) -> Probe<T> {
     }
 }
 
-fn bsd_info_raw(pid: i32) -> Probe<libc::proc_bsdinfo> {
+fn bsd_info_raw(pid: i32, include_exited: bool) -> Probe<libc::proc_bsdinfo> {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
     clear_errno();
@@ -397,7 +397,7 @@ fn bsd_info_raw(pid: i32) -> Probe<libc::proc_bsdinfo> {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            u64::from(include_exited),
             info.as_mut_ptr().cast(),
             size,
         )
@@ -424,11 +424,17 @@ fn seen_from(pid: i32, info: &libc::proc_bsdinfo) -> Seen {
 
 /// Reads one process. Allocation-free.
 pub fn probe(pid: i32) -> Probe<Seen> {
-    bsd_info_raw(pid).map(|info| seen_from(pid, &info))
+    bsd_info_raw(pid, false).map(|info| seen_from(pid, &info))
+}
+
+/// A verified child can finish before STARTED reaches the broker. XNU's BSD-info flavor
+/// checks the zombie table too when its argument is nonzero.
+pub(crate) fn probe_including_exited(pid: i32) -> Probe<Seen> {
+    bsd_info_raw(pid, true).map(|info| seen_from(pid, &info))
 }
 
 fn probe_proc(pid: i32) -> Probe<Proc> {
-    bsd_info_raw(pid).map(|info| {
+    bsd_info_raw(pid, false).map(|info| {
         let name = match c_chars(&info.pbi_name) {
             n if n.is_empty() => c_chars(&info.pbi_comm),
             n => n,
@@ -475,14 +481,18 @@ pub fn list_pids() -> Vec<i32> {
 
 /// `ri_phys_footprint`, or 0 for a process we may not inspect.
 pub fn footprint(pid: i32) -> u64 {
+    usage(pid).map_or(0, |ri| ri.ri_phys_footprint)
+}
+
+fn usage(pid: i32) -> Option<libc::rusage_info_v2> {
     let mut ri = MaybeUninit::<libc::rusage_info_v2>::zeroed();
     // SAFETY: the buffer is a zeroed rusage_info_v2, the flavor that matches it.
     let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, ri.as_mut_ptr().cast()) };
     if rc != 0 {
-        return 0;
+        return None;
     }
     // SAFETY: the kernel filled the struct.
-    unsafe { ri.assume_init() }.ri_phys_footprint
+    Some(unsafe { ri.assume_init() })
 }
 
 fn exe_path(pid: i32) -> Probe<String> {
@@ -588,6 +598,7 @@ pub enum Look {
 pub struct Inspector {
     pids: Vec<i32>,
     members: Vec<Seen>,
+    usage: Vec<Option<libc::rusage_info_v2>>,
 }
 
 impl Default for Inspector {
@@ -601,6 +612,7 @@ impl Inspector {
         Inspector {
             pids: vec![0; 1024],
             members: Vec::with_capacity(64),
+            usage: Vec::new(),
         }
     }
 
@@ -851,17 +863,74 @@ pub fn session_of(agent: &Regex, pid: i32) -> i32 {
     client.ppid
 }
 
-/// The summed footprint of the live members of group `pgid`, or None if it is gone or the
+pub(crate) struct GroupUsage {
+    pub bytes: u64,
+    pub cpu_ns: Option<u64>,
+    pub measured_at: f64,
+    pub stopped: bool,
+}
+
+fn cpu_nanos(ri: &libc::rusage_info_v2) -> u64 {
+    ri.ri_user_time + ri.ri_system_time + ri.ri_child_user_time + ri.ri_child_system_time
+}
+
+/// Footprint and cumulative CPU time of group `pgid`, or None if it is gone or the
 /// kernel could not list it, or if its leader is no longer the process that started at
 /// `leader_start_us`: a pgid is only ever measured as the group it was when it was chosen.
 /// Allocation-free once `insp` is warm.
-pub fn group_footprint(insp: &mut Inspector, pgid: i32, leader_start_us: u64) -> Option<u64> {
+pub(crate) fn group_usage(
+    insp: &mut Inspector,
+    pgid: i32,
+    leader_start_us: u64,
+) -> Option<GroupUsage> {
     if !matches!(probe(pgid), Probe::Found(l) if l.start_us == leader_start_us) {
         return None;
     }
-    match insp.look(pgid) {
-        Look::Present => Some(insp.members().iter().map(|m| footprint(m.pid)).sum()),
-        Look::Absent | Look::Unknown(_) => None,
+    if !matches!(insp.look(pgid), Look::Present) {
+        return None;
+    }
+    Some(read_group_usage(
+        &insp.members,
+        &mut insp.usage,
+        usage,
+        |m| {
+            matches!(probe(m.pid), Probe::Found(p)
+            if !p.zombie && p.start_us == m.start_us && p.pgid == pgid)
+        },
+    ))
+}
+
+fn read_group_usage(
+    members: &[Seen],
+    readings: &mut Vec<Option<libc::rusage_info_v2>>,
+    read: impl Fn(i32) -> Option<libc::rusage_info_v2>,
+    still_live: impl Fn(&Seen) -> bool,
+) -> GroupUsage {
+    // Read counters before validating process identities. A member already in a
+    // parent's reaped-child total cannot still be live after the reads. Drop that
+    // member's own contribution without dropping the surviving counters.
+    let mut bytes = 0u64;
+    let mut cpu_ns: Option<u64> = None;
+    let mut stopped = true;
+    readings.clear();
+    readings.extend(members.iter().map(|m| read(m.pid)));
+    let measured_at = crate::signals::uptime();
+    for (m, ri) in members
+        .iter()
+        .zip(readings)
+        .filter_map(|(m, ri)| ri.as_ref().map(|ri| (m, ri)))
+    {
+        if still_live(m) {
+            bytes = bytes.saturating_add(ri.ri_phys_footprint);
+            cpu_ns = Some(cpu_ns.unwrap_or(0).saturating_add(cpu_nanos(ri)));
+            stopped &= m.stopped;
+        }
+    }
+    GroupUsage {
+        bytes,
+        cpu_ns,
+        measured_at,
+        stopped,
     }
 }
 
@@ -878,7 +947,12 @@ pub fn spared(rules: &Rules, pgid: i32) -> Option<String> {
         Read::Facts(group) => {
             let (leader, full) = leader_and_command(pgid, &group)?;
             match rules.classify(pgid, leader.uid, leader.ppid, &group.members, full) {
-                Verdict::Eligible { .. } => None,
+                Verdict::Eligible {
+                    protected: true, ..
+                } => Some("the user's jobs are protected".into()),
+                Verdict::Eligible {
+                    protected: false, ..
+                } => None,
                 Verdict::Ineligible(reason) => Some(reason.text().to_string()),
             }
         }
@@ -911,6 +985,39 @@ pub fn uid_of(name: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_reaped_during_the_reads_cannot_count_twice() {
+        let member = |pid, ppid| Seen {
+            pid,
+            ppid,
+            pgid: 10,
+            uid: 501,
+            start_us: pid as u64,
+            zombie: false,
+            stopped: false,
+        };
+        let group = [member(11, 10), member(10, 1)];
+        let read = |pid| {
+            // The worker was read while alive, then reaped before its parent's read.
+            let mut ri: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+            if pid == 11 {
+                ri.ri_user_time = 8_000_000_000;
+            } else {
+                ri.ri_child_user_time = 8_000_000_000;
+            }
+            Some(ri)
+        };
+        assert_eq!(
+            read_group_usage(&group, &mut Vec::new(), read, |m| m.pid == 10).cpu_ns,
+            Some(8_000_000_000),
+            "retain the parent's counter during worker churn"
+        );
+        assert_eq!(
+            read_group_usage(&group[1..], &mut Vec::new(), read, |_| true).cpu_ns,
+            Some(8_000_000_000)
+        );
+    }
     use crate::testutil::fault;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
@@ -1249,13 +1356,10 @@ mod tests {
         let pid = pid_of(&sleeper);
         let started = bsd_info(pid).unwrap().start_us;
         let mut insp = Inspector::new();
-        assert!(group_footprint(&mut insp, pid, started).is_some());
-        assert!(group_footprint(&mut insp, pid, started + 1).is_none());
-        assert!(group_footprint(&mut insp, pid, started - 1).is_none());
-        assert!(
-            group_footprint(&mut insp, i32::MAX, started).is_none(),
-            "gone"
-        );
+        assert!(group_usage(&mut insp, pid, started).is_some());
+        assert!(group_usage(&mut insp, pid, started + 1).is_none());
+        assert!(group_usage(&mut insp, pid, started - 1).is_none());
+        assert!(group_usage(&mut insp, i32::MAX, started).is_none(), "gone");
     }
 
     #[test]

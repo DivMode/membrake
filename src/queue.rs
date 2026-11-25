@@ -1,44 +1,15 @@
-//! Admission control: which waiting command may start now. A pure function of the memory
-//! readings and the requests, with no I/O, so every rule is tested with synthetic samples (as
-//! `engine` is).
-//!
-//! The design is Buck2's local-action scheduler (`scheduler.rs`, Meta Platforms, Apache-2.0;
-//! see THIRD_PARTY_NOTICES.md): start jobs only when the memory in use, averaged over
-//! the last 5 s, plus what they are expected to need stays under a cap; learn the cap
-//! from the memory in use, averaged over the last 15 s, whenever the machine was under
-//! pressure; and expect `min(1 GiB, cap / 5)` of a job nothing is known about. Buck2 leaves a
-//! cap that was learned too low as a FIXME, and it stays low for good. Here it is probed
-//! upwards: after 60 s without pressure, while a request is held back only by the cap, the cap
-//! rises by 5% of RAM, and no further than 90% of RAM.
-//!
-//! The queue and the freeze engine are one ordered system: nothing is admitted while memory is
-//! tight or while the engine holds a frozen job (Buck2: a new scene waits while anything is
-//! suspended). A command that does fit is started only after the queue has taken the rest of
-//! its rules into account:
-//!
-//! - Requests are served in turns between sessions (an agent and everything it runs): the
-//!   next one is the oldest request of the session with the fewest commands running, so one
-//!   agent's backlog cannot hold up another's single command. Within a session it is first
-//!   come, first served.
-//! - When the next one does not fit, nothing behind it starts.
-//! - Each start reserves its expected need for 10 s, until its memory has had time to enter
-//!   the 5 s average, and after that the part of its need it has not yet been seen to use,
-//!   for as long as it runs: a lint or test run that grows for a minute still holds the
-//!   memory it will reach. All requests that fit with those reservations start in one step.
-//!   Arrivals use the last sample's state to start immediately, without waiting for a sample.
-//! - If no admitted command is running and nothing is frozen, the next one starts even if it
-//!   does not fit, or it would wait for a machine that never gets any quieter. Never while
-//!   memory is tight.
-//! - Waiting clients are told whether memory is tight, a job is frozen, the next request
-//!   exceeds the cap (including reservations), or they are behind that request.
+//! Memory and CPU admission from measured background use and whole-job reservations.
+//! The oldest request has priority. EASY backfill uses learned completion times to
+//! admit smaller requests that can finish before the head needs their resources.
+
+use std::collections::VecDeque;
+
+use crate::sizes::Demand;
 
 /// Memory is counted in bytes; this is the unit of the defaults.
 pub const GIB: u64 = 1 << 30;
 /// Memory in use is averaged over this long when deciding whether a command fits (seconds).
 pub const USED_WINDOW: f64 = 5.0;
-/// Allow five seconds for a start's memory to appear, plus a full window to enter the average.
-/// For this long a start reserves its whole need; afterwards, what its peak has not reached.
-pub const RESERVE: f64 = USED_WINDOW + 5.0;
 /// The cap is learned from the memory in use averaged over this long (seconds).
 pub const CAP_WINDOW: f64 = 15.0;
 /// The cap is probed upwards after this long without pressure (seconds).
@@ -51,8 +22,27 @@ const PROBE_PERCENT: u64 = 5;
 const MAX_PERCENT: u64 = 90;
 /// Readings kept: more than `CAP_WINDOW` holds at one a second.
 const HISTORY: usize = 64;
+const FRESH_SAMPLE_SECONDS: f64 = 2.5;
+const EXCLUSIVE_WAIT_SECONDS: f64 = 600.0;
+const CPU_WINDOW_SECONDS: f64 = 10.0;
+/// Set the soft admission budget below the machine's logical core count by this share.
+pub const DEFAULT_CPU_HEADROOM_PERCENT: u32 = 20;
+pub(crate) const MILLICORES: u32 = 1000;
 
 pub type Id = u64;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Reservation {
+    pub pgid: i32,
+    pub start_us: u64,
+    pub limit: ReservationLimit,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReservationLimit {
+    Learned(u64),
+    Cold(u64),
+}
 
 /// One reading, as the queue sees it.
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +73,7 @@ fn percent(ram: u64, percent: u64) -> u64 {
 }
 
 /// Recent (time, memory in use) readings in a fixed array, so a step never allocates.
+#[derive(Clone, Debug)]
 struct History {
     buf: [(f64, u64); HISTORY],
     len: usize,
@@ -142,12 +133,17 @@ pub struct Running {
     pub signature: String,
     /// Wall-clock seconds when it was admitted.
     pub since: f64,
-    /// Engine seconds when it was admitted, for its memory reservation.
+    /// Engine seconds when it was admitted.
     pub admitted: f64,
     /// How long it waited, seconds.
     pub waited: f64,
-    /// What it was expected to need when it was admitted.
+    /// Reservation at admission, also the limit used to identify unexpected growth.
     pub need: u64,
+    cpu_need: u32,
+    cold: bool,
+    exclusive: Option<ExclusiveAdmission>,
+    backfill_for: Option<Id>,
+    runtime_ms: Option<u64>,
     /// Its process group, once the client has said and the daemon has checked.
     pub pgid: Option<i32>,
     /// When the leader of that group started (microseconds since the epoch): with the pgid,
@@ -155,21 +151,100 @@ pub struct Running {
     pub leader_start_us: u64,
     /// The most memory its group has been seen to use.
     pub peak: u64,
-    /// Engine seconds when `peak` last rose.
-    pub peak_at: f64,
-    /// The highest peak that had been held for a full `USED_WINDOW`, so is in the average.
-    pub shown: u64,
+    footprint: Option<(f64, u64)>,
+    cpu: Cpu,
+}
+
+#[derive(Clone, Debug)]
+struct Cpu {
+    last: Option<(f64, u64, bool)>,
+    peak: Option<u32>,
+    sampled_seconds: f64,
+    /// Candidates for the recent maximum, in time order and decreasing demand.
+    recent: VecDeque<(f64, u32)>,
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Self {
+            last: None,
+            peak: None,
+            sampled_seconds: 0.0,
+            // The live sampler runs once a second. Reserve a full window with room for jitter.
+            recent: VecDeque::with_capacity(16),
+        }
+    }
+}
+
+impl Cpu {
+    fn observe(&mut self, now: f64, nanos: u64, stopped: bool, machine_cpu: u32) {
+        if let Some((then, previous, was_stopped)) = self.last {
+            let elapsed = now - then;
+            if elapsed <= 0.0 {
+                return;
+            }
+            if !stopped && !was_stopped && nanos >= previous {
+                // Age the window only on a running reading: a frozen group keeps its
+                // commitment until it has been measured running again.
+                while self
+                    .recent
+                    .front()
+                    .is_some_and(|&(end, _)| now - end >= CPU_WINDOW_SECONDS)
+                {
+                    self.recent.pop_front();
+                }
+                let used = ((nanos - previous) as f64 / (1e6 * elapsed)).ceil() as u32;
+                let used = used.min(machine_cpu);
+                self.peak = Some(self.peak.unwrap_or(0).max(used));
+                self.sampled_seconds += elapsed;
+                // A newer reading stays in the window longer than any smaller or equal one.
+                while self.recent.back().is_some_and(|&(_, older)| older <= used) {
+                    self.recent.pop_back();
+                }
+                self.recent.push_back((now, used));
+            }
+            self.last = Some((now, nanos.max(previous), stopped));
+        } else {
+            self.last = Some((now, nanos, stopped));
+        }
+    }
+}
+
+fn with_margin(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes.div_ceil(4))
 }
 
 impl Running {
-    /// The most memory its group has used that has had a full `USED_WINDOW` to enter the
-    /// 5 s average of memory in use; a newer, higher peak counts only once it has.
-    fn shown_at(&self, now: f64) -> u64 {
-        if now - self.peak_at >= USED_WINDOW {
-            self.peak
-        } else {
-            self.shown
+    pub(crate) fn measured_cpu(&self) -> Option<u32> {
+        self.cpu.peak
+    }
+
+    fn reservation(&self) -> u64 {
+        self.need.max(with_margin(self.peak))
+    }
+
+    fn cores(&self, budget: u32) -> u32 {
+        if self.cpu.sampled_seconds < CPU_WINDOW_SECONDS {
+            return self.cpu_need;
         }
+        self.cpu
+            .recent
+            .front()
+            .map_or(0, |&(_, used)| used)
+            .clamp(MILLICORES, budget)
+    }
+
+    pub(crate) fn limit(&self) -> ReservationLimit {
+        if self.cold {
+            ReservationLimit::Cold(self.need)
+        } else {
+            ReservationLimit::Learned(self.need)
+        }
+    }
+
+    fn expected_end(&self, now: f64) -> Option<f64> {
+        let end = self.admitted + self.runtime_ms? as f64 / 1000.0;
+        (end > now).then_some(end)
     }
 }
 
@@ -178,6 +253,23 @@ impl Running {
 pub enum Released {
     Waiting(Waiting),
     Running(Running),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExclusiveAdmission {
+    Alone,
+    Reservations,
+    TimedOut,
+}
+
+impl ExclusiveAdmission {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Alone => "no other jobs running",
+            Self::Reservations => "background and reservations fit under the maximum cap",
+            Self::TimedOut => "held the turn for 10 minutes and memory pressure is calm",
+        }
+    }
 }
 
 /// Why a request is still waiting, as of the latest admission decision.
@@ -193,7 +285,41 @@ pub enum WaitReason {
         reserved: u64,
         cap: u64,
     },
+    Cpu {
+        committed: u32,
+        budget: u32,
+    },
     Behind,
+}
+
+impl std::fmt::Display for WaitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gib = |bytes| bytes as f64 / GIB as f64;
+        let cores = |millicores| f64::from(millicores) / f64::from(MILLICORES);
+        match *self {
+            Self::Unspecified => Ok(()),
+            Self::Tight => f.write_str("memory is tight"),
+            Self::Frozen => f.write_str("a job is frozen"),
+            Self::Behind => f.write_str("behind another request"),
+            Self::Cap {
+                used,
+                reserved,
+                cap,
+            } => write!(
+                f,
+                "memory over the cap ({:.1} GB in use + {:.1} GB reserved of a {:.1} GB cap)",
+                gib(used),
+                gib(reserved),
+                gib(cap)
+            ),
+            Self::Cpu { committed, budget } => write!(
+                f,
+                "CPU budget ({:.1} cores committed, {:.1} core budget)",
+                cores(committed),
+                cores(budget)
+            ),
+        }
+    }
 }
 
 /// A request waiting for its turn, as it is shown to the world.
@@ -222,6 +348,7 @@ pub struct Admitted {
     pub waited: f64,
     pub need: u64,
     pub label: String,
+    pub(crate) exclusive: Option<ExclusiveAdmission>,
 }
 
 /// Where the queue stands, copied out of the scheduler so that it can be read, shown and
@@ -236,11 +363,6 @@ pub struct Snapshot {
     /// In the order they will be admitted if nothing changes.
     pub waiting: Vec<Place>,
     pub running: Vec<Admitted>,
-    /// Scratch for working out the order: each session with a request waiting, and how many
-    /// of its commands count as running by the time its turn comes; and the requests not
-    /// yet placed (indices into the scheduler's waiting list).
-    turns: Vec<(i32, usize)>,
-    left: Vec<usize>,
 }
 
 /// Makes `rows` exactly `len` long, keeping the rows (and what they own) it already has.
@@ -255,11 +377,13 @@ pub struct Scheduler {
     waiting: Vec<Waiting>,
     running: Vec<Running>,
     history: History,
+    background: History,
     /// None until the first reading says how much RAM there is.
     cap: Option<u64>,
     ram: u64,
-    /// Memory in use over the last `USED_WINDOW`, as of the last step.
+    /// Background memory averaged over the last `USED_WINDOW`.
     used: u64,
+    cpu_budget: u32,
     /// Engine time of the latest admission decision, and the last sample's stop conditions.
     now: f64,
     tight: bool,
@@ -267,6 +391,11 @@ pub struct Scheduler {
     /// The last time memory was tight or the cap was probed: what the 60 s count runs from.
     quiet_since: f64,
     next_id: Id,
+    machine_cpu: u32,
+    /// The head holding the turn and when it took it, even if the cap is probed up.
+    exclusive_turn: Option<(Id, f64)>,
+    sample_time: f64,
+    measured_background: u64,
 }
 
 impl Default for Scheduler {
@@ -277,18 +406,39 @@ impl Default for Scheduler {
 
 impl Scheduler {
     pub fn new() -> Scheduler {
+        Self::with_cpu_headroom(DEFAULT_CPU_HEADROOM_PERCENT)
+    }
+
+    pub(crate) fn with_cpu_headroom(percent: u32) -> Scheduler {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+        let budget = cores * 100u32.saturating_sub(percent) * (MILLICORES / 100);
+        Self::with_cpu_capacity(budget.max(MILLICORES), cores * MILLICORES)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cpu_budget(cpu_budget: u32) -> Scheduler {
+        Self::with_cpu_capacity(cpu_budget, cpu_budget)
+    }
+
+    fn with_cpu_capacity(cpu_budget: u32, machine_cpu: u32) -> Scheduler {
         Scheduler {
             waiting: Vec::new(),
             running: Vec::new(),
             history: History::new(),
+            background: History::new(),
             cap: None,
             ram: 0,
             used: 0,
+            cpu_budget,
             now: 0.0,
             tight: false,
             frozen: false,
             quiet_since: 0.0,
             next_id: 0,
+            machine_cpu,
+            exclusive_turn: None,
+            sample_time: 0.0,
+            measured_background: 0,
         }
     }
 
@@ -314,22 +464,33 @@ impl Scheduler {
         &self.running
     }
 
-    /// A new request goes to the back of the line.
+    /// Order by the first connection attempt, with receipt order breaking ties.
     pub fn enqueue(&mut self, session: i32, label: String, signature: String, wall: f64) -> Id {
         self.next_id += 1;
-        self.waiting.push(Waiting {
-            id: self.next_id,
-            session,
-            label,
-            signature,
-            since: wall,
-        });
+        let at = self.waiting.partition_point(|w| w.since <= wall);
+        self.waiting.insert(
+            at,
+            Waiting {
+                id: self.next_id,
+                session,
+                label,
+                signature,
+                since: wall,
+            },
+        );
         self.next_id
+    }
+
+    pub(crate) fn sample_time(&self) -> f64 {
+        self.sample_time
     }
 
     /// The request ends: it stops waiting, or it stops running. None if it is not known.
     pub fn release(&mut self, id: Id) -> Option<Released> {
         if let Some(at) = self.waiting.iter().position(|w| w.id == id) {
+            if self.exclusive_turn.is_some_and(|(head, _)| head == id) {
+                self.exclusive_turn = None;
+            }
             return Some(Released::Waiting(self.waiting.remove(at)));
         }
         let at = self.running.iter().position(|r| r.id == id)?;
@@ -350,99 +511,151 @@ impl Scheduler {
     /// The admitted command's group is using `bytes` at engine time `now`, the sample's own
     /// time (the scheduler's clock has not moved to it yet when the broker measures).
     pub fn observe(&mut self, id: Id, bytes: u64, now: f64) {
-        if let Some(job) = self.running.iter_mut().find(|r| r.id == id)
-            && bytes > job.peak
-        {
-            job.shown = job.shown_at(now);
-            job.peak = bytes;
-            job.peak_at = now;
+        if let Some(job) = self.running.iter_mut().find(|r| r.id == id) {
+            if bytes > 0 {
+                job.footprint = Some((now, bytes));
+            }
+            job.peak = job.peak.max(bytes);
         }
     }
 
-    fn running_of(&self, session: i32) -> usize {
-        self.running.iter().filter(|r| r.session == session).count()
+    pub(crate) fn observe_cpu(&mut self, id: Id, nanos: u64, stopped: bool, now: f64) {
+        if let Some(job) = self.running.iter_mut().find(|r| r.id == id) {
+            job.cpu.observe(now, nanos, stopped, self.machine_cpu);
+        }
     }
 
-    /// Where in `waiting` the request that goes next is: the oldest of the session with the
-    /// fewest commands running.
-    fn next(&self) -> Option<usize> {
-        self.waiting
+    fn need(&self, demand: Demand) -> u64 {
+        demand
+            .bytes
+            .map_or_else(|| (4 * GIB).max(self.cap.unwrap_or(0) / 8), with_margin)
+    }
+
+    fn cpu_need(&self, demand: Demand) -> u32 {
+        demand
+            .millicores
+            .map_or(2 * MILLICORES, |cpu| cpu.max(MILLICORES))
+            .min(self.cpu_budget)
+    }
+
+    fn cpu_committed(&self) -> u32 {
+        self.running
             .iter()
-            .enumerate()
-            .min_by_key(|(_, w)| (self.running_of(w.session), w.id))
-            .map(|(at, _)| at)
+            .fold(0, |sum, job| sum.saturating_add(job.cores(self.cpu_budget)))
     }
 
-    /// What a command of this signature is expected to need: what was learned of it, or else
-    /// `min(1 GiB, cap / 5)`.
-    fn need(&self, signature: &str, learned: &dyn Fn(&str) -> Option<u64>) -> u64 {
-        learned(signature).unwrap_or_else(|| self.cap.map_or(GIB, |cap| GIB.min(cap / 5)))
+    fn reserved(&self) -> u64 {
+        self.running
+            .iter()
+            .fold(0, |sum, job| sum.saturating_add(job.reservation()))
     }
 
-    fn reserved(&self, now: f64) -> u64 {
-        self.running.iter().fold(0u64, |sum, r| {
-            let held = if now - r.admitted < RESERVE {
-                r.need
-            } else if r.peak == 0 {
-                // Never measured (its group not yet reported, or not readable): the 10 s
-                // reservation alone, so a job membrake cannot see never holds the queue.
-                0
-            } else {
-                r.need.saturating_sub(r.shown_at(now))
-            };
-            sum.saturating_add(held)
-        })
+    /// Unknown and overdue jobs promise no release. A known completion only creates a
+    /// backfill window if the head can start with every still-committed job present.
+    fn earliest_start(&self, head: Demand) -> Option<f64> {
+        let mut completions: Vec<_> = self
+            .running
+            .iter()
+            .filter_map(|job| job.expected_end(self.now).map(|end| (end, job)))
+            .collect();
+        completions.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut memory = self.reserved();
+        let mut cpu = self.cpu_committed();
+        let mut left = self.running.len();
+        for (end, job) in completions {
+            left -= 1;
+            memory = memory.saturating_sub(job.reservation());
+            cpu = cpu.saturating_sub(job.cores(self.cpu_budget));
+            if left == 0 || self.fits(self.need(head), memory, cpu) {
+                return Some(end);
+            }
+        }
+        None
     }
 
-    fn fits(&self, need: u64, reserved: u64) -> bool {
+    fn exclusive(&self, demand: Demand) -> bool {
+        self.need(demand) >= self.cap.unwrap_or(u64::MAX)
+    }
+
+    fn exclusive_admission(
+        &self,
+        need: u64,
+        reserved: u64,
+        since: f64,
+    ) -> Option<ExclusiveAdmission> {
+        let max = percent(self.ram, MAX_PERCENT);
+        if self.running.is_empty() {
+            Some(ExclusiveAdmission::Alone)
+        } else if self.now - self.sample_time > FRESH_SAMPLE_SECONDS {
+            None
+        } else if self
+            .measured_background
+            .saturating_add(reserved)
+            .saturating_add(need)
+            < max
+        {
+            Some(ExclusiveAdmission::Reservations)
+        } else if self.now - since >= EXCLUSIVE_WAIT_SECONDS {
+            Some(ExclusiveAdmission::TimedOut)
+        } else {
+            None
+        }
+    }
+
+    /// Without a completion estimate, assume every incumbent that can coexist with
+    /// the head might still be running when it starts. Backfills must also fit now.
+    fn fits_spare(&self, head_id: Id, head: Demand, candidate: Demand) -> bool {
+        let head_memory = self.need(head);
+        let mut memory = head_memory.saturating_add(self.need(candidate));
+        let mut cpu = self.cpu_need(candidate);
+        for job in self.running.iter().filter(|job| {
+            job.backfill_for == Some(head_id)
+                || self.fits(head_memory, job.reservation(), job.cores(self.cpu_budget))
+        }) {
+            memory = memory.saturating_add(job.reservation());
+            cpu = cpu.saturating_add(job.cores(self.cpu_budget));
+        }
+        self.fits(memory, 0, cpu)
+    }
+
+    fn fits(&self, need: u64, reserved: u64, committed: u32) -> bool {
+        committed < self.cpu_budget && self.fits_memory(need, reserved)
+    }
+
+    fn fits_memory(&self, need: u64, reserved: u64) -> bool {
         self.used.saturating_add(reserved).saturating_add(need) < self.cap.unwrap_or(0)
     }
 
-    /// Copies out where every request stands: the waiting ones in the order they will be
-    /// admitted if nothing changes (each session's turn comes round in turn, as `next` picks
-    /// them), then the admitted ones.
-    pub fn snapshot(&self, learned: &dyn Fn(&str) -> Option<u64>, out: &mut Snapshot) {
+    /// Copies the queue in reservation order and each admitted job's current reservation.
+    pub fn snapshot(&self, learned: &dyn Fn(&str) -> Demand, out: &mut Snapshot) {
         out.ram = self.ram;
         out.cap = self.cap.unwrap_or(0);
         out.used = self.used;
-
-        out.turns.clear();
-        for w in &self.waiting {
-            if !out.turns.iter().any(|&(session, _)| session == w.session) {
-                out.turns.push((w.session, self.running_of(w.session)));
-            }
-        }
-        out.left.clear();
-        out.left.extend(0..self.waiting.len());
         refit(&mut out.waiting, self.waiting.len());
-        let turn = |turns: &[(i32, usize)], session: i32| {
-            turns
-                .iter()
-                .find(|&&(s, _)| s == session)
-                .map_or(0, |&(_, running)| running)
-        };
-        let mut position = 0;
-        let reserved = self.reserved(self.now);
-        while let Some(at) = (0..out.left.len()).min_by_key(|&at| {
-            let w = &self.waiting[out.left[at]];
-            (turn(&out.turns, w.session), w.id)
-        }) {
-            let w = &self.waiting[out.left.remove(at)];
-            if let Some(entry) = out.turns.iter_mut().find(|t| t.0 == w.session) {
-                entry.1 += 1;
-            }
-            position += 1;
-            let place = &mut out.waiting[position - 1];
+        let reserved = self.reserved();
+        let committed = self.cpu_committed();
+        for (index, (w, place)) in self.waiting.iter().zip(&mut out.waiting).enumerate() {
+            let position = index + 1;
             place.id = w.id;
             place.position = position;
-            place.need = self.need(&w.signature, learned);
+            let demand = learned(&w.signature);
+            place.need = self.need(demand);
             place.reason = if position > 1 {
                 WaitReason::Behind
             } else if self.tight {
                 WaitReason::Tight
             } else if self.frozen {
                 WaitReason::Frozen
-            } else if self.cap.is_some() && !self.fits(place.need, reserved) {
+            } else if !self.exclusive(demand)
+                && self.exclusive_turn.is_none()
+                && committed >= self.cpu_budget
+            {
+                WaitReason::Cpu {
+                    committed,
+                    budget: self.cpu_budget,
+                }
+            } else if self.cap.is_some() && !self.fits_memory(place.need, reserved) {
                 WaitReason::Cap {
                     used: self.used,
                     reserved,
@@ -464,15 +677,28 @@ impl Scheduler {
             row.pgid = r.pgid.unwrap_or(0);
             row.peak = r.peak;
             row.waited = r.waited;
-            row.need = r.need;
+            row.need = r.reservation();
             row.label.clone_from(&r.label);
+            row.exclusive = r.exclusive;
         }
     }
 
     /// Takes one reading and admits every request that fits. Clears `out`, then appends the
     /// admitted ids in order. Allocation-free when nobody is waiting.
-    pub fn step(&mut self, s: &Sample, learned: &dyn Fn(&str) -> Option<u64>, out: &mut Vec<Id>) {
+    pub fn step(&mut self, s: &Sample, learned: &dyn Fn(&str) -> Demand, out: &mut Vec<Id>) {
+        self.step_at(s, s.time, learned, out);
+    }
+
+    pub(crate) fn step_at(
+        &mut self,
+        s: &Sample,
+        decision_time: f64,
+        learned: &dyn Fn(&str) -> Demand,
+        out: &mut Vec<Id>,
+    ) {
         let now = s.time;
+        self.sample_time = now;
+        let measured_memory = s.used();
         self.ram = s.ram;
         self.tight = s.tight;
         self.frozen = s.frozen;
@@ -480,8 +706,16 @@ impl Scheduler {
             self.cap = Some(percent(s.ram, START_PERCENT));
             self.quiet_since = now;
         }
-        self.history.push(now, s.used());
-        self.used = self.history.average(now, USED_WINDOW);
+        let attributable = self
+            .running
+            .iter()
+            .filter_map(|job| job.footprint)
+            .filter(|(time, _)| *time == now)
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(bytes));
+        self.measured_background = measured_memory.saturating_sub(attributable);
+        self.history.push(now, measured_memory);
+        self.background.push(now, self.measured_background);
+        self.used = self.background.average(now, USED_WINDOW);
         if s.tight {
             // What was in use when memory ran short is what the machine can hold.
             self.cap = Some(self.history.average(now, CAP_WINDOW));
@@ -493,11 +727,11 @@ impl Scheduler {
             && !s.frozen
             && !self.running.is_empty()
             && now - self.quiet_since >= PROBE_AFTER
-            && let Some(at) = self.next()
-            && !self.fits(
-                self.need(&self.waiting[at].signature, learned),
-                self.reserved(now),
-            )
+            && self.waiting.first().is_some_and(|head| {
+                let demand = learned(&head.signature);
+                self.cpu_committed() < self.cpu_budget
+                    && !self.fits_memory(self.need(demand), self.reserved())
+            })
         {
             let max = percent(s.ram, MAX_PERCENT);
             if let Some(cap) = self.cap.as_mut().filter(|cap| **cap < max) {
@@ -505,7 +739,7 @@ impl Scheduler {
             }
             self.quiet_since = now;
         }
-        self.admit_now(now, s.wall, learned, out);
+        self.admit_now(decision_time, s.wall, learned, out);
     }
 
     /// Uses the latest sample's memory and stop conditions, without changing history or the
@@ -515,22 +749,67 @@ impl Scheduler {
         &mut self,
         now: f64,
         wall: f64,
-        learned: &dyn Fn(&str) -> Option<u64>,
+        learned: &dyn Fn(&str) -> Demand,
         out: &mut Vec<Id>,
     ) {
         out.clear();
         self.now = now;
-        if self.cap.is_none() || self.tight || self.frozen {
+        if self.cap.is_none() || self.running.iter().any(|job| job.exclusive.is_some()) {
             return;
         }
-        let alone = self.running.is_empty();
-        let mut reserved = self.reserved(now);
-        while let Some(at) = self.next() {
-            let need = self.need(&self.waiting[at].signature, learned);
-            // Forward progress applies only to the first start with nothing already running.
-            if !(self.fits(need, reserved) || alone && out.is_empty()) {
+        let mut reserved = self.reserved();
+        let mut committed = self.cpu_committed();
+        while let Some(head) = self.waiting.first() {
+            let demand = learned(&head.signature);
+            self.exclusive_turn = self
+                .exclusive_turn
+                .filter(|(id, _)| *id == head.id)
+                .or_else(|| self.exclusive(demand).then_some((head.id, now)));
+            if self.tight || self.frozen {
                 break;
             }
+            let exclusive = match self.exclusive_turn {
+                Some((_, since)) => {
+                    let Some(rule) = self.exclusive_admission(self.need(demand), reserved, since)
+                    else {
+                        break;
+                    };
+                    Some(rule)
+                }
+                None => None,
+            };
+            let fits = |demand: Demand| self.fits(self.need(demand), reserved, committed);
+            let (at, demand, backfill_for) =
+                if self.running.is_empty() || exclusive.is_some() || fits(demand) {
+                    (0, demand, None)
+                } else {
+                    let start = self.earliest_start(demand);
+                    let Some(backfill) =
+                        self.waiting
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .find_map(|(at, job)| {
+                                let candidate = learned(&job.signature);
+                                if self.exclusive(candidate) || !fits(candidate) {
+                                    return None;
+                                }
+                                let can_backfill = match start {
+                                    Some(start) => candidate.runtime_ms.is_some_and(|ms| {
+                                        let runtime = ms as f64 / 1000.0;
+                                        now + runtime + (runtime * 0.25).max(0.25) <= start
+                                    }),
+                                    None => self.fits_spare(head.id, demand, candidate),
+                                };
+                                can_backfill.then_some((at, candidate, Some(head.id)))
+                            })
+                    else {
+                        break;
+                    };
+                    backfill
+                };
+            let need = self.need(demand);
+            let cpu_need = self.cpu_need(demand);
             let w = self.waiting.remove(at);
             self.running.push(Running {
                 id: w.id,
@@ -539,16 +818,26 @@ impl Scheduler {
                 signature: w.signature,
                 since: wall,
                 admitted: now,
-                waited: wall - w.since,
+                waited: (wall - w.since).max(0.0),
                 need,
+                cpu_need,
+                cold: demand.bytes.is_none(),
+                exclusive,
+                backfill_for,
+                runtime_ms: demand.runtime_ms,
                 pgid: None,
                 leader_start_us: 0,
                 peak: 0,
-                peak_at: now,
-                shown: 0,
+                footprint: None,
+                cpu: Cpu::default(),
             });
             out.push(w.id);
             reserved = reserved.saturating_add(need);
+            committed = committed.saturating_add(cpu_need);
+            if exclusive.is_some() {
+                self.exclusive_turn = None;
+                break;
+            }
         }
     }
 }
@@ -578,8 +867,17 @@ mod tests {
         at(time, 80)
     }
 
-    fn unknown(_: &str) -> Option<u64> {
-        None
+    // Isolate memory and fairness in the older scenarios by assuming one core per job.
+    fn memory(bytes: Option<u64>) -> Demand {
+        Demand {
+            bytes: bytes.or(Some(4 * GIB / 5)),
+            millicores: Some(MILLICORES),
+            runtime_ms: None,
+        }
+    }
+
+    fn unknown(_: &str) -> Demand {
+        memory(None)
     }
 
     /// Asks for a command named `name` for `session`; its signature is its name.
@@ -592,7 +890,7 @@ mod tests {
     }
 
     /// Existing single-admission scenarios also check that no extra request starts.
-    fn step(q: &mut Scheduler, s: &Sample, learned: &dyn Fn(&str) -> Option<u64>) -> Option<Id> {
+    fn step(q: &mut Scheduler, s: &Sample, learned: &dyn Fn(&str) -> Demand) -> Option<Id> {
         let mut out = Vec::new();
         q.step(s, learned, &mut out);
         assert!(out.len() <= 1, "unexpected extra admissions: {out:?}");
@@ -605,7 +903,7 @@ mod tests {
         from: u32,
         to: u32,
         level: i32,
-        learned: &dyn Fn(&str) -> Option<u64>,
+        learned: &dyn Fn(&str) -> Demand,
     ) -> Option<Id> {
         (from..=to)
             .map(|t| step(q, &at(f64::from(t), level), learned))
@@ -615,7 +913,7 @@ mod tests {
 
     #[test]
     fn a_command_is_admitted_when_there_is_room() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let a = ask(&mut q, 1, "a");
         assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(a));
         assert_eq!(names(&q), ["a"]);
@@ -628,33 +926,393 @@ mod tests {
         );
     }
 
-    /// `used + need < cap` is the rule, so equality waits. With another command already
-    /// running (so that forward progress does not apply) a command that needs 15 GiB at 55 GiB
-    /// in use waits for the 70 GiB cap, and one that needs 14 GiB does not.
     #[test]
-    fn a_command_waits_when_used_plus_need_reaches_the_cap() {
-        let learned = |s: &str| match s {
-            "edge" => Some(15 * GIB),
-            "fits" => Some(14 * GIB),
-            _ => None,
+    fn an_unmeasured_idle_watch_leaves_room_for_new_signatures() {
+        let mut q = Scheduler::with_cpu_budget(4 * MILLICORES);
+        let mut out = Vec::new();
+        let unknown = |_: &str| Demand::default();
+        let watch = ask(&mut q, 1, "watch");
+        q.step(&calm(0.0), &unknown, &mut out);
+        assert_eq!(out, [watch]);
+        q.observe_cpu(watch, 0, false, 1.0);
+        q.observe_cpu(watch, 0, false, 2.0);
+        let short = ask(&mut q, 2, "short-a");
+        let other = ask(&mut q, 3, "short-b");
+        let ready = |s: &str| {
+            if s == "watch" {
+                Demand::default()
+            } else {
+                Demand {
+                    bytes: Some(GIB),
+                    millicores: Some(2000),
+                    runtime_ms: None,
+                }
+            }
         };
-        let mut q = Scheduler::new();
+        q.step(&calm(2.0), &ready, &mut out);
+        assert_eq!(out, [short], "the idle watch keeps its bounded reservation");
+        q.release(short);
+        q.step(&calm(3.0), &ready, &mut out);
+        assert_eq!(out, [other]);
+    }
+
+    #[test]
+    fn the_oldest_waiter_is_not_overtaken_without_a_completion_estimate() {
+        let mut q = Scheduler::with_cpu_budget(3 * MILLICORES);
+        let mut out = Vec::new();
+        let learned = |s: &str| Demand {
+            bytes: Some(GIB),
+            millicores: Some(if s == "waiter" { 3 } else { 1 } * MILLICORES),
+            runtime_ms: None,
+        };
+        ask(&mut q, 1, "watch");
+        let first = ask(&mut q, 2, "first");
+        let second = ask(&mut q, 3, "second");
+        q.step(&calm(0.0), &learned, &mut out);
+        assert_eq!(out.len(), 3);
+        let waiter = ask(&mut q, 1, "waiter");
+        q.step(&calm(31.0), &learned, &mut out);
+        let newcomer = ask(&mut q, 4, "newcomer");
+        q.admit_now(31.0, 31.0, &learned, &mut out);
+        assert!(out.is_empty());
+        q.release(first).unwrap();
+        q.step(&calm(32.0), &learned, &mut out);
+        assert_eq!(out, [waiter]);
+        assert_eq!(q.waiting()[0].id, newcomer);
+        q.release(second).unwrap();
+        assert_eq!(step(&mut q, &calm(33.0), &learned), None);
+    }
+
+    #[test]
+    fn review4_peak_cpu_job_starts_beside_a_long_running_watch() {
+        let mut q = Scheduler::with_cpu_capacity(24000, 30000);
+        let learned = |name: &str| Demand {
+            bytes: Some(GIB),
+            millicores: Some(match name {
+                "watch" => 2000,
+                "build" => 30000,
+                _ => 1000,
+            }),
+            runtime_ms: None,
+        };
+        let watch = ask(&mut q, 1, "watch");
+        assert_eq!(step(&mut q, &calm(0.0), &learned), Some(watch));
+        assert!(q.started(watch, 123, 7));
+        let build = ask(&mut q, 2, "build");
+        let small = ask(&mut q, 3, "small");
+        assert_eq!(
+            step(&mut q, &calm(3600.0), &learned),
+            Some(build),
+            "two committed cores leave the 30-core request free to start"
+        );
+        assert_eq!(q.cpu_committed(), 26000);
+        assert_eq!(q.waiting()[0].id, small);
+        q.release(build);
+        assert_eq!(step(&mut q, &calm(3601.0), &learned), Some(small));
+        assert_eq!(names(&q), ["watch", "small"]);
+    }
+
+    #[test]
+    fn oversized_memory_head_times_out_on_a_fresh_calm_reading_even_without_fit() {
+        let learned = |name: &str| {
+            memory(Some(match name {
+                "head" => 58 * GIB,
+                "watch" => 20 * GIB,
+                _ => GIB,
+            }))
+        };
+        let mut q = Scheduler::with_cpu_capacity(24000, 30000);
+        let watch = ask(&mut q, 1, "watch");
+        assert_eq!(step(&mut q, &calm(0.0), &learned), Some(watch));
+        assert!(q.started(watch, 123, 7));
+        let head = ask(&mut q, 2, "head");
+        let small = ask(&mut q, 3, "small");
+        q.observe(watch, 2 * GIB, 1.0);
+        assert_eq!(
+            step(&mut q, &at(1.0, 88), &learned),
+            None,
+            "10 + 25 + 72.5 exceeds 90"
+        );
+        assert_eq!(
+            q.waiting().iter().map(|w| w.id).collect::<Vec<_>>(),
+            [head, small]
+        );
+        q.observe(watch, 2 * GIB, 600.0);
+        assert_eq!(
+            step(&mut q, &at(600.0, 88), &learned),
+            None,
+            "one second before the timeout"
+        );
+        q.admit_now(603.0, 603.0, &learned, &mut Vec::new());
+        assert_eq!(
+            q.waiting()[0].id,
+            head,
+            "a stale reading cannot use the timeout"
+        );
+        assert_eq!(
+            step(&mut q, &at(604.0, 35), &learned),
+            None,
+            "tight memory still blocks admission"
+        );
+        let frozen = Sample {
+            frozen: true,
+            ..calm(605.0)
+        };
+        assert_eq!(
+            step(&mut q, &frozen, &learned),
+            None,
+            "a frozen job still blocks admission"
+        );
+        q.observe(watch, 2 * GIB, 606.0);
+        assert_eq!(
+            step(&mut q, &calm(606.0), &learned),
+            Some(head),
+            "the first fresh calm reading admits the head even though 20 + 72.5 exceeds 90"
+        );
+        assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
+        assert_eq!(
+            step(&mut q, &calm(607.0), &learned),
+            None,
+            "the younger request waits through the exclusive run"
+        );
+        q.release(head);
+        assert_eq!(
+            step(&mut q, &at(612.0, 90), &learned),
+            Some(small),
+            "the younger request starts once it fits the cap learned under pressure"
+        );
+    }
+
+    #[test]
+    fn review4_oversized_memory_head_can_start_early_when_reservations_fit() {
+        let learned = |name: &str| memory(Some(if name == "head" { 58 } else { 2 } * GIB));
+        let mut q = Scheduler::with_cpu_capacity(24000, 30000);
+        let watch = ask(&mut q, 1, "watch");
+        assert_eq!(step(&mut q, &calm(0.0), &learned), Some(watch));
+        assert!(q.started(watch, 123, 7));
+        let head = ask(&mut q, 2, "head");
+        q.observe(watch, 2 * GIB, 1.0);
+        assert_eq!(
+            step(&mut q, &at(1.0, 85), &learned),
+            Some(head),
+            "13 + 2.5 + 72.5 fits under 90"
+        );
+        assert_eq!(
+            q.running()[1].exclusive,
+            Some(ExclusiveAdmission::Reservations)
+        );
+    }
+
+    #[test]
+    fn review4_cold_jobs_start_together_and_reserve_their_observed_peak() {
+        let mut q = Scheduler::with_cpu_budget(24000);
+        let cold = |_: &str| Demand::default();
+        let first = ask(&mut q, 1, "cold-a");
+        let second = ask(&mut q, 2, "cold-b");
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &cold, &mut out);
+        assert_eq!(out, [first, second], "both cold defaults fit the cap");
+        let default = 70 * GIB / 8;
+        assert_eq!(q.reserved(), 2 * default);
+        q.observe(first, 8 * GIB, 1.0);
+        assert_eq!(q.reserved(), 10 * GIB + default);
+    }
+
+    #[test]
+    fn review4_cpu_learning_uses_the_full_interval_and_clamps_to_the_machine() {
+        let mut q = Scheduler::with_cpu_capacity(24000, 30000);
+        let build = ask(&mut q, 1, "build");
+        assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(build));
+        q.observe_cpu(build, 0, false, 1.0);
+        q.observe_cpu(build, 48_000_000_000, false, 7.0);
+        assert_eq!(
+            q.running()[0].measured_cpu(),
+            Some(8000),
+            "48 CPU-seconds over six seconds"
+        );
+        q.observe_cpu(build, 88_000_000_000, false, 8.0);
+        assert_eq!(
+            q.running()[0].measured_cpu(),
+            Some(30000),
+            "the peak cannot exceed 30 cores"
+        );
+    }
+
+    #[test]
+    fn an_idle_watch_releases_cpu_budget_after_its_burst_ages_out() {
+        let mut q = Scheduler::with_cpu_capacity(24 * MILLICORES, 30 * MILLICORES);
+        let demand = |_: &str| Demand::default();
+        let watch = ask(&mut q, 1, "watch");
+        assert_eq!(step(&mut q, &calm(0.0), &demand), Some(watch));
+        for t in 0..10 {
+            q.observe_cpu(watch, 0, false, f64::from(t));
+        }
+        assert_eq!(q.cpu_committed(), 2 * MILLICORES);
+
+        let build = ask(&mut q, 2, "build");
+        for t in 10..20 {
+            q.observe_cpu(watch, 25_000_000_000, false, f64::from(t));
+            assert_eq!(step(&mut q, &calm(f64::from(t)), &demand), None);
+        }
+        let mut status = Snapshot::default();
+        q.snapshot(&demand, &mut status);
+        assert_eq!(
+            status.waiting[0].reason,
+            WaitReason::Cpu {
+                committed: 24 * MILLICORES,
+                budget: 24 * MILLICORES,
+            }
+        );
+
+        q.observe_cpu(watch, 25_000_000_000, false, 20.0);
+        assert_eq!(
+            step(&mut q, &calm(20.0), &demand),
+            Some(build),
+            "an idle watch releases the CPU budget while it is still running"
+        );
+        assert_eq!(q.cpu_committed(), 3 * MILLICORES);
+        assert_eq!(q.running()[0].measured_cpu(), Some(25 * MILLICORES));
+    }
+
+    #[test]
+    fn a_frozen_build_keeps_its_cpu_commitment_until_it_runs_again() {
+        let mut q = Scheduler::with_cpu_capacity(24 * MILLICORES, 30 * MILLICORES);
+        let demand = |_: &str| Demand::default();
+        let build = ask(&mut q, 1, "build");
+        assert_eq!(step(&mut q, &calm(0.0), &demand), Some(build));
+        for t in 0..=11u32 {
+            q.observe_cpu(build, u64::from(t) * 25_000_000_000, false, f64::from(t));
+        }
+        assert_eq!(q.cpu_committed(), 24 * MILLICORES);
+
+        let stopped_at = 11 * 25_000_000_000;
+        for t in 12..=30u32 {
+            q.observe_cpu(build, stopped_at, true, f64::from(t));
+            assert_eq!(q.cpu_committed(), 24 * MILLICORES, "frozen at {t} s");
+        }
+        // The thaw tick's interval spans the stop, so it cannot measure demand.
+        q.observe_cpu(build, stopped_at, false, 31.0);
+        assert_eq!(
+            q.cpu_committed(),
+            24 * MILLICORES,
+            "resumed, not yet measured"
+        );
+        q.observe_cpu(build, stopped_at + 25_000_000_000, false, 32.0);
+        assert_eq!(q.cpu_committed(), 24 * MILLICORES, "measured busy again");
+    }
+
+    #[test]
+    fn cpu_learning_keeps_an_eight_core_burst_after_eight_idle_seconds() {
+        let mut q = Scheduler::with_cpu_budget(12 * MILLICORES);
+        let mut out = Vec::new();
+        let learned = |_: &str| memory(None);
+        let first = ask(&mut q, 1, "burst");
+        q.step(&calm(0.0), &learned, &mut out);
+        for i in 0..=10 {
+            q.observe_cpu(
+                first,
+                (i as u64).saturating_sub(8) * 8_000_000_000,
+                false,
+                f64::from(i),
+            );
+        }
+        let mut sizes = crate::sizes::Sizes::default();
+        sizes.record_usage("burst", GIB, q.running()[0].measured_cpu(), None);
+        assert_eq!(sizes.demand("burst").millicores, Some(8000));
+        let second = ask(&mut q, 2, "burst");
+        let third = ask(&mut q, 3, "burst");
+        q.step(&calm(10.0), &|s| sizes.demand(s), &mut out);
+        assert_eq!(
+            out,
+            [second],
+            "another job can start while eight cores are committed"
+        );
+        assert_eq!(
+            q.waiting()[0].id,
+            third,
+            "the two bursts now commit sixteen cores"
+        );
+        q.release(first).unwrap();
+        q.step(&calm(11.0), &|s| sizes.demand(s), &mut out);
+        assert_eq!(out, [third]);
+    }
+
+    #[test]
+    fn cpu_heavy_jobs_wait_and_start_in_arrival_order_as_cores_free_up() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let mut sizes = crate::sizes::Sizes::default();
+        sizes.record_usage("test", GIB, Some(12 * MILLICORES), None);
+        let learned = |signature: &str| sizes.demand(signature);
+        let a1 = ask(&mut q, 1, "test");
+        let a2 = ask(&mut q, 1, "test");
+        let b1 = ask(&mut q, 2, "test");
+        let b2 = ask(&mut q, 2, "test");
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &learned, &mut out);
+        assert_eq!(out, [a1, a2]);
+
+        let mut view = Snapshot::default();
+        q.snapshot(&learned, &mut view);
+        assert_eq!((view.waiting[0].id, view.waiting[1].id), (b1, b2));
+        assert_eq!(
+            view.waiting[0].reason,
+            WaitReason::Cpu {
+                committed: 24 * MILLICORES,
+                budget: 24 * MILLICORES,
+            }
+        );
+        assert_eq!(view.waiting[1].reason, WaitReason::Behind);
+
+        assert!(matches!(q.release(a1), Some(Released::Running(_))));
+        q.step(&calm(1.0), &learned, &mut out);
+        assert_eq!(out, [b1]);
+        assert!(matches!(q.release(a2), Some(Released::Running(_))));
+        q.step(&calm(2.0), &learned, &mut out);
+        assert_eq!(out, [b2]);
+        assert!(q.waiting().is_empty());
+    }
+
+    #[test]
+    fn cpu_learning_uses_active_elapsed_time_and_ignores_counter_rebounds() {
+        let mut cpu = Cpu::default();
+        cpu.observe(0.0, 1_000_000_000, false, 30000);
+        cpu.observe(1.0, 5_000_000_000, false, 30000);
+        cpu.observe(2.0, 3_000_000_000, false, 30000); // worker exited before being reaped
+        cpu.observe(3.0, 7_000_000_000, false, 30000);
+        cpu.observe(4.0, 7_000_000_000, true, 30000);
+        cpu.observe(24.0, 7_000_000_000, true, 30000);
+        cpu.observe(25.0, 7_000_000_000, false, 30000);
+        cpu.observe(26.0, 9_000_000_000, false, 30000);
+        assert_eq!(cpu.peak, Some(4000));
+    }
+
+    /// At 58 GiB background plus 1 GiB reserved, another 11 GiB reaches the cap and waits.
+    #[test]
+    fn a_command_waits_when_background_plus_reservations_reaches_the_cap() {
+        let learned = |s: &str| {
+            memory(match s {
+                "edge" => Some(44 * GIB / 5),
+                "fits" => Some(8 * GIB),
+                _ => None,
+            })
+        };
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let first = ask(&mut q, 1, "first");
         assert!(step(&mut q, &calm(0.0), &learned).is_some());
-        q.observe(first, GIB, 0.0); // its group has reached its need: nothing left reserved
-        run(&mut q, 1, 10, 45, &learned); // 55 GiB in use, the 5 s average settled
-        assert_eq!(q.used(), 55 * GIB);
+        q.observe(first, GIB, 0.0);
+        run(&mut q, 1, 10, 42, &learned);
+        assert_eq!(q.used(), 58 * GIB);
 
         let edge = ask(&mut q, 2, "edge");
-        assert_eq!(run(&mut q, 11, 20, 45, &learned), None);
-        assert_eq!(q.waiting().len(), 1, "55 + 15 = 70 is not under 70");
+        assert_eq!(run(&mut q, 11, 20, 42, &learned), None);
+        assert_eq!(q.waiting().len(), 1, "58 + 1 + 11 equals 70");
 
         q.release(edge);
         let fits = ask(&mut q, 2, "fits");
         assert_eq!(
-            step(&mut q, &at(21.0, 45), &learned),
+            step(&mut q, &at(21.0, 42), &learned),
             Some(fits),
-            "55 + 14 = 69 is"
+            "58 + 1 + 10 is under 70"
         );
     }
 
@@ -662,7 +1320,7 @@ mod tests {
     /// little is in use.
     #[test]
     fn nothing_is_admitted_while_memory_is_tight_or_a_job_is_frozen() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let a = ask(&mut q, 1, "a");
         assert_eq!(step(&mut q, &at(0.0, 35), &unknown), None, "tight");
         let frozen = Sample {
@@ -690,8 +1348,8 @@ mod tests {
     /// reading after a long busy spell does not let a big command in, five do.
     #[test]
     fn the_memory_in_use_is_averaged_over_five_seconds() {
-        let big = |s: &str| (s == "big").then_some(25 * GIB);
-        let mut q = Scheduler::new();
+        let big = |s: &str| memory((s == "big").then_some(20 * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "first");
         assert!(step(&mut q, &calm(0.0), &big).is_some());
         run(&mut q, 1, 10, 45, &big); // 55 GiB in use
@@ -706,7 +1364,7 @@ mod tests {
 
     #[test]
     fn two_strangers_that_fit_start_in_the_same_step() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 2, "b"));
         let mut out = Vec::new();
         q.step(&calm(0.0), &unknown, &mut out);
@@ -719,87 +1377,155 @@ mod tests {
         );
     }
 
-    /// A gate's lint and test runs reach their peak 30-60 s after they start. On 2026-11-20 a
-    /// burst admitted 70 GB of expected need into a 57.5 GB cap because each reservation
-    /// lapsed after 10 s while memory in use had not moved yet.
     #[test]
-    fn a_burst_stays_reserved_until_its_memory_shows() {
-        let mut q = Scheduler::new();
-        let ids: Vec<_> = (1..=4).map(|s| ask(&mut q, s, "build")).collect();
-        let need = |_: &str| Some(20 * GIB);
+    fn the_entire_memory_commitment_remains_when_footprint_falls_or_is_missing() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let need = |_: &str| memory(Some(18 * GIB));
+        let ids: Vec<_> = (1..=3).map(|s| ask(&mut q, s, "build")).collect();
         let mut out = Vec::new();
         q.step(&calm(0.0), &need, &mut out);
-        assert_eq!(
-            out,
-            ids[..2],
-            "20 used + 40 reserved fits; another 20 does not"
-        );
-        for id in &ids[..2] {
-            q.observe(*id, GIB, 1.0); // sampled every second: small while they start
+        assert_eq!(out, ids[..2]);
+        for t in 30..=40 {
+            let time = f64::from(t);
+            for &id in &ids[..2] {
+                q.observe(id, 20 * GIB, time);
+            }
+            // 59 GiB measured, 40 attributable to admitted jobs: 19 background.
+            q.step(&at(time, 41), &need, &mut out);
+            assert!(out.is_empty());
         }
-        q.step(&calm(RESERVE + 30.0), &need, &mut out);
-        assert!(
-            out.is_empty(),
-            "the burst is still growing, so it is still reserved"
-        );
-        for id in &ids[..2] {
-            q.observe(*id, 20 * GIB, RESERVE + 30.0);
+        assert_eq!(q.used(), 19 * GIB);
+        for t in 41..=50 {
+            let time = f64::from(t);
+            q.observe(ids[0], GIB, time);
+            q.step(&calm(time), &need, &mut out);
+            assert!(out.is_empty());
         }
-        q.step(&calm(RESERVE + 30.0 + USED_WINDOW - 0.1), &need, &mut out);
-        assert!(
-            out.is_empty(),
-            "a peak just reached is not yet in the 5 s average, so it frees nothing"
-        );
-        q.step(&calm(RESERVE + 30.0 + USED_WINDOW), &need, &mut out);
-        assert_eq!(
-            out,
-            ids[2..],
-            "with the burst's memory shown, the same reading has room again"
-        );
+        assert_eq!(q.reserved(), 50 * GIB);
+        q.release(ids[0]);
+        assert_eq!(step(&mut q, &calm(51.0), &need), Some(ids[2]));
     }
 
     #[test]
-    fn a_reservation_holds_its_whole_need_then_what_its_peak_has_not_reached() {
-        let mut q = Scheduler::new();
+    fn reservation_grows_with_the_peak_even_after_current_use_falls() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let id = ask(&mut q, 1, "build");
-        step(&mut q, &calm(7.0), &unknown);
-        q.observe(id, GIB / 4, 7.0);
-        assert_eq!(
-            q.reserved(7.0 + RESERVE - 0.1),
-            GIB,
-            "the whole need until it can enter the average"
-        );
-        assert_eq!(q.reserved(7.0 + RESERVE), GIB - GIB / 4);
-        q.observe(id, 2 * GIB, 30.0);
-        assert_eq!(
-            q.reserved(30.0 + USED_WINDOW - 0.1),
-            GIB - GIB / 4,
-            "a new peak frees room only once it is in the average"
-        );
-        assert_eq!(
-            q.reserved(30.0 + USED_WINDOW),
-            0,
-            "a peak past its need holds nothing"
-        );
+        step(&mut q, &calm(0.0), &unknown);
+        assert_eq!(q.reserved(), GIB);
+        q.observe(id, 2 * GIB, 1.0);
+        q.observe(id, 0, 2.0);
+        assert_eq!(q.reserved(), with_margin(2 * GIB));
         q.release(id);
-        assert_eq!(q.reserved(8.0), 0);
+        assert_eq!(q.reserved(), 0);
     }
 
-    /// A job membrake never measures (its group never reported, or not readable) keeps only
-    /// the 10 s reservation, as before reservations followed peaks, so it cannot hold the
-    /// queue for as long as it runs.
     #[test]
-    fn an_unmeasured_job_reserves_only_its_first_ten_seconds() {
-        let mut q = Scheduler::new();
-        ask(&mut q, 1, "build");
-        step(&mut q, &calm(7.0), &unknown);
-        assert_eq!(q.reserved(7.0 + RESERVE - 0.1), GIB);
-        assert_eq!(q.reserved(7.0 + RESERVE), 0);
+    fn easy_backfills_only_jobs_finishing_by_the_heads_earliest_start() {
+        let mut q = Scheduler::with_cpu_budget(4 * MILLICORES);
+        let learned = |s: &str| {
+            let (gib, cores, seconds) = match s {
+                "watch" => (8, 2, None),
+                "blocker" => (16, 1, Some(10)),
+                "head" => (24, 4, Some(2)),
+                "short" => (1, 3, Some(2)),
+                "long" => (1, 1, Some(20)),
+                _ => (1, 1, None),
+            };
+            Demand {
+                bytes: Some(gib * GIB),
+                millicores: Some(cores * MILLICORES),
+                runtime_ms: seconds.map(|s| s * 1000),
+            }
+        };
+        ask(&mut q, 1, "watch");
+        let blocker = ask(&mut q, 1, "blocker");
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &learned, &mut out);
+        let head = ask(&mut q, 1, "head");
+        ask(&mut q, 2, "long");
+        ask(&mut q, 3, "unknown");
+        for i in [1, 3, 5, 7] {
+            let short = ask(&mut q, 4, "short");
+            q.step(&calm(f64::from(i)), &learned, &mut out);
+            assert_eq!(out, [short]);
+            q.release(short);
+            assert_eq!(q.waiting()[0].id, head);
+        }
+        ask(&mut q, 4, "short");
+        q.step(&calm(9.0), &learned, &mut out);
+        assert!(out.is_empty(), "two seconds would delay the head");
+        q.release(blocker);
+        q.step(&calm(10.0), &learned, &mut out);
+        assert_eq!(out, [head]);
+    }
+
+    #[test]
+    fn review3_backfill_can_use_spare_capacity_without_an_incumbent_estimate() {
+        let mut q = Scheduler::with_cpu_budget(4000);
+        let learned = |s: &str| Demand {
+            millicores: Some(match s {
+                "watch" => 3000,
+                "head" => 4000,
+                _ => 1000,
+            }),
+            bytes: Some(
+                match s {
+                    "watch" => 24,
+                    "head" => 20,
+                    _ => 1,
+                } * GIB,
+            ),
+            runtime_ms: None,
+        };
+        let watch = ask(&mut q, 1, "watch");
+        step(&mut q, &calm(0.0), &learned);
+        let head = ask(&mut q, 2, "head");
+        let small = ask(&mut q, 3, "small");
+        assert_eq!(step(&mut q, &calm(1.0), &learned), Some(small));
+        q.release(watch);
+        assert_eq!(step(&mut q, &calm(2.0), &learned), Some(head));
+    }
+
+    #[test]
+    fn a_backfill_cannot_block_a_head_that_could_run_after_a_partial_release() {
+        let mut q = Scheduler::with_cpu_budget(4000);
+        let learned = |name: &str| {
+            memory(Some(
+                match name {
+                    "watch" => 20,
+                    "blocker" => 8,
+                    "head" => 16,
+                    _ => 4,
+                } * GIB,
+            ))
+        };
+        ask(&mut q, 1, "watch");
+        let blocker = ask(&mut q, 1, "blocker");
+        q.step(&calm(0.0), &learned, &mut Vec::new());
+        let head = ask(&mut q, 2, "head");
+        ask(&mut q, 3, "small");
+        assert_eq!(step(&mut q, &calm(1.0), &learned), None);
+        q.release(blocker);
+        assert_eq!(step(&mut q, &calm(2.0), &learned), Some(head));
+    }
+
+    #[test]
+    fn missed_cpu_readings_use_the_elapsed_time_and_keep_the_default_commitment() {
+        let mut q = Scheduler::with_cpu_budget(12 * MILLICORES);
+        let demand = |_: &str| Demand::default();
+        let id = ask(&mut q, 1, "burst");
+        step(&mut q, &calm(0.0), &demand);
+        q.observe_cpu(id, 0, false, 0.0);
+        q.observe_cpu(id, 0, false, 1.0);
+        q.observe_cpu(id, 5_600_000_000, false, 8.0);
+        q.observe_cpu(id, 5_600_000_000, false, 9.0);
+        assert_eq!(q.running()[0].measured_cpu(), Some(800));
+        assert_eq!(q.cpu_committed(), 2000);
     }
 
     #[test]
     fn arrivals_use_the_last_sample_without_learning_or_probing() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let first = ask(&mut q, 1, "first");
         let mut out = vec![999];
         q.admit_now(0.0, 0.0, &unknown, &mut out);
@@ -811,7 +1537,7 @@ mod tests {
         assert_eq!(out, [second], "no sample between request and admission");
         assert_eq!(q.running()[1].admitted, 0.1);
         ask(&mut q, 3, "large");
-        let large = |_: &str| Some(60 * GIB);
+        let large = |_: &str| memory(Some(60 * GIB));
         q.admit_now(PROBE_AFTER + 1.0, 61.0, &large, &mut out);
         assert!(out.is_empty());
         assert_eq!(q.cap(), Some(70 * GIB), "arrival never probes the cap");
@@ -823,7 +1549,7 @@ mod tests {
     #[test]
     fn arrivals_obey_the_last_samples_tight_and_frozen_conditions() {
         for (tight, frozen) in [(true, false), (false, true)] {
-            let mut q = Scheduler::new();
+            let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
             let mut out = Vec::new();
             q.step(
                 &Sample {
@@ -849,12 +1575,18 @@ mod tests {
     }
 
     #[test]
-    fn the_head_explains_its_wait_and_nothing_passes_it() {
-        let mut q = Scheduler::new();
+    fn the_head_explains_its_wait_and_keeps_its_share() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let first = ask(&mut q, 1, "large");
-        let head = ask(&mut q, 2, "large");
+        let head = ask(&mut q, 2, "head");
         let behind = ask(&mut q, 3, "small");
-        let need = |s: &str| (s == "large").then_some(30 * GIB);
+        let need = |s: &str| {
+            memory(Some(match s {
+                "large" => 30 * GIB,
+                "head" => 39 * GIB,
+                _ => 2 * GIB,
+            }))
+        };
         let mut out = Vec::new();
         q.step(&calm(0.0), &need, &mut out);
         assert_eq!(out, [first], "the small request cannot pass the head");
@@ -865,7 +1597,7 @@ mod tests {
             view.waiting[0].reason,
             WaitReason::Cap {
                 used: 20 * GIB,
-                reserved: 30 * GIB,
+                reserved: 30 * GIB * 5 / 4,
                 cap: 70 * GIB,
             }
         );
@@ -892,8 +1624,8 @@ mod tests {
 
     #[test]
     fn probing_counts_recent_reservations_as_memory_in_use() {
-        let mut q = Scheduler::new();
-        let need = |_: &str| Some(30 * GIB);
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let need = |_: &str| memory(Some(30 * GIB));
         let mut out = Vec::new();
         q.step(&calm(0.0), &need, &mut out);
         let first = ask(&mut q, 1, "first");
@@ -917,8 +1649,8 @@ mod tests {
     /// once it runs the next one has to fit.
     #[test]
     fn the_next_command_starts_when_nothing_runs_even_if_it_does_not_fit() {
-        let big = |_: &str| Some(30 * GIB);
-        let mut q = Scheduler::new();
+        let big = |_: &str| memory(Some(30 * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 1, "b"));
         assert_eq!(step(&mut q, &at(0.0, 35), &big), None, "never while tight");
         // 55 + 30 is over the cap, which the tight reading set to 65.
@@ -937,7 +1669,7 @@ mod tests {
     /// calm seconds at 20 GiB and then 75 GiB, and later only the 75 GiB.
     #[test]
     fn the_cap_is_learned_from_a_tight_episode() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         run(&mut q, 0, 9, 80, &unknown);
         assert_eq!(q.cap(), Some(70 * GIB));
         step(&mut q, &at(10.0, 25), &unknown);
@@ -956,8 +1688,8 @@ mod tests {
     /// again every 60 s; the request that fits at last is admitted.
     #[test]
     fn the_cap_is_probed_upwards_while_a_request_is_blocked_by_it() {
-        let need = |s: &str| (s == "b").then_some(20 * GIB);
-        let mut q = Scheduler::new();
+        let need = |s: &str| memory((s == "b").then_some(16 * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
         assert!(step(&mut q, &calm(0.0), &need).is_some());
         run(&mut q, 1, 10, 45, &need); // 55 GiB in use, the 5 s average settled
@@ -981,10 +1713,11 @@ mod tests {
 
     #[test]
     fn probing_stops_at_90_percent_of_ram_and_waits_for_a_blocked_request() {
-        let huge = |_: &str| Some(95 * GIB);
-        let mut q = Scheduler::new();
+        let huge = |_: &str| memory(Some(95 * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
         assert!(step(&mut q, &calm(0.0), &huge).is_some());
+        assert_eq!(q.running()[0].exclusive, Some(ExclusiveAdmission::Alone));
         // Nobody waiting: nothing is blocked, so the cap stays where it is.
         run(&mut q, 1, 200, 45, &huge);
         assert_eq!(q.cap(), Some(70 * GIB));
@@ -1004,8 +1737,8 @@ mod tests {
     /// the cap that reading learned.
     #[test]
     fn a_tight_reading_restarts_the_minute_before_the_next_probe() {
-        let need = |_: &str| Some(40 * GIB);
-        let mut q = Scheduler::new();
+        let need = |_: &str| memory(Some(40 * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
         assert!(step(&mut q, &calm(0.0), &need).is_some());
         ask(&mut q, 2, "b");
@@ -1026,19 +1759,19 @@ mod tests {
 
     #[test]
     fn what_was_learned_about_a_command_replaces_the_default_need() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "first");
         assert!(step(&mut q, &calm(0.0), &unknown).is_some());
         run(&mut q, 1, 10, 55, &unknown); // 45 GiB in use, the 5 s average settled
         ask(&mut q, 2, "bun run test");
-        let need = |q: &Scheduler, learned: &dyn Fn(&str) -> Option<u64>| {
+        let need = |q: &Scheduler, learned: &dyn Fn(&str) -> Demand| {
             let mut view = Snapshot::default();
             q.snapshot(learned, &mut view);
             view.waiting[0].need
         };
         assert_eq!(need(&q, &unknown), GIB);
-        let learned = |s: &str| (s == "bun run test").then_some(30 * GIB);
-        assert_eq!(need(&q, &learned), 30 * GIB);
+        let learned = |s: &str| memory((s == "bun run test").then_some(30 * GIB));
+        assert_eq!(need(&q, &learned), 30 * GIB * 5 / 4);
 
         // 45 + 30 is over the 70 GiB cap; 45 + the default 1 is not.
         assert_eq!(run(&mut q, 11, 20, 55, &learned), None);
@@ -1053,70 +1786,45 @@ mod tests {
         );
     }
 
-    /// A stranger is expected to need a fifth of the cap on a small machine, not a whole GiB.
     #[test]
-    fn the_default_need_is_a_fifth_of_the_cap_on_a_small_machine() {
-        let mut q = Scheduler::new();
-        ask(&mut q, 1, "a");
+    fn cold_reservations_have_a_four_gib_floor_even_on_small_machines() {
+        let mut q = Scheduler::with_cpu_budget(24000);
+        let cold = |_: &str| Demand::default();
+        let a = ask(&mut q, 1, "cold a");
+        let b = ask(&mut q, 1, "cold b");
         let small = Sample {
             ram: 4 * GIB,
             ..calm(0.0)
         };
-        let _ = step(&mut q, &small, &unknown);
-        let cap = q.cap().unwrap();
-        assert_eq!(cap, 4 * GIB * 70 / 100);
-        ask(&mut q, 2, "b");
+        assert_eq!(step(&mut q, &small, &cold), Some(a));
+        assert_eq!(q.running()[0].need, 4 * GIB);
+        assert_eq!(q.waiting()[0].id, b);
+        let mut view = Snapshot::default();
+        q.snapshot(&cold, &mut view);
+        assert_eq!(view.waiting[0].need, 4 * GIB);
+    }
+
+    #[test]
+    fn reconnection_keeps_the_original_request_order_across_sessions() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let new = q.enqueue(2, "new".into(), "new".into(), 30.0);
+        let retry = q.enqueue(1, "old".into(), "old".into(), 10.0);
         let mut view = Snapshot::default();
         q.snapshot(&unknown, &mut view);
         assert_eq!(
-            (view.waiting[0].position, view.waiting[0].need),
-            (1, cap / 5)
+            view.waiting.iter().map(|w| w.id).collect::<Vec<_>>(),
+            [retry, new]
         );
-        assert!(cap / 5 < GIB);
-    }
-
-    /// Sessions take turns: agent 1 asks three times before agent 2 asks once, and agent 2's
-    /// command is second, not fourth.
-    #[test]
-    fn sessions_take_turns() {
-        let mut q = Scheduler::new();
-        for name in ["a1", "a2", "a3"] {
-            ask(&mut q, 1, name);
-        }
-        ask(&mut q, 2, "b1");
-        let order = |q: &Scheduler| -> Vec<String> {
-            let mut view = Snapshot::default();
-            q.snapshot(&unknown, &mut view);
-            view.waiting.iter().map(|w| w.label.clone()).collect()
-        };
-        assert_eq!(order(&q), ["a1", "b1", "a2", "a3"]);
         let mut out = Vec::new();
         q.step(&calm(0.0), &unknown, &mut out);
-        assert_eq!(names(&q), ["a1", "b1", "a2", "a3"]);
-        assert_eq!(out, q.running().iter().map(|r| r.id).collect::<Vec<_>>());
-    }
-
-    /// A session that already has a command running goes behind one that has none, however
-    /// much older its request is; and ties go to the older request.
-    #[test]
-    fn the_session_with_fewer_commands_running_goes_first_and_ties_go_to_the_older() {
-        let mut q = Scheduler::new();
-        ask(&mut q, 1, "running");
-        assert!(step(&mut q, &calm(0.0), &unknown).is_some());
-        ask(&mut q, 1, "old");
-        ask(&mut q, 2, "new");
-        ask(&mut q, 3, "newest");
-        let mut out = Vec::new();
-        q.step(&calm(1.0), &unknown, &mut out);
-        assert_eq!(out.len(), 3);
-        assert_eq!(names(&q), ["running", "new", "newest", "old"]);
+        assert_eq!(out, [retry, new]);
     }
 
     /// Within one session the order never changes, whoever else comes and goes, and the
     /// positions told to the clients follow it.
     #[test]
     fn requests_of_one_session_stay_in_arrival_order() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let ids: Vec<Id> = ["a", "b", "c", "d"]
             .iter()
             .map(|n| ask(&mut q, 7, n))
@@ -1144,7 +1852,7 @@ mod tests {
 
     #[test]
     fn a_running_command_is_measured_and_released() {
-        let mut q = Scheduler::new();
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let a = ask(&mut q, 1, "a");
         assert!(!q.started(a, 4242, 7), "not admitted yet");
         assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(a));
@@ -1160,5 +1868,50 @@ mod tests {
         );
         assert!(q.release(a).is_none(), "released once");
         assert!(q.running().is_empty());
+    }
+
+    #[test]
+    fn review3_a_single_busy_interval_is_learned_as_the_peak() {
+        let demand = |_: &str| memory(None);
+        let mut q = Scheduler::with_cpu_budget(12000);
+        let id = ask(&mut q, 1, "burst");
+        step(&mut q, &calm(0.0), &demand);
+        q.observe_cpu(id, 0, false, 0.0);
+        for i in 1..=20 {
+            q.observe_cpu(id, 8_000_000_000, false, f64::from(i));
+        }
+        assert_eq!(q.running()[0].measured_cpu(), Some(8000));
+    }
+    #[test]
+    fn review3_late_backfill_uses_the_arrival_clock_and_margin() {
+        let mut q = Scheduler::with_cpu_budget(4000);
+        let learned = |s: &str| Demand {
+            bytes: Some(
+                match s {
+                    "watch" => 8,
+                    "blocker" => 16,
+                    "head" => 24,
+                    _ => 1,
+                } * GIB,
+            ),
+            millicores: Some(if s == "watch" || s == "head" {
+                2000
+            } else {
+                1000
+            }),
+            runtime_ms: match s {
+                "blocker" => Some(10000),
+                "late" => Some(500),
+                _ => None,
+            },
+        };
+        ask(&mut q, 1, "watch");
+        ask(&mut q, 1, "blocker");
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &learned, &mut out);
+        ask(&mut q, 1, "head");
+        ask(&mut q, 1, "late");
+        q.admit_now(9.4, 9.4, &learned, &mut out);
+        assert!(out.is_empty());
     }
 }

@@ -23,8 +23,8 @@ const DRY_RUN_LOG_DIR: &str = "/var/log/membrake/dry-run";
 /// memory, macOS does not kill them: it compresses, swaps and finally freezes. `membrake
 /// exec` queues a heavy command until there is memory for it. The daemon watches what the
 /// kernel actually runs out of (compressor occupancy and room for swap), freezes (SIGSTOP)
-/// the newest eligible job when memory gets tight, resumes frozen jobs when it recovers, and
-/// kills the biggest eligible job only at the cliff.
+/// eligible groups when measured pressure warrants it, resumes frozen jobs when it recovers,
+/// and kills only at measured kill pressure.
 ///
 /// A job is a process group. Never touched: application, XPC and extension bundles, system
 /// processes, groups led by a uid below 500 or mixing users, the agent CLIs (claude, codex),
@@ -53,7 +53,7 @@ enum Command {
     /// root to act on other users' jobs; only one instance may run at a time.
     ///
     /// Also serves the queue: `membrake exec` asks for its turn on the socket (--socket) and
-    /// the daemon starts each command when there is memory for it.
+    /// the daemon starts each command based on memory and running jobs' CPU commitments.
     Run(RunArgs),
     /// Show the live signals, the frozen jobs and the next candidates
     ///
@@ -63,14 +63,14 @@ enum Command {
     ///
     /// Nothing is signalled. The candidate jobs are the ones recorded in the file.
     Replay(ReplayArgs),
-    /// Run a command when there is memory for it
+    /// Queue a command for memory and CPU admission
     ///
     /// Asks the daemon (`membrake run`) for a turn, waits for the go-ahead, runs the command
     /// at the caller's priority in a process group of its own, and exits
     /// with its exit code (128 plus the signal if it died of one). The daemon starts a command
-    /// when the memory in use plus what it is expected to need stays under a cap it learns,
-    /// never while memory is tight or a job is frozen. If the daemon cannot be reached the
-    /// command runs at once. Inside a command that was admitted, it runs directly.
+    /// when its expected memory fits and running jobs commit less than the CPU budget,
+    /// never while memory is tight or a job is frozen. If the queue is unavailable the
+    /// client exits with an error. A call inside an admitted command shares its reservation.
     Exec(ExecArgs),
 }
 
@@ -83,7 +83,7 @@ struct PolicyArgs {
     /// Minimum time between freezes, between resumes, and after a kill
     #[arg(long, value_name = "SECONDS", default_value_t = 10.0)]
     settle_seconds: f64,
-    /// Kill a job frozen longer than this while memory is still tight
+    /// Allow an overdue frozen job to bypass the settle period at sustained freeze pressure
     #[arg(long, value_name = "MINUTES", default_value_t = 15.0)]
     max_freeze_minutes: f64,
 }
@@ -91,15 +91,14 @@ struct PolicyArgs {
 /// Which groups are eligible, and in what order.
 #[derive(Args)]
 struct RuleArgs {
-    /// This user's jobs are never frozen and are killed only when no other eligible job is
-    /// left, e.g. a CI runner account. Ranking only: a uid below 500 also needs
-    /// --include-user (repeatable)
+    /// Exempt this user's jobs from freezing and killing (repeatable). A uid below 500
+    /// also needs --include-user to be considered for group classification.
     #[arg(long, value_name = "NAME")]
     protect_user: Vec<String>,
     /// Treat this user's jobs as eligible even though its uid is below 500 (repeatable)
     #[arg(long, value_name = "NAME")]
     include_user: Vec<String>,
-    /// Jobs matching this POSIX extended regex rank first for freezing and killing; matched
+    /// Prefer jobs matching this POSIX extended regex when victim class and excess are tied; matched
     /// against process names, executable paths and the leader's command line (repeatable)
     #[arg(long, value_name = "REGEX")]
     prefer: Vec<String>,
@@ -124,6 +123,14 @@ struct RunArgs {
     /// Seconds between SIGTERM and SIGKILL when a kill is not an emergency
     #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
     term_seconds: f64,
+    /// Percentage of logical CPU cores subtracted from the soft admission budget
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        value_parser = clap::value_parser!(u32).range(0..100),
+        default_value_t = membrake::queue::DEFAULT_CPU_HEADROOM_PERCENT
+    )]
+    cpu_headroom_percent: u32,
     /// Where frozen jobs are recorded so a restart can resume them
     #[arg(long, value_name = "DIR", default_value = "/var/db/membrake")]
     state_dir: PathBuf,
@@ -243,6 +250,7 @@ fn run(a: RunArgs, uid: u32, euid: u32) -> Result<(), String> {
         rules: rule_args,
         dry_run,
         term_seconds,
+        cpu_headroom_percent,
         state_dir,
         log_dir,
         on_event,
@@ -291,6 +299,7 @@ fn run(a: RunArgs, uid: u32, euid: u32) -> Result<(), String> {
             policy: policy(&policy_args)?,
             rules,
             term_seconds,
+            cpu_headroom_percent,
             on_event,
         })
     };

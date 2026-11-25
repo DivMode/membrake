@@ -12,6 +12,7 @@
 
 use crate::engine::{Action, Engine, Policy, Step};
 use crate::jobs::{Job, one_line};
+use crate::queue::{Reservation, ReservationLimit};
 use crate::signals::{self, Pressure, Signals};
 use crate::spool::Spool;
 use std::fmt::Write as _;
@@ -39,14 +40,15 @@ const EVENT_QUEUE: usize = 256;
 const SAMPLE_QUEUE: usize = 256;
 
 /// `time` is the wall clock (for people); `uptime` is the engine's clock, which `replay`
-/// uses. The next seven columns are the raw readings `replay` feeds the engine; `occupancy`,
-/// `eta_s` and `tight` are derived and informational.
+/// uses. The next seven columns are the raw readings `replay` feeds the engine.
+/// `occupancy` and `tight` are derived. The historical ETA column is left empty.
 ///
 /// `jobs` is the candidate list the engine was shown on that sample. Empty means the process
 /// table was not scanned; `-` means it was scanned and nothing qualified. Otherwise entries
 /// `pgid:leader_pid:start_us:uid:bytes:procs:flags:command` joined by `;`, with flags among
 /// `p` (preferred), `P` (protected user), `s` (stopped) or `-`.
-pub const HEADER: &str = "time\tuptime\tsegments\tpages\tswap_used\theadroom\tram\tlevel\tpressure\toccupancy\teta_s\ttight\tjobs\n";
+/// The final column records the admitted group identities and limits used to rank victims.
+pub const HEADER: &str = "time\tuptime\tsegments\tpages\tswap_used\theadroom\tram\tlevel\tpressure\toccupancy\teta_s\ttight\tjobs\treservations\n";
 
 /// An append-only file that moves itself to `<name>.1` when the next write would pass the
 /// cap. It opens lazily and re-opens after any failure, so a full disk or a missing
@@ -381,6 +383,16 @@ impl Recorder {
     /// nothing). Never waits, and allocation-free once the row buffers have grown to fit: if
     /// the thread has fallen `SAMPLE_QUEUE` samples behind, this one is dropped and counted.
     pub fn sample(&mut self, s: &Signals, step: &Step, jobs: Option<&[Job]>) {
+        self.sample_with_admissions(s, step, jobs, &[]);
+    }
+
+    pub(crate) fn sample_with_admissions(
+        &mut self,
+        s: &Signals,
+        step: &Step,
+        jobs: Option<&[Job]>,
+        reservations: &[Reservation],
+    ) {
         let Some(samples) = &self.samples else {
             return;
         };
@@ -390,7 +402,7 @@ impl Recorder {
                 Err(_) => return samples.count_dropped(),
             }
         }
-        format_row(&mut self.line, s, step, jobs);
+        format_row_with_admissions(&mut self.line, s, step, jobs, reservations);
         if let Err(SampleMsg::Line(line)) =
             samples.offer(SampleMsg::Line(std::mem::take(&mut self.line)))
         {
@@ -473,6 +485,16 @@ impl Recorder {
 /// One TSV line (with its newline) in `line`, which is cleared first. Allocation-free once
 /// the buffer has grown to fit.
 pub fn format_row(line: &mut String, s: &Signals, step: &Step, jobs: Option<&[Job]>) {
+    format_row_with_admissions(line, s, step, jobs, &[]);
+}
+
+fn format_row_with_admissions(
+    line: &mut String,
+    s: &Signals,
+    step: &Step,
+    jobs: Option<&[Job]>,
+    reservations: &[Reservation],
+) {
     line.clear();
     let _ = write!(
         line,
@@ -488,9 +510,6 @@ pub fn format_row(line: &mut String, s: &Signals, step: &Step, jobs: Option<&[Jo
         s.pressure as u8,
         step.occupancy
     );
-    if step.eta.is_finite() {
-        let _ = write!(line, "{}", step.eta as u64);
-    }
     let _ = write!(line, "\t{}\t", u8::from(step.tight));
     match jobs {
         None => {}
@@ -521,6 +540,16 @@ pub fn format_row(line: &mut String, s: &Signals, step: &Step, jobs: Option<&[Jo
                 );
             }
         }
+    }
+    line.push('\t');
+    for (i, r) in reservations.iter().enumerate() {
+        if i > 0 {
+            line.push(';');
+        }
+        let _ = match r.limit {
+            ReservationLimit::Learned(need) => write!(line, "{}:{}:{need}", r.pgid, r.start_us),
+            ReservationLimit::Cold(need) => write!(line, "{}:{}:c{need}", r.pgid, r.start_us),
+        };
     }
     line.push('\n');
 }
@@ -571,6 +600,7 @@ pub fn describe(action: &Action) -> (&'static str, String) {
             job,
             immediate,
             reason,
+            ..
         } => (
             "kill",
             format!(
@@ -589,6 +619,7 @@ pub struct Row {
     pub signals: Signals,
     /// None: the process table was not scanned on this sample.
     pub jobs: Option<Vec<Job>>,
+    reservations: Vec<Reservation>,
 }
 
 fn parse_job(entry: &str) -> Option<Job> {
@@ -616,11 +647,28 @@ fn parse_job(entry: &str) -> Option<Job> {
     })
 }
 
+fn parse_reservation(entry: &str) -> Option<Reservation> {
+    let mut fields = entry.split(':');
+    let (pgid, start_us, need) = (fields.next()?, fields.next()?, fields.next()?);
+    (fields.next().is_none()).then_some(Reservation {
+        pgid: pgid.parse().ok()?,
+        start_us: start_us.parse().ok()?,
+        limit: if let Some(cold) = need.strip_prefix('c') {
+            ReservationLimit::Cold(cold.parse().ok()?)
+        } else if need == "0" {
+            // Older recordings used zero for a cold job and did not save its default.
+            ReservationLimit::Cold(0)
+        } else {
+            ReservationLimit::Learned(need.parse().ok()?)
+        },
+    })
+}
+
 pub fn parse_row(line: &str) -> Result<Row, String> {
     let f: Vec<&str> = line.split('\t').collect();
-    if f.len() != 13 {
+    if !matches!(f.len(), 13..=16) {
         return Err(format!(
-            "expected 13 tab-separated columns, found {}",
+            "expected 13 to 16 tab-separated columns, found {}",
             f.len()
         ));
     }
@@ -654,6 +702,18 @@ pub fn parse_row(line: &str) -> Result<Row, String> {
             pressure: Pressure::from_raw(int(8)?),
         },
         jobs,
+        reservations: match f.len() {
+            14 => f.get(13),
+            16 => f.get(15),
+            _ => None,
+        }
+        .into_iter()
+        .flat_map(|entries| entries.split(';'))
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            parse_reservation(entry).ok_or_else(|| format!("bad reservation entry {entry:?}"))
+        })
+        .collect::<Result<_, _>>()?,
     })
 }
 
@@ -757,7 +817,7 @@ pub fn replay_with(
             jobs = list;
         }
         summary.samples += 1;
-        let step = engine.step(&row.signals, || jobs.clone());
+        let step = engine.step_with_admissions(&row.signals, &row.reservations, || jobs.clone());
         for action in &step.actions {
             match action {
                 Action::Stall { .. } => summary.stalls += 1,
@@ -894,10 +954,10 @@ mod tests {
         let mut out = Vec::new();
         let summary = replay(text.as_bytes(), Policy::default(), &mut out).unwrap();
         // The engine saw the jobs only on the second sample, so that is where it can pick
-        // one: the preferred job ranks first, then it is frozen.
+        // one: the largest group ranks first.
         assert_eq!(summary.samples, 4);
         let printed = String::from_utf8(out).unwrap();
-        assert!(printed.contains("freeze 4.0GB group 11"), "{printed}");
+        assert!(printed.contains("freeze 8.0GB group 10"), "{printed}");
         assert!(printed.contains("2023-11-14T22:13:2"), "{printed}");
     }
 
@@ -946,6 +1006,80 @@ mod tests {
         let (cleared, printed) = replayed(tsv(Some(&[])));
         assert_eq!(cleared.freezes, 0, "{printed}");
         assert!(printed.contains("no eligible job"), "{printed}");
+    }
+
+    #[test]
+    fn replay_uses_the_same_reservations_to_choose_a_victim() {
+        let jobs = jobs3();
+        let reservations = [
+            Reservation {
+                pgid: jobs[0].pgid,
+                start_us: jobs[0].start_us,
+                limit: ReservationLimit::Learned(4 << 30),
+            },
+            Reservation {
+                pgid: jobs[1].pgid,
+                start_us: jobs[1].start_us,
+                limit: ReservationLimit::Cold(8 << 30),
+            },
+        ];
+        let mut tsv = String::from(HEADER);
+        let mut line = String::new();
+        let mut engine = Engine::new(Policy::default());
+        for i in 0..2 {
+            let s = signals(i, 0.65, 35);
+            let step = engine.step_with_admissions(&s, &reservations, || jobs.to_vec());
+            format_row_with_admissions(&mut line, &s, &step, Some(&jobs), &reservations);
+            tsv.push_str(&line);
+        }
+        let mut out = Vec::new();
+        replay(tsv.as_bytes(), Policy::default(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("freeze 8.0GB group 10"), "{out}");
+        assert!(!out.contains("freeze 4.0GB group 11"), "{out}");
+    }
+
+    #[test]
+    fn legacy_growth_columns_do_not_change_measured_pressure_decisions() {
+        let jobs = jobs3();
+        let mut replays = Vec::new();
+        for credited in [false, true] {
+            let mut tsv = String::new();
+            let mut line = String::new();
+            let mut engine = Engine::new(Policy::default());
+            for i in 0..=13 {
+                let occupancy = match i {
+                    0..=10 => 0.40 + 0.018 * f64::from(i),
+                    11..=12 => 0.65,
+                    _ => 0.93,
+                };
+                let mut s = signals(i, occupancy, 43 - 8 * i.min(10) as i32 / 10);
+                s.pressure = Pressure::Warn;
+                let step = engine.step(&s, Vec::new);
+                format_row(&mut line, &s, &step, Some(&jobs));
+                for field in line.split('\t').take(13) {
+                    tsv.push_str(field);
+                    tsv.push('\t');
+                }
+                let growth = if credited {
+                    (8u64 << 30) * u64::from(i.min(10)) / 10
+                } else {
+                    0
+                };
+                use std::fmt::Write as _;
+                writeln!(tsv, "{growth}\t0\t").unwrap();
+            }
+            let mut out = Vec::new();
+            let summary = replay(tsv.as_bytes(), Policy::default(), &mut out).unwrap();
+            assert_eq!(
+                (summary.freezes, summary.kills),
+                (1, 1),
+                "{}",
+                String::from_utf8_lossy(&out)
+            );
+            replays.push(out);
+        }
+        assert_eq!(replays[0], replays[1]);
     }
 
     #[test]
