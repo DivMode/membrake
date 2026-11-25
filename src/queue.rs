@@ -681,16 +681,19 @@ impl Scheduler {
         let max = percent(self.ram, MAX_PERCENT);
         if self.running.is_empty() {
             Some(ExclusiveAdmission::Alone)
-        } else if self.now - self.sample_time > FRESH_SAMPLE_SECONDS || !self.below_freeze {
-            // Beside other jobs only while the compressor is below the freeze tier: a cap
-            // that fell back under pressure must not turn a waiting job into one that starts.
+        } else if self.now - self.sample_time > FRESH_SAMPLE_SECONDS {
             None
-        } else if self
-            .measured_background
-            .saturating_add(reserved)
-            .saturating_add(need)
-            < max
+        } else if self.below_freeze
+            && self
+                .measured_background
+                .saturating_add(reserved)
+                .saturating_add(need)
+                < max
         {
+            // Beside other jobs by reservations only while the compressor is below the freeze
+            // tier: a cap that fell back under pressure must not turn a waiting job into one
+            // that starts at once. Occupancy can stay high long after a load (fragmented
+            // segments), so the ten-minute fallback below still bounds the wait.
             Some(ExclusiveAdmission::Reservations)
         } else if self.now - since >= EXCLUSIVE_WAIT_SECONDS {
             Some(ExclusiveAdmission::TimedOut)
@@ -1962,6 +1965,37 @@ mod tests {
             step(&mut q, &quiet(2.0, freeze - 0.01), &learned),
             Some(big),
             "the reservations fit below it"
+        );
+    }
+
+    /// Occupancy can stay at the freeze tier long after a load while memory is calm; the
+    /// ten-minute fallback still bounds an oversized head's wait.
+    #[test]
+    fn an_oversized_head_waits_at_most_ten_minutes_at_freeze_occupancy() {
+        let learned = |s: &str| match s {
+            "small" => memory(Some(8 * GIB)),
+            _ => memory(Some(56 * GIB)),
+        };
+        let quiet = |time, occupancy| Sample {
+            occupancy,
+            ..at(time, 95)
+        };
+        let freeze = Policy::default().freeze_occupancy;
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let small = ask(&mut q, 1, "small");
+        assert_eq!(step(&mut q, &quiet(0.0, 0.0), &learned), Some(small));
+        let big = ask(&mut q, 2, "big");
+        assert_eq!(step(&mut q, &quiet(1.0, freeze), &learned), None);
+        let waited = 1.0 + EXCLUSIVE_WAIT_SECONDS;
+        assert_eq!(
+            step(&mut q, &quiet(waited - 1.0, freeze), &learned),
+            None,
+            "still inside the ten minutes"
+        );
+        assert_eq!(
+            step(&mut q, &quiet(waited, freeze), &learned),
+            Some(big),
+            "the fallback ends the wait"
         );
     }
 
