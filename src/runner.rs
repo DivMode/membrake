@@ -549,12 +549,7 @@ impl Runner {
         self.update_hold(s);
         if let Some(queue) = self.queue.as_mut() {
             queue.measure(s.time);
-            for (kind, text) in queue.schedule(
-                s,
-                step.tight,
-                self.held,
-                self.engine.policy().freeze_occupancy,
-            ) {
+            for (kind, text) in queue.schedule(s, step.tight, self.held, self.engine.policy()) {
                 self.events.push(Event::note(s.wall, kind, text));
             }
         }

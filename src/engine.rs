@@ -59,6 +59,12 @@ impl Default for Policy {
     }
 }
 
+impl Policy {
+    pub(crate) fn freeze_occupancy_tripped(&self, tight: bool, occupancy: f64) -> bool {
+        tight && occupancy >= self.freeze_occupancy
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// The previous sample was too long ago.
@@ -191,7 +197,7 @@ impl Arm {
 
     fn tripped(self, v: &View, p: &Policy) -> bool {
         match self {
-            Arm::FreezeOccupancy => v.tight && v.occupancy >= p.freeze_occupancy,
+            Arm::FreezeOccupancy => p.freeze_occupancy_tripped(v.tight, v.occupancy),
             Arm::FreezeHeadroom => v.tight && v.headroom < v.ram,
             Arm::KillOccupancyNow => v.tight && v.occupancy >= p.kill_occupancy_now,
             Arm::KillHeadroomNow => v.tight && v.headroom < p.kill_headroom_now,

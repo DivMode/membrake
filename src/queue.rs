@@ -420,10 +420,8 @@ pub struct Scheduler {
     background: History,
     /// None until the first reading says how much RAM there is.
     cap: Option<u64>,
-    /// The initial cap or the cap learned at the most recent tight reading, before probes.
-    base_cap: u64,
-    /// The latest reading's compressor occupancy is below the engine's freeze tier.
-    below_freeze: bool,
+    /// The latest reading trips the engine's compressor freeze arm.
+    freeze_pressure: bool,
     ram: u64,
     /// Background memory averaged over the last `USED_WINDOW`.
     used: u64,
@@ -471,8 +469,7 @@ impl Scheduler {
             history: History::new(),
             background: History::new(),
             cap: None,
-            base_cap: 0,
-            below_freeze: true,
+            freeze_pressure: false,
             ram: 0,
             used: 0,
             cpu_budget,
@@ -686,17 +683,15 @@ impl Scheduler {
             Some(ExclusiveAdmission::Alone)
         } else if self.now - self.sample_time > FRESH_SAMPLE_SECONDS {
             None
-        } else if self.below_freeze
+        } else if !self.freeze_pressure
             && self
                 .measured_background
                 .saturating_add(reserved)
                 .saturating_add(need)
                 < max
         {
-            // Beside other jobs by reservations only while the compressor is below the freeze
-            // tier: a cap that fell back under pressure must not turn a waiting job into one
-            // that starts at once. Occupancy can stay high long after a load (fragmented
-            // segments), so the ten-minute fallback below still bounds the wait.
+            // A cap that fell back under freeze-tier pressure must not start a waiting job
+            // beside other jobs until the pressure clears.
             Some(ExclusiveAdmission::Reservations)
         } else if self.now - since >= EXCLUSIVE_WAIT_SECONDS {
             Some(ExclusiveAdmission::TimedOut)
@@ -792,14 +787,14 @@ impl Scheduler {
     /// Takes one reading and admits every request that fits. Clears `out`, then appends the
     /// admitted ids in order. Allocation-free when nobody is waiting.
     pub fn step(&mut self, s: &Sample, learned: &dyn Fn(&str) -> Demand, out: &mut Vec<Id>) {
-        self.step_at(s, s.time, Policy::default().freeze_occupancy, learned, out);
+        self.step_at(s, s.time, &Policy::default(), learned, out);
     }
 
     pub(crate) fn step_at(
         &mut self,
         s: &Sample,
         decision_time: f64,
-        freeze_occupancy: f64,
+        policy: &Policy,
         learned: &dyn Fn(&str) -> Demand,
         out: &mut Vec<Id>,
     ) {
@@ -809,9 +804,9 @@ impl Scheduler {
         self.ram = s.ram;
         self.tight = s.tight;
         self.frozen = s.frozen;
+        self.freeze_pressure = policy.freeze_occupancy_tripped(s.tight, s.occupancy);
         if self.cap.is_none() {
-            self.base_cap = percent(s.ram, START_PERCENT);
-            self.cap = Some(self.base_cap);
+            self.cap = Some(percent(s.ram, START_PERCENT));
             self.quiet_since = now;
         }
         let attributable = self
@@ -824,21 +819,16 @@ impl Scheduler {
         self.history.push(now, measured_memory);
         self.background.push(now, self.measured_background);
         self.used = self.background.average(now, USED_WINDOW);
-        let below_freeze_occupancy = s.occupancy < freeze_occupancy;
-        self.below_freeze = below_freeze_occupancy;
         if s.tight {
-            // What was in use when memory ran short is what the machine can hold.
-            self.base_cap = self.history.average(now, CAP_WINDOW);
-            self.cap = Some(self.base_cap);
+            // Tight readings, including freeze-tier pressure, replace any probed cap.
+            self.cap = Some(self.history.average(now, CAP_WINDOW));
             self.quiet_since = now;
-        } else if !below_freeze_occupancy {
-            self.cap = Some(self.base_cap);
         }
 
         // Held back by the cap and nothing else, for a minute of quiet: try a little more.
         if !s.tight
             && !s.frozen
-            && below_freeze_occupancy
+            && !self.freeze_pressure
             && !self.running.is_empty()
             && now - self.quiet_since >= PROBE_AFTER
             && self
@@ -1900,56 +1890,108 @@ mod tests {
     }
 
     #[test]
-    fn cap_probe_keeps_the_cap_at_or_above_freeze_occupancy() {
-        let freeze_occupancy = Policy::default().freeze_occupancy;
-        for occupancy in [freeze_occupancy, freeze_occupancy + 0.15] {
+    fn cap_probe_raises_the_cap_when_occupancy_stays_high_but_memory_is_calm() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let need = |_: &str| memory(Some(30 * GIB));
+        let quiet = |time| Sample {
+            occupancy: 0.75,
+            ..at(time, 90)
+        };
+        let first = ask(&mut q, 1, "first");
+        assert_eq!(step(&mut q, &quiet(0.0), &need), Some(first));
+        let head = ask(&mut q, 2, "second");
+        assert_eq!(step(&mut q, &quiet(PROBE_AFTER - 1.0), &need), None);
+        assert_eq!(q.cap(), Some(70 * GIB));
+        assert_eq!(step(&mut q, &quiet(PROBE_AFTER), &need), None);
+        assert_eq!(q.waiting()[0].id, head);
+        assert_eq!(q.cap(), Some(75 * GIB), "the blocked head triggers a probe");
+    }
+
+    #[test]
+    fn cap_probe_gives_back_its_increase_under_freeze_pressure() {
+        for occupancy in [0.75, Policy::default().freeze_occupancy] {
             let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
-            let need = |_: &str| memory(Some(30 * GIB));
+            // Even after pressure clears, 10 + 42.5 + 42.5 exceeds the exclusive ceiling.
+            let need = |_: &str| memory(Some(34 * GIB));
+            let reading = |time, level| Sample {
+                occupancy,
+                ..at(time, level)
+            };
             let first = ask(&mut q, 1, "first");
             assert_eq!(step(&mut q, &calm(0.0), &need), Some(first));
             ask(&mut q, 2, "second");
-            for time in 1..=60 {
-                let s = Sample {
-                    occupancy,
-                    ..calm(f64::from(time))
-                };
-                assert_eq!(step(&mut q, &s, &need), None);
-                assert_eq!(q.cap(), Some(70 * GIB), "occupancy {occupancy}, t = {time}");
+            assert_eq!(run(&mut q, 1, 60, 90, &need), None);
+            assert_eq!(q.cap(), Some(75 * GIB), "probed in calm memory");
+            assert_eq!(step(&mut q, &reading(61.0, 90), &need), None);
+            assert_eq!(q.cap(), Some(75 * GIB), "occupancy alone keeps the probe");
+
+            assert_eq!(step(&mut q, &reading(62.0, 35), &need), None);
+            assert_eq!(
+                q.cap(),
+                Some((14 * 10 + 65) * GIB / 15),
+                "tight memory gives back the probe and learns the last 15 s of use"
+            );
+            for time in 63..=122 {
+                assert_eq!(step(&mut q, &reading(f64::from(time), 35), &need), None);
+                if time >= 76 {
+                    assert_eq!(q.cap(), Some(65 * GIB), "no probe under sustained pressure");
+                }
             }
+            assert_eq!(step(&mut q, &reading(123.0, 90), &need), None);
+            assert_eq!(
+                q.cap(),
+                Some(65 * GIB),
+                "quiet time restarts after pressure"
+            );
         }
     }
 
     #[test]
-    fn cap_probe_gives_back_its_increase_at_freeze_occupancy() {
-        for (last, base) in [(calm(1.0), 70 * GIB), (at(1.0, 35), (20 + 65) * GIB / 2)] {
-            let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
-            let need = |_: &str| memory(Some(30 * GIB));
-            step(&mut q, &calm(0.0), &need);
-            step(&mut q, &last, &need);
-            let first = ask(&mut q, 1, "first");
-            assert_eq!(step(&mut q, &calm(2.0), &need), Some(first));
-            ask(&mut q, 2, "second");
-            assert_eq!(run(&mut q, 3, 61, 80, &need), None);
-            assert_eq!(q.cap(), Some(base + 5 * GIB), "probed in calm memory");
-
-            let s = Sample {
-                occupancy: Policy::default().freeze_occupancy,
-                ..calm(62.0)
-            };
-            assert_eq!(step(&mut q, &s, &need), None);
-            assert_eq!(q.cap(), Some(base), "restored the cap from before probing");
-        }
-    }
-
-    /// A head that needs the whole cap starts beside other jobs only below the freeze tier:
-    /// under pressure the exclusive path's reservation rule must not admit it either.
-    #[test]
-    fn an_oversized_head_waits_beside_others_at_freeze_occupancy() {
+    fn an_oversized_head_can_start_beside_others_when_pressure_clears() {
         let learned = |s: &str| match s {
             "small" => memory(Some(8 * GIB)),
             _ => memory(Some(56 * GIB)),
         };
         // 5 GiB in use: 5 + 10 reserved + 70 needed fits under the 90% ceiling.
+        let quiet = |time, occupancy| Sample {
+            occupancy,
+            ..at(time, 95)
+        };
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let small = ask(&mut q, 1, "small");
+        assert_eq!(step(&mut q, &quiet(0.0, 0.0), &learned), Some(small));
+        let big = ask(&mut q, 2, "big");
+        // The OS can report warning pressure while the memory level remains high.
+        assert_eq!(
+            step(
+                &mut q,
+                &Sample {
+                    tight: true,
+                    ..quiet(1.0, 0.75)
+                },
+                &learned
+            ),
+            None,
+            "pressure holds the head even though the reservations fit"
+        );
+        assert_eq!(
+            step(&mut q, &quiet(2.0, 0.75), &learned),
+            Some(big),
+            "the reservations fit once pressure clears at the same occupancy"
+        );
+        assert_eq!(
+            q.running()[1].exclusive,
+            Some(ExclusiveAdmission::Reservations)
+        );
+    }
+
+    /// The ten-minute fallback bounds the wait when reservations exceed 90% of RAM.
+    #[test]
+    fn an_oversized_head_waits_at_most_ten_minutes_at_freeze_occupancy() {
+        let learned = |s: &str| match s {
+            "small" => memory(Some(8 * GIB)),
+            _ => memory(Some(61 * GIB)),
+        };
         let quiet = |time, occupancy| Sample {
             occupancy,
             ..at(time, 95)
@@ -1962,33 +2004,8 @@ mod tests {
         assert_eq!(
             step(&mut q, &quiet(1.0, freeze), &learned),
             None,
-            "not beside others at the freeze tier"
+            "5 used + 10 reserved + 76.25 needed exceeds the 90% ceiling"
         );
-        assert_eq!(
-            step(&mut q, &quiet(2.0, freeze - 0.01), &learned),
-            Some(big),
-            "the reservations fit below it"
-        );
-    }
-
-    /// Occupancy can stay at the freeze tier long after a load while memory is calm; the
-    /// ten-minute fallback still bounds an oversized head's wait.
-    #[test]
-    fn an_oversized_head_waits_at_most_ten_minutes_at_freeze_occupancy() {
-        let learned = |s: &str| match s {
-            "small" => memory(Some(8 * GIB)),
-            _ => memory(Some(56 * GIB)),
-        };
-        let quiet = |time, occupancy| Sample {
-            occupancy,
-            ..at(time, 95)
-        };
-        let freeze = Policy::default().freeze_occupancy;
-        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
-        let small = ask(&mut q, 1, "small");
-        assert_eq!(step(&mut q, &quiet(0.0, 0.0), &learned), Some(small));
-        let big = ask(&mut q, 2, "big");
-        assert_eq!(step(&mut q, &quiet(1.0, freeze), &learned), None);
         let waited = 1.0 + EXCLUSIVE_WAIT_SECONDS;
         assert_eq!(
             step(&mut q, &quiet(waited - 1.0, freeze), &learned),
@@ -2000,6 +2017,7 @@ mod tests {
             Some(big),
             "the fallback ends the wait"
         );
+        assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
     }
 
     /// With nothing running the next command starts although it does not fit (a machine that
