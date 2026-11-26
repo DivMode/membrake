@@ -34,7 +34,7 @@
 //! in the line or report its own completion. Strings and protocol lines are bounded.
 //! Process identities are checked before measuring groups.
 
-use crate::engine::{Policy, include_covered_groups};
+use crate::engine::{Frozen, GroupReservations, Policy, include_covered_groups};
 use crate::jobs::{self, AGENT_CLI, Inspector, Job, Probe, ProcessTable, Regex};
 use crate::queue::{Id, Released, Reservation, Sample, Scheduler, Snapshot, WaitReason};
 use crate::runner::{age, gb};
@@ -572,15 +572,24 @@ impl Broker {
             else {
                 continue;
             };
-            for leader in self.processes.group_leaders().filter(|p| p.pid != pgid) {
-                if jobs::admission_covers(
-                    (leader.pid, leader.start_us),
-                    (pgid, leader_start_us),
-                    |pid| self.processes.get(pid),
-                ) && let Some(child) =
-                    jobs::group_usage(&mut self.inspector, leader.pid, leader.start_us)
+            for member in self.processes.members().filter(|p| p.pgid != pgid) {
+                if !jobs::admission_covers(member, (pgid, leader_start_us), |pid| {
+                    self.processes.get(pid)
+                }) || self.groups.iter().any(|&(_, root, start)| {
+                    member.pgid == root
+                        && self
+                            .processes
+                            .get(root)
+                            .is_some_and(|p| p.pgid == root && p.start_us == start)
+                }) {
+                    continue;
+                }
+                let bytes = jobs::footprint(member.pid);
+                if let Some(live) = jobs::live_process(member.pid)
+                    .filter(|p| p.pgid == member.pgid && p.start_us == member.start_us)
                 {
-                    usage.bytes = usage.bytes.saturating_add(child.bytes);
+                    usage.bytes = usage.bytes.saturating_add(bytes);
+                    usage.stopped |= live.stopped;
                 }
             }
             self.seen.push((id, usage));
@@ -602,10 +611,11 @@ impl Broker {
     /// Fetch after scanning candidates so STARTED messages checked during that scan
     /// also take part in ranking. Resolve descendants of those commands for both
     /// current candidates and previously frozen groups.
-    pub(crate) fn refresh_reservations<'a>(
+    pub(crate) fn refresh_reservations(
         &mut self,
-        candidates: impl Iterator<Item = &'a Job>,
-    ) -> &[Reservation] {
+        candidates: &[Job],
+        frozen: &[Frozen],
+    ) -> GroupReservations<'_> {
         self.reservations.clear();
         self.reservations
             .extend(lock(&self.core).sched.running().iter().filter_map(|r| {
@@ -615,8 +625,10 @@ impl Broker {
                     limit: r.limit(),
                 })
             }));
-        include_covered_groups(&mut self.reservations, candidates, jobs::live_process);
-        &self.reservations
+        if !self.reservations.is_empty() {
+            self.processes.refresh();
+        }
+        include_covered_groups(&mut self.reservations, candidates, frozen, &self.processes)
     }
 
     pub(crate) fn reservations(&self) -> &[Reservation] {
@@ -2120,17 +2132,32 @@ mod tests {
     }
 
     #[test]
-    fn a_job_control_group_contributes_to_the_learned_peak() {
+    fn a_leaderless_pipeline_contributes_to_the_learned_peak() {
+        check_job_control_peak(false);
+    }
+
+    #[test]
+    fn a_nested_admission_measures_its_own_root_group() {
+        check_job_control_peak(true);
+    }
+
+    fn check_job_control_peak(nested: bool) {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
         let (mut broker, socket, dir) = broker("job-control-peak", false);
         let mut time = 0.0;
         let mut client = go(&mut broker, &mut time, &socket, "job control");
+        let _nested_client = nested.then(|| go(&mut broker, &mut time, &socket, "nested"));
         let script = dir.join("job-control.sh");
+        let worker_command = if nested {
+            "/bin/cat <&3"
+        } else {
+            "/usr/bin/true | /bin/cat <&3"
+        };
         fs::write(
             &script,
-            "set -m\nexec 3<&0\n/bin/cat <&3 &\nprintf '%s\\n' \"$!\"\nwait\n",
+            format!("set -m\nexec 3<&0\n{worker_command} &\nprintf '%s\\n' \"$!\"\nwait\n"),
         )
         .unwrap();
         let mut command = Command::new("/bin/bash")
@@ -2148,12 +2175,29 @@ mod tests {
             .unwrap();
         let worker: i32 = line.trim().parse().unwrap();
         tick_until(&mut broker, &mut time, 80, || {
-            jobs::bsd_info(worker).is_some_and(|p| p.name == "cat")
+            jobs::bsd_info(worker).is_some_and(|p| {
+                p.name == "cat" && (nested || jobs::live_process(p.pgid).is_none())
+            })
         });
         let process = jobs::bsd_info(worker).unwrap();
-        assert_eq!((process.pgid, process.ppid), (worker, pgid));
-        client.send(&format!("STARTED\t{pgid}\n"));
+        assert_eq!(process.ppid, pgid);
+        assert_ne!(process.pgid, pgid);
+        assert_eq!(process.pgid == worker, nested);
         let core = Arc::clone(&broker.core);
+        if nested {
+            // The fixture's wire clients share this test's PID. Register the inner
+            // root directly since its real parent is the outer command.
+            let mut core = lock(&core);
+            let id = core
+                .sched
+                .running()
+                .iter()
+                .find(|r| r.signature == "nested")
+                .unwrap()
+                .id;
+            assert!(core.sched.started(id, worker, process.start_us));
+        }
+        client.send(&format!("STARTED\t{pgid}\n"));
         tick_until(&mut broker, &mut time, 80, || {
             lock(&core)
                 .sched
@@ -2162,17 +2206,35 @@ mod tests {
                 .any(|r| r.pgid == Some(pgid) && r.peak > 0)
         });
         let (leader_bytes, worker_bytes) = (jobs::footprint(pgid), jobs::footprint(worker));
-        let peak = lock(&core).sched.running()[0].peak;
+        let (peak, nested_peak) = {
+            let core = lock(&core);
+            let peak_for = |signature| {
+                core.sched
+                    .running()
+                    .iter()
+                    .find(|r| r.signature == signature)
+                    .map(|r| r.peak)
+            };
+            (peak_for("job control").unwrap(), peak_for("nested"))
+        };
         drop(input); // EOF lets the worker and then the admitted shell exit.
         assert!(command.wait().unwrap().success());
         client.send("DONE\t0\n");
         assert!(client.hung_up());
         let learned = lock(&core).sizes.demand("job control").bytes;
         assert!(leader_bytes > 0 && worker_bytes > 0);
-        assert!(
-            peak >= leader_bytes + worker_bytes,
-            "recorded peak {peak}, admitted shell {leader_bytes}, separate worker group {worker_bytes}"
-        );
+        if let Some(nested_peak) = nested_peak {
+            assert!(nested_peak >= worker_bytes);
+            assert_eq!(
+                peak, leader_bytes,
+                "outer peak {peak}, admitted shell {leader_bytes}, nested root {worker_bytes}"
+            );
+        } else {
+            assert!(
+                peak >= leader_bytes + worker_bytes,
+                "recorded peak {peak}, admitted shell {leader_bytes}, leaderless worker group {worker_bytes}"
+            );
+        }
         assert_eq!(learned, Some(peak));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2483,8 +2545,7 @@ mod tests {
             let mut s = reading(2.0, 35);
             s.segments = 0.93;
             let step = e.step_with_candidates(&s, |frozen| {
-                let reservations = broker
-                    .refresh_reservations(candidates.iter().chain(frozen.iter().map(|f| &f.job)));
+                let reservations = broker.refresh_reservations(&candidates, frozen);
                 (candidates, reservations)
             });
             returned.send(step.actions).unwrap();

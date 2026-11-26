@@ -451,32 +451,57 @@ pub(crate) fn live_process(pid: i32) -> Option<Seen> {
     (!p.zombie).then_some(p)
 }
 
-/// An admission covers its recorded group and groups led by descendants of that
-/// command. Both identities name actual group leaders. A descendant needs a live
-/// parent chain back to the original leader, with the same PID and start time.
+/// Whether a live process descends from the verified admission leader. The caller
+/// accounts for members of the root group separately.
 pub(crate) fn admission_covers(
-    (pgid, start_us): (i32, u64),
+    mut member: Seen,
     (root_pgid, root_start_us): (i32, u64),
     process: impl Fn(i32) -> Option<Seen>,
 ) -> bool {
-    if pgid == root_pgid {
-        return start_us == root_start_us;
-    }
-    let Some(mut child) =
-        process(pgid).filter(|p| !p.zombie && p.pgid == pgid && p.start_us == start_us)
-    else {
+    if member.zombie {
         return false;
-    };
-    while child.ppid > 1 {
-        let Some(parent) = process(child.ppid).filter(|p| !p.zombie) else {
+    }
+    // A debugger can reparent an ancestor to its own descendant.
+    let mut visited = [0; 64];
+    for depth in 0..visited.len() {
+        visited[depth] = member.pid;
+        if member.ppid <= 1 || visited[..=depth].contains(&member.ppid) {
+            return false;
+        }
+        let Some(parent) = process(member.ppid).filter(|p| !p.zombie) else {
             return false;
         };
         if parent.pid == root_pgid {
             return parent.pgid == root_pgid && parent.start_us == root_start_us;
         }
-        child = parent;
+        member = parent;
     }
     false
+}
+
+#[cfg(test)]
+#[test]
+fn admission_coverage_rejects_a_cycle_in_the_parent_chain() {
+    let reads = std::cell::Cell::new(0);
+    let process = |pid| {
+        reads.set(reads.get() + 1);
+        assert!(reads.get() <= 65, "parent walk exceeded 64 steps");
+        let ppid = match pid {
+            12 => 13,
+            13 => 12,
+            _ => return None,
+        };
+        Some(Seen {
+            pid,
+            ppid,
+            pgid: 12,
+            uid: 501,
+            start_us: 200,
+            zombie: false,
+            stopped: false,
+        })
+    };
+    assert!(!admission_covers(process(12).unwrap(), (10, 100), process));
 }
 
 /// A verified child can finish before STARTED reaches the broker. XNU's BSD-info flavor
@@ -570,8 +595,18 @@ impl ProcessTable {
         self.processes.get(&pid).copied()
     }
 
-    pub(crate) fn group_leaders(&self) -> impl Iterator<Item = Seen> + '_ {
-        self.processes.values().filter(|p| p.pid == p.pgid).copied()
+    pub(crate) fn members(&self) -> impl Iterator<Item = Seen> + '_ {
+        self.processes.values().copied()
+    }
+}
+
+#[cfg(test)]
+impl FromIterator<Seen> for ProcessTable {
+    fn from_iter<T: IntoIterator<Item = Seen>>(processes: T) -> Self {
+        Self {
+            processes: processes.into_iter().map(|p| (p.pid, p)).collect(),
+            ..Self::default()
+        }
     }
 }
 
@@ -1022,19 +1057,17 @@ fn read_group_usage(
     // member's own contribution without dropping the surviving counters.
     let mut bytes = 0u64;
     let mut cpu_ns: Option<u64> = None;
-    let mut stopped = true;
+    let mut stopped = false;
     readings.clear();
     readings.extend(members.iter().map(|m| read(m.pid)));
     let measured_at = crate::signals::uptime();
-    for (m, ri) in members
-        .iter()
-        .zip(readings)
-        .filter_map(|(m, ri)| ri.as_ref().map(|ri| (m, ri)))
-    {
+    for (m, ri) in members.iter().zip(readings) {
         if still_live(m) {
-            bytes = bytes.saturating_add(ri.ri_phys_footprint);
-            cpu_ns = Some(cpu_ns.unwrap_or(0).saturating_add(cpu_nanos(ri)));
-            stopped &= m.stopped;
+            stopped |= m.stopped;
+            if let Some(ri) = ri {
+                bytes = bytes.saturating_add(ri.ri_phys_footprint);
+                cpu_ns = Some(cpu_ns.unwrap_or(0).saturating_add(cpu_nanos(ri)));
+            }
         }
     }
     GroupUsage {

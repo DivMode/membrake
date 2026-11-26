@@ -537,9 +537,9 @@ impl Runner {
         let step = self.engine.step_with_candidates(s, |frozen| {
             scanned = signals::wall();
             let jobs = jobs::scan(rules, min);
-            let reservations = queue.map_or(&[][..], |queue| {
-                queue.refresh_reservations(jobs.iter().chain(frozen.iter().map(|f| &f.job)))
-            });
+            let reservations = queue
+                .map(|queue| queue.refresh_reservations(&jobs, frozen))
+                .unwrap_or_default();
             shown = Some(jobs.clone());
             (jobs, reservations)
         });
