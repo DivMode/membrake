@@ -2109,7 +2109,8 @@ mod tests {
     fn tight_memory_lets_small_jobs_backfill_within_the_cap_and_cpu_budget() {
         let learned = |name: &str| match name {
             "head" => memory(Some(80 * GIB)),
-            "minimum" => unknown(name),
+            // Exactly at the freeze minimum: not small.
+            "minimum" => memory(Some(GIB)),
             // Below the freeze minimum, although its reservation (with margin) is not.
             _ => memory(Some(900 * GIB / 1024)),
         };
