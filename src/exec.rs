@@ -1,8 +1,9 @@
 //! `membrake exec -- COMMAND ...`: asks the daemon for a turn, waits for the go-ahead, runs
 //! the command, and reports how it ended.
 //!
-//! The client retries while the live broker keeps publishing samples. A nested
-//! command started by admitted work (`MEMBRAKE_ADMITTED` is set) runs directly.
+//! The client retries while the live broker keeps publishing samples. If a queued
+//! connection drops, it has a bounded window to rejoin. Nested commands run directly
+//! while the client that admitted them is still running.
 //!
 //! The command runs in a process group of its own (the job the brake freezes and the queue
 //! measures), at the caller's own priority: no nice, no QoS clamp. A clamp put admitted work
@@ -47,6 +48,8 @@ pub const ADMITTED: &str = "MEMBRAKE_ADMITTED";
 const FIRST_ANSWER: Duration = Duration::from_secs(10);
 /// How often a waiting client looks up from the socket to see whether it was signalled.
 const LOOK_UP: Duration = Duration::from_millis(250);
+/// How long a disconnected queued client has to get a new turn or place in line.
+const RECONNECT_LIMIT: Duration = Duration::from_secs(30);
 /// Where a shell looks for a program when `PATH` is not set.
 const DEFAULT_PATH: &str = "/usr/bin:/bin";
 
@@ -58,6 +61,31 @@ pub struct Args {
     /// Stop what the command leaves running in its group when it ends, even when nothing
     /// interrupted it.
     pub reap: bool,
+}
+
+/// The client that started an admitted command, distinguished from a later user of its pid.
+struct Admission {
+    pid: i32,
+    start_us: u64,
+}
+
+impl Admission {
+    fn parse(text: &str) -> Option<Self> {
+        let (pid, start_us) = text.split_once(':')?;
+        let pid = pid.parse().ok()?;
+        let start_us = start_us.parse().ok()?;
+        (pid > 0 && start_us > 0).then_some(Self { pid, start_us })
+    }
+
+    /// A command that switched to another user cannot read its admitting client (macOS answers
+    /// EPERM for another uid's process); a process that exists is then taken to be it.
+    fn is_live(&self) -> bool {
+        match jobs::probe(self.pid) {
+            jobs::Probe::Found(client) => !client.zombie && client.start_us == self.start_us,
+            jobs::Probe::Unreadable(e) => e.kind() == io::ErrorKind::PermissionDenied,
+            jobs::Probe::Gone => false,
+        }
+    }
 }
 
 /// Best-effort stderr line. Not `eprintln!`, which panics when stderr is closed.
@@ -116,9 +144,27 @@ const UNEXPECTED: &str = "the daemon sent something unexpected";
 /// Why the wait ended without a go-ahead.
 enum Stopped {
     Unavailable(String),
+    /// This connection dropped after the daemon assigned it a place in line.
+    Disconnected(String),
     Refused(String),
     /// This process was signalled while it waited: it never ran anything.
     Signalled(i32),
+}
+
+struct Reconnect {
+    deadline: Instant,
+    backoff: Duration,
+}
+
+impl Reconnect {
+    fn remaining(&self) -> Result<Duration, Stopped> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(Stopped::Unavailable("the reconnect window expired".into()))
+        } else {
+            Ok(remaining)
+        }
+    }
 }
 
 /// A turn granted within this long is not worth a line.
@@ -159,10 +205,14 @@ fn wait_for_turn(
     socket: &Path,
     request: &Message,
     liveness: &mut Liveness,
+    reconnect: &mut Option<Reconnect>,
 ) -> Result<UnixStream, Stopped> {
     let sig = PENDING.load(Ordering::SeqCst);
     if sig != 0 {
         return Err(Stopped::Signalled(sig));
+    }
+    if let Some(retry) = reconnect.as_ref() {
+        retry.remaining()?;
     }
     let mut stream =
         UnixStream::connect(socket).map_err(|e| Stopped::Unavailable(connect_error(socket, &e)))?;
@@ -190,14 +240,13 @@ fn wait_for_turn(
     let mut shown = None;
     let mut shown_text = String::new();
     let mut input = Vec::new();
+    let mut read_timeout = LOOK_UP;
     loop {
-        if let Some(why) = liveness.failure(socket, false) {
-            return Err(Stopped::Refused(why));
-        }
         let sig = PENDING.load(Ordering::SeqCst);
         if sig != 0 {
             return Err(Stopped::Signalled(sig));
         }
+        let remaining = reconnect.as_ref().map(Reconnect::remaining).transpose()?;
         while let Some(line) = wire::take_line(&mut input) {
             heard = Instant::now();
             match Reply::parse(&line) {
@@ -207,6 +256,7 @@ fn wait_for_turn(
                     need,
                     reason,
                 }) => {
+                    *reconnect = None;
                     told = true;
                     position = Some((now, need, reason));
                 }
@@ -218,6 +268,16 @@ fn wait_for_turn(
                 Some(Reply::Error(why)) => return Err(Stopped::Refused(why)),
                 None => return Err(Stopped::Refused(UNEXPECTED.into())),
             }
+        }
+        if let Some(failure) = liveness.failure(socket, false) {
+            let why = liveness.describe(socket, failure);
+            return Err(if told && failure == LivenessFailure::Offline {
+                Stopped::Disconnected(why)
+            } else if reconnect.is_some() {
+                Stopped::Unavailable(why)
+            } else {
+                Stopped::Refused(why)
+            });
         }
         if let Some((now, need, reason)) = position
             && asked.elapsed() >= QUIET
@@ -239,12 +299,26 @@ fn wait_for_turn(
         if input.len() > wire::MAX_LINE {
             return Err(Stopped::Refused(UNEXPECTED.into()));
         }
+        let timeout = remaining
+            .filter(|_| reconnect.is_some())
+            .map_or(LOOK_UP, |remaining| remaining.min(LOOK_UP));
+        if timeout != read_timeout {
+            stream
+                .set_read_timeout(Some(timeout))
+                .map_err(|e| Stopped::Unavailable(e.to_string()))?;
+            read_timeout = timeout;
+        }
+        let dropped = |why| {
+            if told {
+                Stopped::Disconnected(why)
+            } else {
+                Stopped::Unavailable(why)
+            }
+        };
         let mut chunk = [0u8; 256];
         match stream.read(&mut chunk) {
             Ok(0) => {
-                return Err(Stopped::Unavailable(
-                    "the daemon closed the connection".into(),
-                ));
+                return Err(dropped("the daemon closed the connection".into()));
             }
             Ok(n) => input.extend_from_slice(&chunk[..n]),
             Err(e)
@@ -254,7 +328,7 @@ fn wait_for_turn(
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
                 ) => {}
-            Err(e) => return Err(Stopped::Unavailable(e.to_string())),
+            Err(e) => return Err(dropped(e.to_string())),
         }
     }
 }
@@ -308,17 +382,21 @@ fn c_string(text: &OsStr) -> Result<CString, NotRun> {
 }
 
 /// Starts the command as the leader of a new process group, at the caller's priority, with
-/// `MEMBRAKE_ADMITTED` set; returns its pid, which is also its group. The program is looked up
-/// the way a shell does, trying each directory of `PATH` and reporting not-found only if none
-/// has it.
-fn spawn(command: &[OsString]) -> Result<i32, NotRun> {
+/// the new admission in its environment. Returns its pid, which is also its group. Looks up
+/// the program the way a shell does, trying each directory of `PATH`.
+fn spawn(command: &[OsString], admission: Option<Admission>) -> Result<i32, NotRun> {
     let argv = command
         .iter()
         .map(|a| c_string(a))
         .collect::<Result<Vec<_>, _>>()?;
     let mut env: Vec<(OsString, OsString)> =
         std::env::vars_os().filter(|(k, _)| k != ADMITTED).collect();
-    env.push((ADMITTED.into(), "1".into()));
+    if let Some(admission) = admission {
+        env.push((
+            ADMITTED.into(),
+            format!("{}:{}", admission.pid, admission.start_us).into(),
+        ));
+    }
     let envp = env
         .into_iter()
         .map(|(mut name, value)| {
@@ -665,8 +743,16 @@ fn run_command(command: &[OsString], stream: UnixStream, reap_always: bool) -> i
             *daemon = None;
         }
     };
+    let client_pid = std::process::id() as i32;
+    let admission = match jobs::probe(client_pid) {
+        jobs::Probe::Found(client) => Some(Admission {
+            pid: client_pid,
+            start_us: client.start_us,
+        }),
+        _ => None,
+    };
     let began = Instant::now();
-    let pid = match spawn(command) {
+    let pid = match spawn(command, admission) {
         Ok(pid) => pid,
         Err(NotRun { code, why }) => {
             say(&format!("{}: {why}", command[0].to_string_lossy()));
@@ -715,7 +801,12 @@ pub fn run(args: Args) -> i32 {
         command,
         reap: reap_always,
     } = args;
-    if std::env::var_os(ADMITTED).is_some() {
+    if std::env::var(ADMITTED)
+        .ok()
+        .as_deref()
+        .and_then(Admission::parse)
+        .is_some_and(|admission| admission.is_live())
+    {
         // Replaces this process: the command is as direct as it can be.
         let error = Command::new(&command[0]).args(&command[1..]).exec();
         let not_run = NotRun::of(error.raw_os_error().unwrap_or(libc::ENOEXEC));
@@ -740,26 +831,51 @@ pub fn run(args: Args) -> i32 {
     let mut liveness = Liveness::new();
     let mut reported = String::new();
     let mut backoff = Duration::from_millis(50);
+    let mut reconnect = None;
     loop {
-        match wait_for_turn(&socket, &request, &mut liveness) {
+        let why = match wait_for_turn(&socket, &request, &mut liveness, &mut reconnect) {
             Ok(stream) => return run_command(&command, stream, reap_always),
             Err(Stopped::Refused(why)) => {
                 say(&why);
                 return 1;
             }
-            Err(Stopped::Unavailable(why)) => {
-                if let Some(failure) = liveness.failure(&socket, true) {
-                    say(&format!("queue unavailable ({why}); {failure}"));
-                    return 1;
-                }
-                if reported != why {
-                    reported = why;
-                    say(&format!("queue waiting ({reported}); retrying"));
-                }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(1));
+            Err(Stopped::Unavailable(why)) => why,
+            Err(Stopped::Disconnected(why)) => {
+                reconnect = Some(Reconnect {
+                    deadline: Instant::now() + RECONNECT_LIMIT,
+                    backoff: Duration::from_millis(250),
+                });
+                why
             }
             Err(Stopped::Signalled(sig)) => return 128 + sig,
+        };
+        if let Some(retry) = &reconnect {
+            if Instant::now() >= retry.deadline {
+                say(&format!("queue unavailable ({why}); command did not start"));
+                return 1;
+            }
+        } else if let Some(failure) = liveness.failure(&socket, true) {
+            let failure = liveness.describe(&socket, failure);
+            say(&format!("queue unavailable ({why}); {failure}"));
+            return 1;
+        }
+        if reported != why {
+            reported = why;
+            say(&format!("queue waiting ({reported}); retrying"));
+        }
+        if let Some(retry) = &mut reconnect {
+            let until = retry.deadline.min(Instant::now() + retry.backoff);
+            while PENDING.load(Ordering::SeqCst) == 0 {
+                let remaining = until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(remaining.min(LOOK_UP));
+            }
+            retry.backoff = (retry.backoff * 2).min(Duration::from_secs(4));
+        } else {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(1));
         }
     }
 }
@@ -768,6 +884,12 @@ struct Liveness {
     latest: f64,
     next_check: f64,
     limit: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LivenessFailure {
+    Offline,
+    Stale,
 }
 
 impl Liveness {
@@ -786,27 +908,32 @@ impl Liveness {
         }
     }
 
-    fn failure(&mut self, socket: &Path, force: bool) -> Option<String> {
+    fn failure(&mut self, socket: &Path, force: bool) -> Option<LivenessFailure> {
         let now = crate::signals::uptime();
         if !force && now < self.next_check {
             return None;
         }
         self.next_check = now + self.limit.min(1.0) / 2.0;
         if !crate::broker::daemon_alive(socket) {
-            return Some(format!(
-                "no live daemon owns {}; command did not start",
-                socket.display()
-            ));
+            return Some(LivenessFailure::Offline);
         }
         self.latest = crate::broker::heartbeat(socket)
             .filter(|&stamp| stamp <= now)
             .unwrap_or(self.latest);
-        (now - self.latest > self.limit).then(|| {
-            format!(
+        (now - self.latest > self.limit).then_some(LivenessFailure::Stale)
+    }
+
+    fn describe(&self, socket: &Path, failure: LivenessFailure) -> String {
+        match failure {
+            LivenessFailure::Offline => format!(
+                "no live daemon owns {}; command did not start",
+                socket.display()
+            ),
+            LivenessFailure::Stale => format!(
                 "daemon heartbeat is stale (over {} s); command did not start",
                 self.limit
-            )
-        })
+            ),
+        }
     }
 }
 

@@ -385,9 +385,9 @@ only after the cleanup, while macOS keeps an unreaped process in the pid table
 and in its group (XNU `forkproc` will not hand out a pid that a process or a
 group still holds; both are released only at reap). A process that left the
 group (`setsid`, `setpgid`, as some build daemons do) is not followed; such a
-process is meant to outlive the command. Inside an admitted command (below)
-`membrake exec` runs its command directly and has no group of its own, so it
-stops nothing there.
+process is meant to outlive the command. A nested call that runs directly
+(below) uses its existing process group. `--reap` applies when
+`membrake exec` starts a group of its own.
 
 This is the answer to nix-config issue 270: on 2026-11-11 a test script that searched
 the process table for its own leftovers reached every process group on the machine.
@@ -491,11 +491,18 @@ awake uptime to an adjacent `.heartbeat` file on each successful sample. A
 heartbeat under 15 s old confirms that the sampler is active. While the
 heartbeat advances, clients can stay queued or retry a full backlog
 indefinitely, keeping the timestamp of their first attempt. They back off
-between retries. A free pidfile lock or a heartbeat older than 60 s produces
-a diagnostic and a nonzero exit.
+between retries. A client whose connection drops after it is told its place
+tries to rejoin for up to 30 s, backing off from 250 ms to at most 4 s. The
+new daemon queues the request and admits it as usual. If the client cannot
+rejoin, it exits with an error. A new client exits immediately if there is
+no daemon, and a stale heartbeat (older than 60 s) also produces an error.
+A daemon restart leaves already running commands running.
 
-Inside an admitted command, a nested `membrake exec` shares the parent's
-reservation. `membrake run --dry-run` grants turns immediately and logs what the queue would have decided.
+A nested `membrake exec` runs directly while the admitting client identified
+by `MEMBRAKE_ADMITTED` is still running. The call queues when that client exits
+or the inherited identity is invalid.
+`membrake run --dry-run` grants turns immediately and logs what the queue
+would have decided.
 
 ### Trust model
 
@@ -634,10 +641,8 @@ killing or rerunning it.
 
 ### Other agents and scripts
 
-Any tool that runs shell commands can use the same line. Inside a command that
-is already admitted, nested `membrake exec` calls run straight away
-(`MEMBRAKE_ADMITTED` is set), so a script that is queued as a whole does not
-queue each of its steps again:
+Any tool that runs shell commands can use the same line. A script admitted as
+a whole can run its nested steps directly while its admitting client runs:
 
 ```sh
 membrake exec --label "full check" -- ./scripts/verify.sh
