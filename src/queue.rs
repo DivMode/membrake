@@ -707,7 +707,11 @@ impl Scheduler {
             // A cap that fell back under freeze-tier pressure must not start a waiting job
             // beside other jobs until the pressure clears.
             Some(ExclusiveAdmission::Reservations)
-        } else if self.now - since >= EXCLUSIVE_WAIT_SECONDS {
+        } else if self.now - since >= EXCLUSIVE_WAIT_SECONDS
+            // Other work's memory may be ignored after the wait; our own reservations may not
+            // pass the tight line (#38).
+            && reserved.saturating_add(need) < self.cap_ceiling
+        {
             Some(ExclusiveAdmission::TimedOut)
         } else {
             None
@@ -1205,8 +1209,10 @@ mod tests {
         assert_eq!(names(&q), ["watch", "small"]);
     }
 
+    /// An oversized head never starts beside other work once their reservations together
+    /// would pass the tight line, however long it has waited: it starts alone.
     #[test]
-    fn oversized_memory_head_times_out_on_a_fresh_calm_reading_even_without_fit() {
+    fn oversized_memory_head_waits_to_run_alone_when_reservations_pass_the_tight_line() {
         let learned = |name: &str| {
             memory(Some(match name {
                 "head" => 58 * GIB,
@@ -1260,10 +1266,16 @@ mod tests {
         q.observe(watch, 2 * GIB, 606.0);
         assert_eq!(
             step(&mut q, &calm(606.0), &learned),
-            Some(head),
-            "the first fresh calm reading admits the head even though 18 + 25 + 72.5 exceeds 60"
+            None,
+            "25 + 72.5 of our own reservations would pass the 57.6 GiB tight line"
         );
-        assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
+        q.release(watch);
+        assert_eq!(
+            step(&mut q, &calm(606.5), &learned),
+            Some(head),
+            "alone once the incumbent ends"
+        );
+        assert_eq!(q.running()[0].exclusive, Some(ExclusiveAdmission::Alone));
         assert_eq!(
             step(&mut q, &calm(607.0), &learned),
             None,
@@ -2126,8 +2138,11 @@ mod tests {
         );
     }
 
+    /// After the wait, the fallback may ignore other work's memory, but never lets membrake's
+    /// own reservations pass the tight line: two 38.3 GiB reservations wait to run one at a
+    /// time.
     #[test]
-    fn two_large_reservations_wait_for_the_fallback_after_the_cap_drops() {
+    fn two_large_reservations_never_run_together_past_the_tight_line() {
         let reservation = 383 * GIB / 10;
         let learned = |_: &str| memory(Some(reservation * 4 / 5));
         let reading = |time, level| Sample {
@@ -2154,10 +2169,16 @@ mod tests {
         }
         assert_eq!(
             step(&mut q, &reading(timeout, 90), &learned),
-            Some(head),
-            "the fallback ends the wait"
+            None,
+            "76.6 GiB of reservations would pass the 57.6 GiB tight line"
         );
-        assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
+        q.release(running);
+        assert_eq!(
+            step(&mut q, &reading(timeout + 1.0, 90), &learned),
+            Some(head),
+            "alone once the first one ends"
+        );
+        assert_eq!(q.running()[0].exclusive, Some(ExclusiveAdmission::Alone));
     }
 
     /// With nothing running the next command starts even when memory is tight and it does

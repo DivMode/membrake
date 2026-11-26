@@ -58,6 +58,8 @@ use std::time::{Duration, Instant};
 pub const SIZES_FILE: &str = "sizes.tsv";
 const CAP_FILE: &str = "cap.tsv";
 const CAP_MAX_AGE_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+/// The learned cap can move every tick under sustained pressure; save the latest at most this often.
+const CAP_SAVE_SECONDS: f64 = 60.0;
 /// What the queue is doing, in the state directory, rewritten when it changes.
 pub const QUEUE_FILE: &str = "queue.tsv";
 /// Request a larger backlog for simultaneous launches. XNU caps it at its own limit.
@@ -458,6 +460,8 @@ pub struct Broker {
     stored_cap: Option<StoredCap>,
     /// The latest learned cap awaiting a turn in the writer's queue.
     unoffered_cap: Option<StoredCap>,
+    /// Wall time of the last cap handed to the writer.
+    cap_offered_at: f64,
     /// The admissions to measure this tick: the request, the group, and when its leader
     /// started.
     groups: Vec<(Id, i32, u64)>,
@@ -575,6 +579,7 @@ impl Broker {
             written: String::with_capacity(1024),
             stored_cap,
             unoffered_cap: None,
+            cap_offered_at: f64::NEG_INFINITY,
             groups: Vec::with_capacity(16),
             seen: Vec::with_capacity(16),
             reservations: Vec::with_capacity(16),
@@ -769,9 +774,11 @@ impl Broker {
         admission_notes(&self.view, &self.admitted, self.dry_run, &mut notes);
         if let Some(files) = &self.files {
             if let Some(cap) = self.unoffered_cap
+                && sample.wall - self.cap_offered_at >= CAP_SAVE_SECONDS
                 && files.offer(FileWork::Cap(cap)).is_ok()
             {
                 self.unoffered_cap = None;
+                self.cap_offered_at = sample.wall;
             }
             self.text.clear();
             render(&self.view, &mut self.text);
