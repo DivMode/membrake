@@ -68,9 +68,11 @@ enum Command {
     /// Asks the daemon (`membrake run`) for a turn, waits for the go-ahead, runs the command
     /// at the caller's priority in a process group of its own, and exits
     /// with its exit code (128 plus the signal if it died of one). The daemon starts a command
-    /// when its expected memory fits and running jobs commit less than the CPU budget,
-    /// never while memory is tight or a job is frozen. If the queue is unavailable the
-    /// client exits with an error. A call inside an admitted command shares its reservation.
+    /// when its expected memory fits and running jobs commit less than the CPU budget.
+    /// Below the freeze tier, tight memory allows the first job to start and lets jobs
+    /// smaller than the freeze minimum use spare capacity. Frozen jobs stop admissions.
+    /// If the queue is unavailable the client exits with an error. A call inside an admitted
+    /// command shares its reservation.
     Exec(ExecArgs),
 }
 

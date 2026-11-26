@@ -626,6 +626,8 @@ impl Broker {
             tight,
             frozen,
         };
+        let freeze_pressure =
+            policy.freeze_pressure(s, tight) || s.pressure == signals::Pressure::Critical;
         let lost = {
             let mut guard = lock(&self.core);
             let core = &mut *guard;
@@ -634,8 +636,27 @@ impl Broker {
             let sizes = &core.sizes;
             let learned = |signature: &str| sizes.demand(signature);
             let now = s.time + self.sample_started.elapsed().as_secs_f64();
-            core.sched
-                .step_at(&sample, now, policy, &learned, &mut self.admitted);
+            core.sched.step_at(
+                &sample,
+                now,
+                policy,
+                freeze_pressure,
+                &learned,
+                &mut self.admitted,
+            );
+            if !self.dry_run {
+                notes.extend(core.sched.new_stalls(sample.wall).map(|job| {
+                    (
+                        "warn",
+                        format!(
+                            "{} (session {}) stalled after {} waiting with nothing running",
+                            job.label,
+                            job.session,
+                            age(sample.wall - job.since)
+                        ),
+                    )
+                }));
+            }
             core.sched.snapshot(&learned, &mut self.view);
             lost
         };
@@ -695,8 +716,21 @@ fn render(view: &Snapshot, out: &mut String) {
     for w in &view.waiting {
         let _ = writeln!(
             out,
-            "wait\t{}\t{}\t{}\t{}\t{}\t{}",
-            w.position, w.session, w.since as u64, w.need, w.reason, w.label
+            "wait\t{}\t{}\t{}\t{}\t{}{}{}\t{}",
+            w.position,
+            w.session,
+            w.since as u64,
+            w.need,
+            if w.stalled { "stalled: " } else { "" },
+            w.reason,
+            if !w.stalled {
+                ""
+            } else if w.reason == WaitReason::Unspecified {
+                "nothing running"
+            } else {
+                ", nothing running"
+            },
+            w.label
         );
     }
     for r in &view.running {
@@ -1449,11 +1483,12 @@ mod tests {
     use std::process::{Child, Command};
     use std::time::Instant;
 
+    /// Tight readings reach the freeze tier so tests can hold the queue with nothing running.
     fn reading(time: f64, level: i32) -> Signals {
         Signals {
             time,
             wall: signals::wall(),
-            segments: 0.1,
+            segments: if level <= 40 { 0.65 } else { 0.1 },
             pages: 0.0,
             swap_used: 0,
             headroom: 500 << 30,
@@ -1602,7 +1637,7 @@ mod tests {
         client.request("tests");
         assert_eq!(client.next(), format!("QUEUED\t1\t{}", 4u64 << 30));
 
-        // Tight: no go-ahead however long it waits.
+        // Freeze-tier pressure holds the request.
         let mut time = 100.0;
         let notes = tick_n(&mut broker, &mut time, 35, 3);
         assert!(client.next().ends_with("\ttight"));
@@ -1920,6 +1955,55 @@ mod tests {
         drop(broker);
         assert!(!dir.join(QUEUE_FILE).exists());
         assert!(!socket.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn low_swap_headroom_holds_the_idle_queue_and_stalled_jobs_warn_and_appear_in_status() {
+        let (mut broker, _socket, dir) = broker("idle-stall", false);
+        lock(&broker.core).sched.enqueue(
+            123,
+            "build".into(),
+            "build".into(),
+            signals::wall() - 11.0 * 60.0,
+        );
+        let mut sample = reading(100.0, 35);
+        sample.segments = 0.1;
+        sample.headroom = sample.ram - 1;
+        let notes = broker.tick(&sample, true, false);
+        assert!(
+            notes.iter().any(|(kind, text)| {
+                *kind == "warn"
+                    && text == "build (session 123) stalled after 11m waiting with nothing running"
+            }),
+            "{notes:?}"
+        );
+        let mut text = String::new();
+        render(&broker.view, &mut text);
+        let status = QueueFile::parse(&text).unwrap();
+        assert!(status.running.is_empty());
+        assert_eq!(
+            status.waiting[0].reason,
+            "stalled: memory is tight, nothing running"
+        );
+
+        sample.time += 1.0;
+        assert!(
+            broker
+                .tick(&sample, true, false)
+                .iter()
+                .all(|(kind, _)| *kind != "warn")
+        );
+        sample.time += 1.0;
+        sample.headroom = sample.ram;
+        let notes = broker.tick(&sample, true, false);
+        assert!(
+            notes
+                .iter()
+                .any(|(kind, text)| *kind == "queue" && text.starts_with("admit build")),
+            "{notes:?}"
+        );
+        drop(broker);
         let _ = fs::remove_dir_all(&dir);
     }
 

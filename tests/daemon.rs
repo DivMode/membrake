@@ -500,14 +500,6 @@ impl Script {
         self.readings(count, 0.65, 35);
     }
 
-    /// Memory is tight but the compressor nearly empty: the queue holds its clients, and the
-    /// brake has nothing to look at. (It scans the process table on every reading past its
-    /// freeze line, which on a busy machine takes seconds, and a daemon that is slow to get
-    /// through its script is not what a test of the queue is about.)
-    fn tight_and_quiet(&mut self, count: u32) {
-        self.readings(count, 0.10, 35);
-    }
-
     /// Tight and 88% full: past the urgent line (85%), short of the cliff (92%).
     fn urgent(&mut self, count: u32) {
         self.readings(count, 0.88, 35);
@@ -1563,7 +1555,7 @@ fn waiting_exec_clients_do_not_make_their_driver_group_a_victim() {
     let dir = scratch("waiting-clients-driver");
     let socket = queue_socket("driver");
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(3);
+    script.tight(3);
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
     daemon.wait_samples(&dir.join("log"), 3);
 
@@ -1617,7 +1609,7 @@ fn a_client_only_group_is_ineligible_at_a_zero_minimum() {
     let dir = scratch("client-only");
     let socket = queue_socket("client-only");
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(3);
+    script.tight(3);
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
     daemon.wait_samples(&dir.join("log"), 3);
 
@@ -1641,11 +1633,11 @@ fn a_client_only_group_is_ineligible_at_a_zero_minimum() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// While memory is tight the client is told its place and waits, and its command does not
+/// Under freeze-tier pressure the client is told its place and waits, and its command does not
 /// run; when memory is calm it runs. The command is `touch`, so that "it ran" is a fact on
 /// disk and not the client's say-so.
 #[test]
-fn queue_a_client_waits_while_memory_is_tight_and_runs_when_it_is_calm() {
+fn queue_a_client_waits_under_freeze_pressure_and_runs_when_it_is_calm() {
     let dir = scratch("qwait");
     let socket = queue_socket("wait");
     let mut script = Script::new(&dir);
@@ -1757,7 +1749,7 @@ fn queue_a_missing_or_stale_socket_fails_without_running_the_command() {
     );
 
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(1);
+    script.calm(1);
     let mut daemon = queue_daemon(&script, &dir, &socket, NOTHING);
     daemon.0.kill().unwrap();
     daemon.0.wait().unwrap();
@@ -1908,7 +1900,7 @@ fn queue_a_simulated_daemon_admits_and_completes_500_concurrent_clients() {
     let dir = scratch("q500");
     let socket = queue_socket("500");
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(3);
+    script.tight(3);
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
     daemon.wait_samples(&dir.join("log"), 3);
 
@@ -2132,7 +2124,7 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     let dir = scratch("qkeep");
     let socket = queue_socket("keep");
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(3);
+    script.tight(3);
     let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, SHORT);
     // Start with a known reason so every keep-alive can be compared byte for byte.
     daemon.wait_samples(&dir.join("log"), 3);
@@ -2154,14 +2146,9 @@ fn queue_a_waiting_client_is_kept_alive_through_a_tight_spell_longer_than_its_si
     let started = Instant::now();
     let mut fed = started;
     while started.elapsed() < SILENCE + SILENCE / 2 {
-        // A reading for the sampling loop every eighth of the limit for a loop that has
-        // stopped scheduling. (Readings past the brake's freeze line make it scan the process
-        // table, which on a busy machine is slow enough to fall behind the script: in one run,
-        // with such a reading every 0.1 s, the daemon had got through 62 of 64 rows 30 s after
-        // the last was appended; in another, at a load average near 50, it had recorded 2 of
-        // 6 rows 5 s in, and its loop was rightly called stalled.)
+        // Keep feeding readings above the freeze tier while the requests wait.
         if fed.elapsed() >= SILENCE / 8 {
-            script.tight_and_quiet(1);
+            script.tight(1);
             fed = Instant::now();
         }
         let mut chunk = [0u8; 256];
@@ -2204,7 +2191,7 @@ fn queue_keeps_places_while_samples_are_unreadable_then_recovers() {
     let socket = queue_socket("stalled");
     let options = [("MEMBRAKE_TEST_SILENCE_MS", "600")];
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(3);
+    script.tight(3);
     let log = dir.join("log");
     let daemon = queue_daemon_env(&script, &dir, &socket, NOTHING, &options);
     daemon.wait_samples(&log, 3);
@@ -2275,7 +2262,7 @@ fn queue_status_lists_the_waiting_and_the_admitted() {
     let dir = scratch("qstat");
     let socket = queue_socket("stat");
     let mut script = Script::new(&dir);
-    script.tight_and_quiet(10);
+    script.tight(10);
     let (state, log) = (dir.join("state"), dir.join("log"));
     fs::create_dir_all(&state).unwrap();
     let full_machine = std::thread::available_parallelism().map_or(1, |n| n.get()) * 1000;
