@@ -6,7 +6,7 @@
 //! Overdue kills apply only to unqueued groups. Recovery counts calm readings and
 //! restarts the count when a measured freeze arm fires.
 
-use crate::jobs::Job;
+use crate::jobs::{Job, ProcessTable, admission_covers};
 use crate::queue::{Reservation, ReservationLimit};
 use crate::signals::{Pressure, Signals};
 
@@ -248,13 +248,102 @@ fn same(a: &Job, b: &Job) -> bool {
     a.pgid == b.pgid && a.start_us == b.start_us
 }
 
-fn reservation_for<'a>(reservations: &'a [Reservation], job: &Job) -> Option<&'a Reservation> {
-    reservations
-        .iter()
-        .find(|r| r.pgid == job.pgid && r.pgid == job.leader_pid && r.start_us == job.start_us)
+/// Root rows retain the exact command identity. The remaining rows were resolved
+/// against the process table and may identify a group by a surviving member.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GroupReservations<'a> {
+    groups: &'a [Reservation],
+    roots: usize,
 }
 
-fn rank(reservations: &[Reservation], job: &Job) -> (u8, u64) {
+fn reservation_for<'a>(reservations: GroupReservations<'a>, job: &Job) -> Option<&'a Reservation> {
+    reservations.groups.iter().enumerate().find_map(|(i, r)| {
+        (r.pgid == job.pgid
+            && r.start_us == job.start_us
+            && (i >= reservations.roots || job.leader_pid == job.pgid))
+            .then_some(r)
+    })
+}
+
+fn admission_for(roots: &[Reservation], job: &Job, processes: &ProcessTable) -> Option<usize> {
+    if job.leader_pid == job.pgid
+        && let Some(i) = roots
+            .iter()
+            .position(|r| r.pgid == job.pgid && r.start_us == job.start_us)
+    {
+        return Some(i);
+    }
+    let member = processes
+        .get(job.leader_pid)
+        .filter(|p| p.pgid == job.pgid && p.start_us == job.start_us && !p.zombie)?;
+    let admission_of = |member| {
+        roots.iter().position(|r| {
+            r.pgid != job.pgid
+                && admission_covers(member, (r.pgid, r.start_us), |pid| processes.get(pid))
+        })
+    };
+    admission_of(member).or_else(|| {
+        processes
+            .members()
+            .filter(|p| p.pgid == job.pgid && p.pid != member.pid)
+            .find_map(admission_of)
+    })
+}
+
+/// Resolve membership for the groups the engine may act on so each can be recorded
+/// as a reservation by group identity and the same decision can be replayed.
+pub(crate) fn include_covered_groups<'a>(
+    reservations: &'a mut Vec<Reservation>,
+    jobs: &[Job],
+    frozen: &[Frozen],
+    processes: &ProcessTable,
+) -> GroupReservations<'a> {
+    let roots = reservations.len();
+    if roots != 0 {
+        let frozen_only = frozen
+            .iter()
+            .map(|f| &f.job)
+            .filter(|job| !jobs.iter().any(|j| same(j, job)));
+        let mut covered: Vec<_> = jobs
+            .iter()
+            .map(|j| (j, j.bytes))
+            .chain(frozen_only.map(|j| (j, 0)))
+            .filter_map(|(job, scanned_bytes)| {
+                let root = admission_for(reservations, job, processes)?;
+                Some((root, job, scanned_bytes))
+            })
+            .collect();
+        covered.sort_unstable_by_key(|&(root, ..)| root);
+        for groups in covered.chunk_by(|a, b| a.0 == b.0) {
+            let root = groups[0].0;
+            let admission = reservations[root];
+            let total: u128 = groups.iter().map(|&(_, _, bytes)| u128::from(bytes)).sum();
+            for &(_, job, scanned_bytes) in groups {
+                let limit = match admission.limit {
+                    ReservationLimit::Learned(limit) => ReservationLimit::Learned(
+                        u128::from(limit).saturating_sub(total - u128::from(scanned_bytes)) as u64,
+                    ),
+                    cold => cold,
+                };
+                if job.pgid == admission.pgid {
+                    reservations[root].limit = limit;
+                } else {
+                    reservations.push(Reservation {
+                        pgid: job.pgid,
+                        start_us: job.start_us,
+                        limit,
+                    });
+                }
+            }
+        }
+    }
+    GroupReservations {
+        groups: reservations,
+        roots,
+    }
+}
+
+fn rank(reservations: GroupReservations<'_>, job: &Job) -> (u8, u64) {
     match reservation_for(reservations, job) {
         None => (2, job.bytes),
         Some(r) => match r.limit {
@@ -316,13 +405,18 @@ impl Engine {
         reservations: &[Reservation],
         jobs: impl FnOnce() -> Vec<Job>,
     ) -> Step {
-        self.step_with_candidates(s, || (jobs(), reservations))
+        // Replay provides the group's resolved reservation rows.
+        let reservations = GroupReservations {
+            groups: reservations,
+            roots: 0,
+        };
+        self.step_with_candidates(s, |_| (jobs(), reservations))
     }
 
     pub(crate) fn step_with_candidates<'a>(
         &mut self,
         s: &Signals,
-        candidates: impl FnOnce() -> (Vec<Job>, &'a [Reservation]),
+        candidates: impl FnOnce(&[Frozen]) -> (Vec<Job>, GroupReservations<'a>),
     ) -> Step {
         let mut actions = Vec::new();
         let now = s.time;
@@ -358,7 +452,8 @@ impl Engine {
         if !kill.is_empty()
             || (sustained_freeze && (!quiet || self.frozen.iter().any(past_freeze_limit)))
         {
-            let (mut pool, reservations) = candidates();
+            let (mut pool, reservations) = candidates(&self.frozen);
+            let admission = |job: &Job| reservation_for(reservations, job);
             for f in &self.frozen {
                 if !pool.iter().any(|j| same(j, &f.job)) {
                     pool.push(f.job.clone());
@@ -368,9 +463,10 @@ impl Engine {
             pool.retain(|j| !j.protected);
             let immediate = kill.iter().any(|a| a.immediate());
             let overdue = sustained_freeze
-                && self.frozen.iter().any(|f| {
-                    past_freeze_limit(f) && reservation_for(reservations, &f.job).is_none()
-                });
+                && self
+                    .frozen
+                    .iter()
+                    .any(|f| past_freeze_limit(f) && admission(&f.job).is_none());
             // The cliff still uses time spent frozen as a tiebreaker for admitted jobs.
             let rank_expired = overdue || (immediate && sustained_freeze);
             let expired_job = |job: &Job| {
@@ -390,10 +486,7 @@ impl Engine {
                 )
             });
             let victim = pool.last();
-            let mut unqueued = pool
-                .iter()
-                .rev()
-                .filter(|j| reservation_for(reservations, j).is_none());
+            let mut unqueued = pool.iter().rev().filter(|j| admission(j).is_none());
             let unqueued_victim = unqueued.clone().next();
             let urgent = !kill.is_empty();
             let highest = victim.map(|j| rank(reservations, j).0);
@@ -446,7 +539,7 @@ impl Engine {
                     let class = rank(reservations, j).0;
                     class > 0 && Some(class) == freeze_class && self.freezable(j)
                 });
-                let count = if urgent && reservations.is_empty() {
+                let count = if urgent && reservations.groups.is_empty() {
                     usize::MAX
                 } else {
                     1
@@ -591,6 +684,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::Seen;
 
     const RAM: u64 = 96 * GIB;
 
@@ -1054,6 +1148,124 @@ mod tests {
             .collect();
         assert_eq!(kills(&actions), [(24.0, 13, false)], "{actions:?}");
         assert!(e.frozen().iter().any(|f| f.job == admitted));
+    }
+
+    #[test]
+    fn an_urgent_kill_spares_a_descendant_group_and_warns() {
+        let reservation = Reservation {
+            pgid: 10,
+            start_us: 100,
+            limit: ReservationLimit::Learned(4 * GIB),
+        };
+        let process = |pid, ppid, pgid, start_us, zombie| Seen {
+            pid,
+            ppid,
+            pgid,
+            uid: 501,
+            start_us,
+            zombie,
+            stopped: false,
+        };
+        for (leader_pid, parent_pid, start_us, zombie, covered, other_member) in [
+            (12, 10, 100, false, true, false),
+            (13, 10, 100, false, true, false),
+            (12, 10, 100, false, true, true),
+            (12, 2, 100, false, false, false),
+            (12, 10, 250, false, false, false),
+            (12, 10, 100, true, false, false),
+        ] {
+            let mut worker = job(12, 300, 8);
+            worker.leader_pid = leader_pid;
+            worker.procs += u32::from(other_member);
+            let processes: ProcessTable = [
+                process(10, 2, 10, start_us, zombie),
+                process(11, parent_pid, 10, 275, false),
+                process(
+                    leader_pid,
+                    if other_member { 2 } else { 11 },
+                    12,
+                    worker.start_us,
+                    false,
+                ),
+                process(14, 11, if other_member { 12 } else { 14 }, 400, false),
+            ]
+            .into_iter()
+            .collect();
+            let mut e = Engine::new(Policy::default());
+            let mut actions = Vec::new();
+            for s in steady(0.0, 13, 0.86, 35) {
+                let mut reservations = vec![reservation];
+                // Once frozen it can fall out of the candidate scan.
+                let candidates = if s.time < 2.0 {
+                    vec![worker.clone()]
+                } else {
+                    vec![]
+                };
+                let step = e.step_with_candidates(&s, |frozen| {
+                    let groups =
+                        include_covered_groups(&mut reservations, &candidates, frozen, &processes);
+                    (candidates, groups)
+                });
+                actions.extend(step.actions.into_iter().map(|action| (s.time, action)));
+            }
+            assert_eq!(freezes(&actions), [(1.0, worker.pgid)], "{actions:?}");
+            if covered {
+                assert!(
+                    matches!(actions.as_slice(), [_, (11.0, Action::Warn { text })] if text.ends_with("to kill")),
+                    "{actions:?}"
+                );
+            } else {
+                assert_eq!(kills(&actions), [(11.0, worker.pgid, false)], "{actions:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn learned_reservation_ranks_groups_by_their_combined_footprint() {
+        for (bytes, over_limit) in [(3 * GIB / 2, false), (3 * GIB, true)] {
+            let mut root = job(10, 100, 0);
+            let mut worker = job(11, 200, 0);
+            root.bytes = bytes;
+            worker.bytes = bytes;
+            let jobs = [root, worker];
+            let mut reservations = vec![Reservation {
+                pgid: 10,
+                start_us: 100,
+                limit: ReservationLimit::Learned(4 * GIB),
+            }];
+            let processes: ProcessTable = jobs
+                .iter()
+                .map(|job| Seen {
+                    pid: job.leader_pid,
+                    ppid: if job.pgid == 10 { 2 } else { 10 },
+                    pgid: job.pgid,
+                    uid: job.uid,
+                    start_us: job.start_us,
+                    zombie: false,
+                    stopped: false,
+                })
+                .collect();
+            let groups = include_covered_groups(&mut reservations, &jobs, &[], &processes);
+            for job in &jobs {
+                assert_eq!(
+                    rank(groups, job),
+                    if over_limit { (2, 2 * GIB) } else { (0, 0) },
+                    "group {} using {bytes} bytes",
+                    job.pgid
+                );
+            }
+            let mut engine = Engine::new(Policy::default());
+            engine.step_with_candidates(&sample(0.0, 0.65, 35), |_| (jobs.to_vec(), groups));
+            let step =
+                engine.step_with_candidates(&sample(1.0, 0.65, 35), |_| (jobs.to_vec(), groups));
+            assert_eq!(
+                step.actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Freeze { .. })),
+                over_limit,
+                "{step:?}"
+            );
+        }
     }
 
     /// The cliff comes into view while an earlier freeze's settle period is still running:

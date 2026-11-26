@@ -398,7 +398,7 @@ fn failure<T>(what: &str) -> Probe<T> {
     }
 }
 
-fn bsd_info_raw(pid: i32, include_exited: bool) -> Probe<libc::proc_bsdinfo> {
+fn read_bsd_info(pid: i32, include_exited: bool) -> Result<libc::proc_bsdinfo, libc::c_int> {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
     clear_errno();
@@ -412,11 +412,19 @@ fn bsd_info_raw(pid: i32, include_exited: bool) -> Probe<libc::proc_bsdinfo> {
             size,
         )
     };
-    match got {
+    if got == size {
         // SAFETY: the kernel filled the whole struct.
-        n if n == size => Probe::Found(unsafe { info.assume_init() }),
-        0 => failure("proc_pidinfo"),
-        _ => Probe::Unreadable(io::Error::other("proc_pidinfo returned a short read")),
+        Ok(unsafe { info.assume_init() })
+    } else {
+        Err(got)
+    }
+}
+
+fn bsd_info_raw(pid: i32, include_exited: bool) -> Probe<libc::proc_bsdinfo> {
+    match read_bsd_info(pid, include_exited) {
+        Ok(info) => Probe::Found(info),
+        Err(0) => failure("proc_pidinfo"),
+        Err(_) => Probe::Unreadable(io::Error::other("proc_pidinfo returned a short read")),
     }
 }
 
@@ -435,6 +443,65 @@ fn seen_from(pid: i32, info: &libc::proc_bsdinfo) -> Seen {
 /// Reads one process. Allocation-free.
 pub fn probe(pid: i32) -> Probe<Seen> {
     bsd_info_raw(pid, false).map(|info| seen_from(pid, &info))
+}
+
+pub(crate) fn live_process(pid: i32) -> Option<Seen> {
+    let info = read_bsd_info(pid, false).ok()?;
+    let p = seen_from(pid, &info);
+    (!p.zombie).then_some(p)
+}
+
+/// Whether a live process descends from the verified admission leader. The caller
+/// accounts for members of the root group separately.
+pub(crate) fn admission_covers(
+    mut member: Seen,
+    (root_pgid, root_start_us): (i32, u64),
+    process: impl Fn(i32) -> Option<Seen>,
+) -> bool {
+    if member.zombie {
+        return false;
+    }
+    // A debugger can reparent an ancestor to its own descendant.
+    let mut visited = [0; 512];
+    for depth in 0..visited.len() {
+        visited[depth] = member.pid;
+        if member.ppid <= 1 || visited[..=depth].contains(&member.ppid) {
+            return false;
+        }
+        let Some(parent) = process(member.ppid).filter(|p| !p.zombie) else {
+            return false;
+        };
+        if parent.pid == root_pgid {
+            return parent.pgid == root_pgid && parent.start_us == root_start_us;
+        }
+        member = parent;
+    }
+    false
+}
+
+#[cfg(test)]
+#[test]
+fn admission_coverage_rejects_a_cycle_in_the_parent_chain() {
+    let reads = std::cell::Cell::new(0);
+    let process = |pid| {
+        reads.set(reads.get() + 1);
+        assert!(reads.get() <= 513, "parent walk exceeded 512 steps");
+        let ppid = match pid {
+            12 => 13,
+            13 => 12,
+            _ => return None,
+        };
+        Some(Seen {
+            pid,
+            ppid,
+            pgid: 12,
+            uid: 501,
+            start_us: 200,
+            zombie: false,
+            stopped: false,
+        })
+    };
+    assert!(!admission_covers(process(12).unwrap(), (10, 100), process));
 }
 
 /// A verified child can finish before STARTED reaches the broker. XNU's BSD-info flavor
@@ -475,18 +542,72 @@ pub fn bsd_info(pid: i32) -> Option<Proc> {
 }
 
 pub fn list_pids() -> Vec<i32> {
-    // SAFETY: a null buffer asks only for the count.
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return Vec::new();
-    }
-    // Room for processes started between the two calls.
-    let mut pids = vec![0i32; count as usize + 64];
-    let bytes = (pids.len() * size_of::<i32>()) as libc::c_int;
-    // SAFETY: `pids` is `bytes` long.
-    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    pids.truncate(filled.max(0) as usize);
+    let mut pids = Vec::new();
+    list_pids_into(&mut pids);
     pids
+}
+
+fn list_pids_into(pids: &mut Vec<i32>) {
+    if pids.capacity() == 0 {
+        // SAFETY: a null buffer asks only for the count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return;
+        }
+        // Room for processes started between the two calls.
+        pids.resize(count as usize + 64, 0);
+    } else {
+        pids.resize(pids.capacity(), 0);
+    }
+    loop {
+        let bytes = (pids.len() * size_of::<i32>()) as libc::c_int;
+        // SAFETY: `pids` is `bytes` long.
+        let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        let count = filled.max(0) as usize;
+        if count < pids.len() {
+            pids.truncate(count);
+            return;
+        }
+        pids.resize(pids.len() * 2, 0);
+    }
+}
+
+/// The live process identities for one measurement. Reuse the buffers across samples.
+#[derive(Default)]
+pub(crate) struct ProcessTable {
+    pids: Vec<i32>,
+    processes: HashMap<i32, Seen>,
+}
+
+impl ProcessTable {
+    pub(crate) fn refresh(&mut self) {
+        list_pids_into(&mut self.pids);
+        self.processes.clear();
+        self.processes.reserve(self.pids.capacity());
+        self.processes.extend(
+            self.pids
+                .iter()
+                .filter_map(|&pid| live_process(pid).map(|p| (pid, p))),
+        );
+    }
+
+    pub(crate) fn get(&self, pid: i32) -> Option<Seen> {
+        self.processes.get(&pid).copied()
+    }
+
+    pub(crate) fn members(&self) -> impl Iterator<Item = Seen> + '_ {
+        self.processes.values().copied()
+    }
+}
+
+#[cfg(test)]
+impl FromIterator<Seen> for ProcessTable {
+    fn from_iter<T: IntoIterator<Item = Seen>>(processes: T) -> Self {
+        Self {
+            processes: processes.into_iter().map(|p| (p.pid, p)).collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// `ri_phys_footprint`, or 0 for a process we may not inspect.
@@ -786,8 +907,7 @@ fn leader_and_command(pgid: i32, group: &Facts) -> Option<(&Proc, &str)> {
     Some((leader, group.members[at].command.as_str()))
 }
 
-/// Every eligible group with a positive footprint of at least `min_bytes`. The one place
-/// that reads the whole process table.
+/// Every eligible group with a positive footprint of at least `min_bytes`.
 pub fn scan(rules: &Rules, min_bytes: u64) -> Vec<Job> {
     let mut groups: HashMap<i32, Vec<Proc>> = HashMap::new();
     for pid in list_pids() {
@@ -909,7 +1029,7 @@ pub(crate) fn group_usage(
     pgid: i32,
     leader_start_us: u64,
 ) -> Option<GroupUsage> {
-    if !matches!(probe(pgid), Probe::Found(l) if l.start_us == leader_start_us) {
+    if !live_process(pgid).is_some_and(|l| l.pgid == pgid && l.start_us == leader_start_us) {
         return None;
     }
     if !matches!(insp.look(pgid), Look::Present) {
@@ -937,19 +1057,17 @@ fn read_group_usage(
     // member's own contribution without dropping the surviving counters.
     let mut bytes = 0u64;
     let mut cpu_ns: Option<u64> = None;
-    let mut stopped = true;
+    let mut stopped = false;
     readings.clear();
     readings.extend(members.iter().map(|m| read(m.pid)));
     let measured_at = crate::signals::uptime();
-    for (m, ri) in members
-        .iter()
-        .zip(readings)
-        .filter_map(|(m, ri)| ri.as_ref().map(|ri| (m, ri)))
-    {
+    for (m, ri) in members.iter().zip(readings) {
         if still_live(m) {
-            bytes = bytes.saturating_add(ri.ri_phys_footprint);
-            cpu_ns = Some(cpu_ns.unwrap_or(0).saturating_add(cpu_nanos(ri)));
-            stopped &= m.stopped;
+            stopped |= m.stopped;
+            if let Some(ri) = ri {
+                bytes = bytes.saturating_add(ri.ri_phys_footprint);
+                cpu_ns = Some(cpu_ns.unwrap_or(0).saturating_add(cpu_nanos(ri)));
+            }
         }
     }
     GroupUsage {

@@ -556,7 +556,7 @@ impl Scheduler {
         true
     }
 
-    /// The admitted command's group is using `bytes` at engine time `now`, the sample's own
+    /// The admission's groups are using `bytes` at engine time `now`, the sample's own
     /// time (the scheduler's clock has not moved to it yet when the broker measures).
     pub fn observe(&mut self, id: Id, bytes: u64, now: f64) {
         if bytes == 0 {

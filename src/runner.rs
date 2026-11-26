@@ -534,11 +534,14 @@ impl Runner {
             queue.begin_sample();
         }
         let queue = self.queue.as_mut();
-        let step = self.engine.step_with_candidates(s, || {
+        let step = self.engine.step_with_candidates(s, |frozen| {
             scanned = signals::wall();
             let jobs = jobs::scan(rules, min);
+            let reservations = queue
+                .map(|queue| queue.refresh_reservations(&jobs, frozen))
+                .unwrap_or_default();
             shown = Some(jobs.clone());
-            (jobs, queue.map_or(&[][..], Broker::refresh_reservations))
+            (jobs, reservations)
         });
         for action in &step.actions {
             self.perform_with_pressure(action, s, scanned, &mut recheck);

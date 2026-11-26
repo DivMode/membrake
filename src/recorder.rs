@@ -548,7 +548,7 @@ fn format_row_with_admissions(
             line.push(';');
         }
         let _ = match r.limit {
-            ReservationLimit::Learned(need) => write!(line, "{}:{}:{need}", r.pgid, r.start_us),
+            ReservationLimit::Learned(need) => write!(line, "{}:{}:l{need}", r.pgid, r.start_us),
             ReservationLimit::Cold(need) => write!(line, "{}:{}:c{need}", r.pgid, r.start_us),
         };
     }
@@ -654,7 +654,9 @@ fn parse_reservation(entry: &str) -> Option<Reservation> {
     (fields.next().is_none()).then_some(Reservation {
         pgid: pgid.parse().ok()?,
         start_us: start_us.parse().ok()?,
-        limit: if let Some(cold) = need.strip_prefix('c') {
+        limit: if let Some(learned) = need.strip_prefix('l') {
+            ReservationLimit::Learned(learned.parse().ok()?)
+        } else if let Some(cold) = need.strip_prefix('c') {
             ReservationLimit::Cold(cold.parse().ok()?)
         } else if need == "0" {
             // Older recordings used zero for a cold job and did not save its default.
@@ -1040,6 +1042,32 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("freeze 8.0GB group 10"), "{out}");
         assert!(!out.contains("freeze 4.0GB group 11"), "{out}");
+    }
+
+    /// A split admission can leave a group a learned limit of zero; replay must not read it
+    /// as an older recording's cold zero.
+    #[test]
+    fn a_learned_zero_limit_round_trips_and_a_legacy_zero_stays_cold() {
+        let jobs = jobs3();
+        let reservations = [Reservation {
+            pgid: jobs[0].pgid,
+            start_us: jobs[0].start_us,
+            limit: ReservationLimit::Learned(0),
+        }];
+        let s = signals(0, 0.65, 35);
+        let step = Engine::new(Policy::default())
+            .step_with_admissions(&s, &reservations, || jobs.to_vec());
+        let mut line = String::new();
+        format_row_with_admissions(&mut line, &s, &step, Some(&jobs), &reservations);
+        let row = parse_row(line.trim_end()).unwrap();
+        assert!(
+            matches!(row.reservations.as_slice(), [r] if matches!(r.limit, ReservationLimit::Learned(0))),
+            "{line}"
+        );
+        assert!(matches!(
+            parse_reservation("10:5:0").unwrap().limit,
+            ReservationLimit::Cold(0)
+        ));
     }
 
     #[test]
