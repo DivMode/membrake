@@ -209,7 +209,7 @@ or killed, and is continued if it was frozen.
 - All of a sample's signals go out before anything is logged. Everything the
   daemon writes for people goes through a bounded queue to a thread of its own:
   events to a logger thread, `samples.tsv` to a thread that writes samples, and
-  the queue's `queue.tsv` and `sizes.tsv` to a third. If a disk stalls what does
+  the queue's `queue.tsv`, `sizes.tsv` and `cap.tsv` to a third. If a disk stalls what does
   not fit is dropped and counted, and the count is logged when the thread
   catches up, so a stuck file never delays a freeze, a kill, a sample or a
   client, and holds up only the thread that writes it. A queue file that could
@@ -218,10 +218,10 @@ or killed, and is continued if it was frozen.
   works. The sampling thread writes one file itself: the state file that lists
   the frozen jobs, flushed to disk before a `SIGSTOP` and when a record is
   dropped, which is what lets a restart resume them. The queue's socket thread
-  writes none. (At start-up the daemon reads `sizes.tsv`; at shutdown it removes
-  the socket.) Events are copied to stdout only when it is a terminal: under
-  launchd stdout is a file that `newsyslog` cannot rotate, and `events.log` has
-  them all.
+  writes none. The daemon reads `sizes.tsv` and `cap.tsv` at start-up and removes
+  the socket at shutdown. Events are copied to stdout only when it is a
+  terminal. Under launchd stdout is a file that `newsyslog` cannot rotate, and
+  `events.log` has them all.
 - Timers run on awake time, so a lid-close never makes a job look "frozen too
   long".
 - `--dry-run` logs every decision and sends no signals.
@@ -311,7 +311,7 @@ membrake replay samples.tsv    # run a recording back through the policy
 | `--max-freeze-minutes M` | `15` | Allow an overdue kill of an unqueued job once a freeze arm fully trips |
 | `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` (none at the cliff) |
 | `--on-event CMD` | — | Run on every freeze, resume and kill, with `MEMBRAKE_*` variables |
-| `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded, and the queue's `queue.tsv` and `sizes.tsv` |
+| `--state-dir DIR` | `/var/db/membrake` | Records of frozen jobs and the queue's `queue.tsv`, `sizes.tsv` and `cap.tsv` |
 | `--socket PATH` | `/var/run/membrake.sock` | Where [`membrake exec`](#queue-membrake-exec) asks for its turn (mode 0666) |
 | `--log-dir DIR` | `/var/log/membrake` | `samples.tsv` and `events.log` (dry runs default to a `dry-run` subdirectory) |
 | `--dry-run` | off | Decide and log, send nothing |
@@ -428,31 +428,36 @@ conditions:
   are capped at the budget. Starting a job can take the total over the budget
   and slow the running jobs.
 
-Requests waiting for the first run's measurement yield their turn. The oldest
-remaining request gets a reservation for its earliest estimated start. With EASY backfilling,
-a younger request can start if it fits immediately and its learned runtime,
-plus a margin of 25% or 250 ms (whichever is greater), ends by that reservation.
-Completion is predicted from the current clock. If no credible completion
-gives the head a start time, a backfill must fit the current commitments and
-leave the head's share reserved against other backfills.
+Requests waiting for the first run's measurement yield their turn. In calm
+memory, if the head is waiting to fit and has waited less than ten minutes,
+younger requests that fit can start in queue order. After ten minutes the head
+gets priority. EASY backfilling lets a younger request start if it fits now and
+its learned runtime, plus a margin of 25% or 250 ms (whichever is greater), puts
+its predicted completion before or at the head's earliest estimated start.
+If no credible completion gives the head a start time, a backfill must fit the
+current commitments and leave the head's share reserved against other backfills.
 
 A head whose memory need meets or exceeds the current cap holds an exclusive
 turn. It can start on its own when the queue's running list is empty and memory
 pressure permits a start. It can start beside running jobs when a fresh, calm
 reading shows that background memory plus their reservations plus its own need
-stays below 75% of RAM, the same ceiling as cap probes. After holding the turn
-for ten minutes it can also start on the next fresh, calm reading, regardless
-of its memory estimate.
+stays below the engine's tight line, the same ceiling as cap probes. After
+holding the turn for ten minutes it can also start on the next fresh, calm
+reading regardless of its memory estimate.
 The brake still monitors measured pressure. Younger requests wait until the
 exclusive job finishes.
 
-The cap starts at 70% of RAM. After a quiet minute with a request blocked only
-by the cap, it rises by 5% of RAM, up to 75%, even if compressor occupancy is
-still above the freeze threshold (60%). Freeze-tier compressor pressure requires
-both tight memory and occupancy at or above that threshold. When memory is
-tight, including under freeze-tier pressure, the cap returns to the last 15 s
-average of counted memory in use. A session, used for display, is the nearest
-agent ancestor of the client or its parent process.
+The default cap is the engine's tight line (60% of RAM in use with the default
+policy). The daemon saves the learned cap, its timestamp and the RAM size in
+`cap.tsv`. On restart it restores a cap learned within the past seven days
+on the same RAM size and within the tight-line ceiling.
+After a quiet minute with a request blocked only by the cap, the cap rises by
+5% of RAM up to the tight line, even if compressor occupancy is still above the
+freeze threshold (60%). Freeze-tier compressor pressure requires both tight
+memory and occupancy at or above that threshold. When memory is tight, including
+under freeze-tier pressure, the cap returns to the last 15 s average of counted
+memory in use, bounded by the tight line. A session, used for display, is the
+nearest agent ancestor of the client or its parent process.
 
 Profiles use the label together with the command signature. The signature is
 the program name and up to two plain arguments, with directories stripped.

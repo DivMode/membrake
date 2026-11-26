@@ -1,4 +1,4 @@
-//! The daemon's side of the queue: the Unix socket, the clients on it, and the two files that
+//! The daemon's side of the queue: the Unix socket, the clients on it, and the files that
 //! tell the world what the queue is doing and has learned.
 //!
 //! Two threads share one `Core` behind a mutex that is held only for in-memory work, never
@@ -16,11 +16,10 @@
 //! silence limit (`Core::stalled`) the waiting clients are sent away with an error, which they
 //! retry with backoff. New requests receive the same reply until sampling resumes.
 //!
-//! Neither thread touches a file. `queue.tsv` and `sizes.tsv` are written by a thread of their
-//! own (`spool`), fed through a bounded queue that drops what it cannot take. That thread
+//! Neither thread touches a file. `queue.tsv`, `sizes.tsv` and `cap.tsv` are written by a thread of
+//! their own (`spool`), fed through a bounded queue that drops what it cannot take. That thread
 //! keeps the latest snapshot of a file it could not write and writes it again (`FileWriter`).
-//! (The exceptions are start-up, which reads `sizes.tsv`, and shutdown, which removes the
-//! socket.)
+//! Start-up reads `sizes.tsv` and `cap.tsv`. Shutdown removes the socket.
 //!
 //! Clients are identified by the kernel, never by what they claim: the peer pid and uid come
 //! from the socket itself, together with the start time of the process that has that pid when
@@ -57,6 +56,8 @@ use std::time::{Duration, Instant};
 
 /// What the queue has learned, in the state directory.
 pub const SIZES_FILE: &str = "sizes.tsv";
+const CAP_FILE: &str = "cap.tsv";
+const CAP_MAX_AGE_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 /// What the queue is doing, in the state directory, rewritten when it changes.
 pub const QUEUE_FILE: &str = "queue.tsv";
 /// Request a larger backlog for simultaneous launches. XNU caps it at its own limit.
@@ -242,12 +243,33 @@ fn admission_notes(view: &Snapshot, admitted: &[Id], dry_run: bool, out: &mut Ve
 // ---------------------------------------------------------------------------------------
 // The files
 
+/// The cap in bytes, when it was learned (Unix seconds), and the machine's RAM in bytes.
+#[derive(Clone, Copy)]
+struct StoredCap {
+    bytes: u64,
+    wall: f64,
+    ram: u64,
+}
+
+impl StoredCap {
+    fn parse(text: &str) -> Option<Self> {
+        let mut fields = text.split_whitespace();
+        let cap = Self {
+            bytes: fields.next()?.parse().ok()?,
+            wall: fields.next()?.parse().ok()?,
+            ram: fields.next()?.parse().ok()?,
+        };
+        fields.next().is_none().then_some(cap)
+    }
+}
+
 /// What the broker asks the thread that writes its files to do.
 enum FileWork {
     /// The new text of the status file.
     Status(String),
     /// The sizes learned so far, to be written as they are.
     Sizes(Arc<Sizes>),
+    Cap(StoredCap),
     /// Remove the status file: the broker is going.
     Remove,
     /// Answer once everything before this is done.
@@ -258,7 +280,7 @@ enum FileWork {
 /// write (it also tries again whenever it is given something new).
 const RETRY_EVERY: Duration = Duration::from_secs(5);
 
-/// The thread that writes `queue.tsv` and `sizes.tsv`. A write that fails is not forgotten: the
+/// The thread that writes the queue's files. A write that fails is not forgotten: the
 /// latest snapshot of that file is kept here and written again, every `retry_every` and
 /// whenever something new arrives, until a write works. A newer snapshot takes the place of
 /// an older one that never got written, so the producers hand over what they have once and
@@ -268,9 +290,12 @@ struct FileWriter {
     status_tmp: PathBuf,
     sizes: PathBuf,
     sizes_tmp: PathBuf,
+    cap: PathBuf,
+    cap_tmp: PathBuf,
     /// The latest snapshot of each file that is not on disk yet.
     unwritten_status: Option<String>,
     unwritten_sizes: Option<Arc<Sizes>>,
+    unwritten_cap: Option<StoredCap>,
     retry_every: Duration,
     last_try: Instant,
     failures: Failures,
@@ -310,6 +335,7 @@ impl FileWriter {
         match work {
             Some(FileWork::Status(text)) => self.unwritten_status = Some(text),
             Some(FileWork::Sizes(table)) => self.unwritten_sizes = Some(table),
+            Some(FileWork::Cap(cap)) => self.unwritten_cap = Some(cap),
             Some(FileWork::Remove) => {
                 // The broker is going: a snapshot that never got written is not to appear now.
                 self.unwritten_status = None;
@@ -327,7 +353,10 @@ impl FileWriter {
     }
 
     fn write_unwritten(&mut self) {
-        if self.unwritten_status.is_none() && self.unwritten_sizes.is_none() {
+        if self.unwritten_status.is_none()
+            && self.unwritten_sizes.is_none()
+            && self.unwritten_cap.is_none()
+        {
             return;
         }
         self.last_try = Instant::now();
@@ -343,10 +372,17 @@ impl FileWriter {
                 self.unwritten_sizes = None;
             }
         }
+        if let Some(StoredCap { bytes, wall, ram }) = self.unwritten_cap {
+            let text = format!("{bytes}\t{wall}\t{ram}\n");
+            let result = write_atomic(&self.cap, &self.cap_tmp, text.as_bytes());
+            if self.failures.worked(result, &self.cap) {
+                self.unwritten_cap = None;
+            }
+        }
     }
 }
 
-/// Starts the thread that writes `queue.tsv` and `sizes.tsv` in `state_dir`. What it cannot
+/// Starts the thread that writes the queue's files in `state_dir`. What it cannot
 /// write, and what it is too far behind to be given, is said in the next tick's notes.
 fn spawn_files(
     state_dir: &Path,
@@ -358,8 +394,11 @@ fn spawn_files(
         status_tmp: state_dir.join(format!("{QUEUE_FILE}.tmp")),
         sizes: state_dir.join(SIZES_FILE),
         sizes_tmp: state_dir.join(format!("{SIZES_FILE}.tmp")),
+        cap: state_dir.join(CAP_FILE),
+        cap_tmp: state_dir.join(format!("{CAP_FILE}.tmp")),
         unwritten_status: None,
         unwritten_sizes: None,
+        unwritten_cap: None,
         retry_every,
         last_try: Instant::now(),
         failures: Failures {
@@ -415,6 +454,10 @@ pub struct Broker {
     /// Reused, so a tick that has nothing to say allocates nothing.
     text: String,
     written: String,
+    /// Read on startup and checked against the first sample.
+    stored_cap: Option<StoredCap>,
+    /// The latest learned cap awaiting a turn in the writer's queue.
+    unoffered_cap: Option<StoredCap>,
     /// The admissions to measure this tick: the request, the group, and when its leader
     /// started.
     groups: Vec<(Id, i32, u64)>,
@@ -470,6 +513,9 @@ impl Broker {
                 Sizes::default()
             }
         };
+        let stored_cap = fs::read_to_string(opts.state_dir.join(CAP_FILE))
+            .ok()
+            .and_then(|text| StoredCap::parse(&text));
         log.push((
             "queue",
             format!(
@@ -527,6 +573,8 @@ impl Broker {
             dry_run: opts.dry_run,
             text: String::with_capacity(1024),
             written: String::with_capacity(1024),
+            stored_cap,
+            unoffered_cap: None,
             groups: Vec::with_capacity(16),
             seen: Vec::with_capacity(16),
             reservations: Vec::with_capacity(16),
@@ -667,6 +715,13 @@ impl Broker {
             let core = &mut *guard;
             core.scheduled_at = self.sample_started;
             let lost = core.take_notes(&mut notes);
+            if let Some(cap) = self.stored_cap.take()
+                && cap.ram == sample.ram
+                && (0.0..=CAP_MAX_AGE_SECONDS).contains(&(sample.wall - cap.wall))
+            {
+                core.sched.restore_cap(cap.bytes, &sample, policy);
+            }
+            let previous_cap = core.sched.cap();
             let sizes = &core.sizes;
             let learned = |signature: &str| sizes.demand(signature);
             let now = s.time + self.sample_started.elapsed().as_secs_f64();
@@ -679,6 +734,17 @@ impl Broker {
                 &mut self.admitted,
             );
             if !self.dry_run {
+                // A calm first sample initializes the cap. Only learning and probes date it.
+                if let Some(bytes) = core.sched.cap()
+                    && previous_cap != Some(bytes)
+                    && (previous_cap.is_some() || sample.tight)
+                {
+                    self.unoffered_cap = Some(StoredCap {
+                        bytes,
+                        wall: sample.wall,
+                        ram: sample.ram,
+                    });
+                }
                 notes.extend(core.sched.new_stalls(sample.wall).map(|job| {
                     (
                         "warn",
@@ -702,6 +768,11 @@ impl Broker {
         }
         admission_notes(&self.view, &self.admitted, self.dry_run, &mut notes);
         if let Some(files) = &self.files {
+            if let Some(cap) = self.unoffered_cap
+                && files.offer(FileWork::Cap(cap)).is_ok()
+            {
+                self.unoffered_cap = None;
+            }
             self.text.clear();
             render(&self.view, &mut self.text);
             // Kept to be offered again at the next sample if the thread could not take it.
@@ -1966,8 +2037,8 @@ mod tests {
         assert_eq!(file.ram, 96 << 30);
         assert_eq!(
             file.cap,
-            (96u64 << 30) * 65 / 100,
-            "learned from the tight reading"
+            (96u64 << 30) * (100 - Policy::default().tight_level) as u64 / 100,
+            "learned from the tight reading and bounded by the tight line"
         );
         let mode = fs::metadata(dir.join(QUEUE_FILE))
             .unwrap()
@@ -2601,7 +2672,7 @@ mod tests {
             for (name, gib, cpu, runtime) in [
                 ("watch", 8, 2000, None),
                 ("blocker", 16, 1000, Some(10_000)),
-                ("head", 24, 2000, None),
+                ("head", 22, 2000, None),
                 ("late", 1, 1000, Some(500)),
             ] {
                 sizes.record_usage(name, gib << 30, Some(cpu), runtime);

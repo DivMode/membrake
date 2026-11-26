@@ -1,6 +1,6 @@
 //! Memory and CPU admission from measured background use and whole-job reservations.
-//! The oldest request has priority. EASY backfill uses learned completion times to
-//! admit smaller requests that can finish before the head needs their resources.
+//! Younger requests can backfill within the current budget. Once the head has waited
+//! ten minutes, backfills must preserve its chance to start.
 
 use std::collections::VecDeque;
 
@@ -15,18 +15,13 @@ pub const USED_WINDOW: f64 = 5.0;
 pub const CAP_WINDOW: f64 = 15.0;
 /// The cap is probed upwards after this long without pressure (seconds).
 pub const PROBE_AFTER: f64 = 60.0;
-/// The cap starts here, as a percentage of RAM.
-const START_PERCENT: u64 = 70;
 /// Each probe raises the cap by this percentage of RAM.
 const PROBE_PERCENT: u64 = 5;
-/// Ceiling for cap probes and reservation-based admission of oversized heads.
-/// Live stress runs (#26) showed a 90% ceiling letting two 38 GB reservations run
-/// together on a 96 GB host whose other work sat in swap.
-const PROBE_MAX_PERCENT: u64 = 75;
 /// Readings kept: more than `CAP_WINDOW` holds at one a second.
 const HISTORY: usize = 64;
 const FRESH_SAMPLE_SECONDS: f64 = 2.5;
 const EXCLUSIVE_WAIT_SECONDS: f64 = 600.0;
+const HEAD_PRIORITY_WAIT_SECONDS: f64 = 10.0 * 60.0;
 const STALL_WAIT_SECONDS: f64 = 10.0 * 60.0;
 const CPU_WINDOW_SECONDS: f64 = 10.0;
 const COLD_PLATEAU_SECONDS: f64 = 30.0;
@@ -80,6 +75,11 @@ impl Sample {
 
 fn percent(ram: u64, percent: u64) -> u64 {
     (u128::from(ram) * u128::from(percent) / 100) as u64
+}
+
+/// The share of RAM in use at the engine's tight line, shared by every cap path.
+fn cap_ceiling(ram: u64, policy: &Policy) -> u64 {
+    percent(ram, (100 - policy.tight_level.clamp(0, 100)) as u64)
 }
 
 /// Recent (time, memory in use) readings in a fixed array, so a step never allocates.
@@ -422,6 +422,7 @@ pub struct Scheduler {
     background: History,
     /// None until the first reading says how much RAM there is.
     cap: Option<u64>,
+    cap_ceiling: u64,
     /// The latest reading reaches the freeze tier or is critical.
     freeze_pressure: bool,
     min_job_bytes: u64,
@@ -472,6 +473,7 @@ impl Scheduler {
             history: History::new(),
             background: History::new(),
             cap: None,
+            cap_ceiling: 0,
             freeze_pressure: false,
             min_job_bytes: Policy::default().min_job_bytes,
             ram: 0,
@@ -492,6 +494,14 @@ impl Scheduler {
     /// The memory the commands may use together, as learned; None before the first reading.
     pub fn cap(&self) -> Option<u64> {
         self.cap
+    }
+
+    /// Restores an age- and RAM-checked cap before the first step.
+    pub(crate) fn restore_cap(&mut self, bytes: u64, sample: &Sample, policy: &Policy) {
+        if bytes <= cap_ceiling(sample.ram, policy) {
+            self.cap = Some(bytes);
+            self.quiet_since = sample.time;
+        }
     }
 
     /// Memory in use over the last 5 s, as of the last step.
@@ -683,7 +693,6 @@ impl Scheduler {
         reserved: u64,
         since: f64,
     ) -> Option<ExclusiveAdmission> {
-        let max = percent(self.ram, PROBE_MAX_PERCENT);
         if self.running.is_empty() {
             Some(ExclusiveAdmission::Alone)
         } else if self.now - self.sample_time > FRESH_SAMPLE_SECONDS {
@@ -693,7 +702,7 @@ impl Scheduler {
                 .measured_background
                 .saturating_add(reserved)
                 .saturating_add(need)
-                < max
+                < self.cap_ceiling
         {
             // A cap that fell back under freeze-tier pressure must not start a waiting job
             // beside other jobs until the pressure clears.
@@ -847,8 +856,9 @@ impl Scheduler {
         self.frozen = s.frozen;
         self.freeze_pressure = freeze_pressure;
         self.min_job_bytes = policy.min_job_bytes;
+        self.cap_ceiling = cap_ceiling(s.ram, policy);
+        let mut cap = self.cap.unwrap_or(self.cap_ceiling).min(self.cap_ceiling);
         if self.cap.is_none() {
-            self.cap = Some(percent(s.ram, START_PERCENT));
             self.quiet_since = now;
         }
         let attributable = self
@@ -863,9 +873,10 @@ impl Scheduler {
         self.used = self.background.average(now, USED_WINDOW);
         if s.tight {
             // Tight readings, including freeze-tier pressure, replace any probed cap.
-            self.cap = Some(self.history.average(now, CAP_WINDOW));
+            cap = self.history.average(now, CAP_WINDOW).min(self.cap_ceiling);
             self.quiet_since = now;
         }
+        self.cap = Some(cap);
 
         // Held back by the cap and nothing else, for a minute of quiet: try a little more.
         if !s.tight
@@ -880,10 +891,10 @@ impl Scheduler {
                         && !self.fits_memory(estimate.need, self.reserved())
                 })
         {
-            let max = percent(s.ram, PROBE_MAX_PERCENT);
-            if let Some(cap) = self.cap.as_mut().filter(|cap| **cap < max) {
-                *cap = (*cap + percent(s.ram, PROBE_PERCENT)).min(max);
-            }
+            self.cap = Some(
+                cap.saturating_add(percent(s.ram, PROBE_PERCENT))
+                    .min(self.cap_ceiling),
+            );
             self.quiet_since = now;
         }
         self.admit_now(decision_time, s.wall, learned, out);
@@ -932,7 +943,8 @@ impl Scheduler {
                 if self.running.is_empty() || exclusive.is_some() || head_fits {
                     (head_at, estimate, None)
                 } else {
-                    let start = if self.tight {
+                    let can_delay_head = wall - head.since < HEAD_PRIORITY_WAIT_SECONDS;
+                    let start = if self.tight || can_delay_head {
                         None
                     } else {
                         self.earliest_start(estimate.need)
@@ -954,6 +966,8 @@ impl Scheduler {
                                 // A large head has no start time while tight. Small jobs may
                                 // still use capacity available under the cap and CPU budget.
                                 self.below_freeze_minimum(candidate)
+                            } else if can_delay_head {
+                                true
                             } else if let Some(start) = start {
                                 candidate.demand.runtime_ms.is_some_and(|ms| {
                                     let runtime = ms as f64 / 1000.0;
@@ -1013,11 +1027,10 @@ impl Scheduler {
 mod tests {
     use super::*;
 
-    /// 100 GiB, so that a level of `100 - n` is `n` GiB in use and the initial cap is 70 GiB.
+    /// 100 GiB, so that a level of `100 - n` is `n` GiB in use.
     const RAM: u64 = 100 * GIB;
 
-    /// A reading at `level` (percent available), tight as the engine counts it (level 40 or
-    /// less).
+    /// A reading at `level` (percent available), tight as the engine counts it.
     fn at(time: f64, level: i32) -> Sample {
         Sample {
             time,
@@ -1025,8 +1038,16 @@ mod tests {
             ram: RAM,
             level,
             occupancy: 0.0,
-            tight: level <= 40,
+            tight: level <= Policy::default().tight_level,
             frozen: false,
+        }
+    }
+
+    /// A kernel pressure warning at the given memory level.
+    fn warned(time: f64, level: i32) -> Sample {
+        Sample {
+            tight: true,
+            ..at(time, level)
         }
     }
 
@@ -1050,7 +1071,11 @@ mod tests {
 
     /// Asks for a command named `name` for `session`; its signature is its name.
     fn ask(q: &mut Scheduler, session: i32, name: &str) -> Id {
-        q.enqueue(session, name.into(), name.into(), 0.0)
+        ask_at(q, session, name, 0.0)
+    }
+
+    fn ask_at(q: &mut Scheduler, session: i32, name: &str, wall: f64) -> Id {
+        q.enqueue(session, name.into(), name.into(), wall)
     }
 
     fn names(q: &Scheduler) -> Vec<&str> {
@@ -1086,7 +1111,7 @@ mod tests {
         assert_eq!(step(&mut q, &calm(0.0), &unknown), Some(a));
         assert_eq!(names(&q), ["a"]);
         assert!(q.waiting().is_empty());
-        assert_eq!(q.cap(), Some(70 * GIB), "the cap starts at 70% of RAM");
+        assert_eq!(q.cap(), Some(60 * GIB), "the cap starts at the tight line");
         assert_eq!(
             q.running()[0].need,
             GIB,
@@ -1193,13 +1218,14 @@ mod tests {
         let watch = ask(&mut q, 1, "watch");
         assert_eq!(step(&mut q, &calm(0.0), &learned), Some(watch));
         assert!(q.started(watch, 123, 7));
-        let head = ask(&mut q, 2, "head");
-        let small = ask(&mut q, 3, "small");
+        let wall = calm(1.0).wall;
+        let head = ask_at(&mut q, 2, "head", wall);
+        let small = ask_at(&mut q, 3, "small", wall);
         q.observe(watch, 2 * GIB, 1.0);
         assert_eq!(
             step(&mut q, &at(1.0, 88), &learned),
             None,
-            "10 + 25 + 72.5 exceeds the 75 GiB ceiling"
+            "10 + 25 + 72.5 exceeds the 60 GiB ceiling"
         );
         assert_eq!(
             q.waiting().iter().map(|w| w.id).collect::<Vec<_>>(),
@@ -1235,7 +1261,7 @@ mod tests {
         assert_eq!(
             step(&mut q, &calm(606.0), &learned),
             Some(head),
-            "the first fresh calm reading admits the head even though 18 + 25 + 72.5 exceeds 75"
+            "the first fresh calm reading admits the head even though 18 + 25 + 72.5 exceeds 60"
         );
         assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
         assert_eq!(
@@ -1253,17 +1279,18 @@ mod tests {
 
     #[test]
     fn review4_oversized_memory_head_can_start_early_when_reservations_fit() {
-        let learned = |name: &str| memory(Some(if name == "head" { 56 } else { 2 } * GIB));
+        let learned = |name: &str| memory(Some(if name == "head" { 44 } else { 2 } * GIB));
         let mut q = Scheduler::with_cpu_capacity(24000, 30000);
         let watch = ask(&mut q, 1, "watch");
         assert_eq!(step(&mut q, &calm(0.0), &learned), Some(watch));
         assert!(q.started(watch, 123, 7));
+        step(&mut q, &warned(1.0, 80), &learned);
         let head = ask(&mut q, 2, "head");
-        q.observe(watch, 2 * GIB, 1.0);
+        q.observe(watch, 2 * GIB, 2.0);
         assert_eq!(
-            step(&mut q, &at(1.0, 96), &learned),
+            step(&mut q, &at(2.0, 96), &learned),
             Some(head),
-            "2 + 2.5 + 70 fits under the 75 GiB ceiling"
+            "2 + 2.5 + 55 fits under the 60 GiB ceiling"
         );
         assert_eq!(
             q.running()[1].exclusive,
@@ -1280,7 +1307,7 @@ mod tests {
         let mut out = Vec::new();
         q.step(&calm(0.0), &cold, &mut out);
         assert_eq!(out, [first, second], "both cold defaults fit the cap");
-        let default = 70 * GIB / 8;
+        let default = 60 * GIB / 8;
         assert_eq!(q.reserved(), 2 * default);
         q.observe(first, 8 * GIB, 1.0);
         assert_eq!(q.reserved(), 10 * GIB + default);
@@ -1397,8 +1424,7 @@ mod tests {
     fn backfill_skips_a_cold_sibling_and_starts_another_signature() {
         let mut q = Scheduler::with_cpu_budget(24_000);
         let learned = |signature: &str| match signature {
-            "incumbent" => memory(Some(21 * GIB)),
-            "head" => memory(Some(24 * GIB)),
+            "incumbent" | "head" => memory(Some(19 * GIB)),
             _ => Demand::default(),
         };
         let first = ask(&mut q, 1, "cold-a");
@@ -1407,9 +1433,10 @@ mod tests {
         q.step(&calm(0.0), &learned, &mut out);
         assert_eq!(out, [first, incumbent]);
 
-        let head = ask(&mut q, 3, "head");
-        let sibling = ask(&mut q, 1, "cold-a");
-        let other = ask(&mut q, 4, "cold-b");
+        let wall = calm(1.0).wall;
+        let head = ask_at(&mut q, 3, "head", wall);
+        let sibling = ask_at(&mut q, 1, "cold-a", wall);
+        let other = ask_at(&mut q, 4, "cold-b", wall);
         // Either cold request fits now and beside the head after the incumbent exits.
         q.step(&calm(1.0), &learned, &mut out);
         assert_eq!(out, [other]);
@@ -1585,7 +1612,7 @@ mod tests {
         assert_eq!(cpu.peak, Some(4000));
     }
 
-    /// At 58 GiB background plus 1 GiB reserved, another 11 GiB reaches the cap and waits.
+    /// At 48 GiB background plus 1 GiB reserved, another 11 GiB reaches the cap and waits.
     #[test]
     fn a_command_waits_when_background_plus_reservations_reaches_the_cap() {
         let learned = |s: &str| {
@@ -1599,19 +1626,19 @@ mod tests {
         let first = ask(&mut q, 1, "first");
         assert!(step(&mut q, &calm(0.0), &learned).is_some());
         q.observe(first, GIB, 0.0);
-        run(&mut q, 1, 10, 42, &learned);
-        assert_eq!(q.used(), 58 * GIB);
+        run(&mut q, 1, 10, 52, &learned);
+        assert_eq!(q.used(), 48 * GIB);
 
         let edge = ask(&mut q, 2, "edge");
-        assert_eq!(run(&mut q, 11, 20, 42, &learned), None);
-        assert_eq!(q.waiting().len(), 1, "58 + 1 + 11 equals 70");
+        assert_eq!(run(&mut q, 11, 20, 52, &learned), None);
+        assert_eq!(q.waiting().len(), 1, "48 + 1 + 11 equals 60");
 
         q.release(edge);
         let fits = ask(&mut q, 2, "fits");
         assert_eq!(
-            step(&mut q, &at(21.0, 42), &learned),
+            step(&mut q, &at(21.0, 52), &learned),
             Some(fits),
-            "58 + 1 + 10 is under 70"
+            "48 + 1 + 10 is under 60"
         );
     }
 
@@ -1642,18 +1669,18 @@ mod tests {
     /// reading after a long busy spell does not let a big command in, five do.
     #[test]
     fn the_memory_in_use_is_averaged_over_five_seconds() {
-        let big = |s: &str| memory((s == "big").then_some(20 * GIB));
+        let big = |s: &str| memory((s == "big").then_some(16 * GIB));
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "first");
         assert!(step(&mut q, &calm(0.0), &big).is_some());
-        run(&mut q, 1, 10, 45, &big); // 55 GiB in use
+        run(&mut q, 1, 10, 50, &big); // 50 GiB in use
         let id = ask(&mut q, 2, "big");
-        // 20 GiB in use now, but 4 x 55 + 20 over 5 s is 48, and 48 + 25 does not fit under 70.
+        // 20 GiB in use now, but the average is 44, and 44 + 1 + 20 does not fit under 60.
         assert_eq!(step(&mut q, &at(11.0, 80), &big), None);
-        assert_eq!(q.used(), 48 * GIB);
-        // Two readings: (3 x 55 + 2 x 20) / 5 = 41 GiB, and 41 + 25 fits.
+        assert_eq!(q.used(), 44 * GIB);
+        // Two readings: (3 x 50 + 2 x 20) / 5 = 38 GiB, and 38 + 1 + 20 fits.
         assert_eq!(step(&mut q, &at(12.0, 80), &big), Some(id));
-        assert_eq!(q.used(), 41 * GIB);
+        assert_eq!(q.used(), 38 * GIB);
     }
 
     #[test]
@@ -1674,7 +1701,7 @@ mod tests {
     #[test]
     fn the_entire_memory_commitment_remains_when_footprint_falls_or_is_missing() {
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
-        let need = |_: &str| memory(Some(18 * GIB));
+        let need = |_: &str| memory(Some(12 * GIB));
         let ids: Vec<_> = (1..=3).map(|s| ask(&mut q, s, "build")).collect();
         let mut out = Vec::new();
         q.step(&calm(0.0), &need, &mut out);
@@ -1720,7 +1747,7 @@ mod tests {
             let (gib, cores, seconds) = match s {
                 "watch" => (8, 2, None),
                 "blocker" => (16, 1, Some(10)),
-                "head" => (24, 4, Some(2)),
+                "head" => (23, 4, Some(2)),
                 "short" => (1, 3, Some(2)),
                 "long" => (1, 1, Some(20)),
                 _ => (1, 1, None),
@@ -1781,6 +1808,62 @@ mod tests {
     }
 
     #[test]
+    fn a_young_head_allows_fitting_backfills_until_it_has_waited_ten_minutes() {
+        let learned = |name: &str| {
+            memory(Some(
+                match name {
+                    "watch" => 8,
+                    "blocker" => 16,
+                    "head" => 22,
+                    _ => 3,
+                } * GIB,
+            ))
+        };
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let watch = ask(&mut q, 1, "watch");
+        let blocker = ask(&mut q, 2, "blocker");
+        let mut out = Vec::new();
+        q.step(&calm(0.0), &learned, &mut out);
+        assert_eq!(out, [watch, blocker]);
+
+        let wall = calm(1.0).wall;
+        let head = ask_at(&mut q, 3, "head", wall);
+        let first = ask_at(&mut q, 4, "first", wall);
+        let second = ask_at(&mut q, 5, "second", wall);
+        let third = ask_at(&mut q, 6, "third", wall);
+        q.step(&calm(600.0), &learned, &mut out);
+        assert_eq!(
+            out,
+            [first, second],
+            "two fit while the head has waited 599 seconds"
+        );
+        assert_eq!(q.used() + q.reserved(), 115 * GIB / 2);
+        assert!(q.used() + q.reserved() < q.cap().unwrap());
+        assert_eq!(
+            q.waiting().iter().map(|w| w.id).collect::<Vec<_>>(),
+            [head, third]
+        );
+
+        q.release(first);
+        q.release(second);
+        q.step(&calm(601.0), &learned, &mut out);
+        assert!(
+            q.fits_memory(15 * GIB / 4, q.reserved()),
+            "the third request fits now"
+        );
+        assert!(
+            out.is_empty(),
+            "at ten minutes a backfill must preserve the head's start"
+        );
+
+        q.release(blocker);
+        q.step(&calm(602.0), &learned, &mut out);
+        assert_eq!(out, [head], "the head starts once enough memory frees");
+        assert_eq!(q.waiting()[0].id, third);
+        assert!(q.used() + q.reserved() < q.cap().unwrap());
+    }
+
+    #[test]
     fn a_backfill_cannot_block_a_head_that_could_run_after_a_partial_release() {
         let mut q = Scheduler::with_cpu_budget(4000);
         let learned = |name: &str| {
@@ -1788,8 +1871,8 @@ mod tests {
                 match name {
                     "watch" => 20,
                     "blocker" => 8,
-                    "head" => 16,
-                    _ => 4,
+                    "head" => 10,
+                    _ => 3,
                 } * GIB,
             ))
         };
@@ -1834,7 +1917,7 @@ mod tests {
         let large = |_: &str| memory(Some(60 * GIB));
         q.admit_now(PROBE_AFTER + 1.0, 61.0, &large, &mut out);
         assert!(out.is_empty());
-        assert_eq!(q.cap(), Some(70 * GIB), "arrival never probes the cap");
+        assert_eq!(q.cap(), Some(60 * GIB), "arrival never probes the cap");
         assert_eq!(q.used(), 20 * GIB);
         assert_eq!(q.history.len, 1, "arrival does not add readings");
         assert_eq!(q.quiet_since, 0.0);
@@ -1878,8 +1961,8 @@ mod tests {
         let need = |s: &str| {
             memory(Some(match s {
                 "large" => 30 * GIB,
-                "head" => 39 * GIB,
-                _ => 2 * GIB,
+                "head" => 31 * GIB,
+                _ => 3 * GIB / 2,
             }))
         };
         let mut out = Vec::new();
@@ -1893,7 +1976,7 @@ mod tests {
             WaitReason::Cap {
                 used: 20 * GIB,
                 reserved: 30 * GIB * 5 / 4,
-                cap: 70 * GIB,
+                cap: 60 * GIB,
             }
         );
         assert_eq!(view.waiting[1].reason, WaitReason::Behind);
@@ -1922,7 +2005,7 @@ mod tests {
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let need = |_: &str| memory(Some(30 * GIB));
         let mut out = Vec::new();
-        q.step(&calm(0.0), &need, &mut out);
+        q.step(&warned(0.0, 50), &need, &mut out);
         let first = ask(&mut q, 1, "first");
         q.step(&calm(PROBE_AFTER - 1.0), &need, &mut out);
         assert_eq!(out, [first]);
@@ -1934,11 +2017,11 @@ mod tests {
         q.step(&s, &need, &mut out);
         assert!(
             out.is_empty(),
-            "20 used + 30 reserved + 30 needed exceeds even the probe"
+            "20 used + 37.5 reserved + 37.5 needed exceeds even the probe"
         );
         assert_eq!(
             q.cap(),
-            Some(75 * GIB),
+            Some(55 * GIB),
             "only the reservation holds the head back"
         );
     }
@@ -1952,13 +2035,13 @@ mod tests {
             ..at(time, 90)
         };
         let first = ask(&mut q, 1, "first");
-        assert_eq!(step(&mut q, &quiet(0.0), &need), Some(first));
+        assert_eq!(step(&mut q, &warned(0.0, 50), &need), Some(first));
         let head = ask(&mut q, 2, "second");
         assert_eq!(step(&mut q, &quiet(PROBE_AFTER - 1.0), &need), None);
-        assert_eq!(q.cap(), Some(70 * GIB));
+        assert_eq!(q.cap(), Some(50 * GIB));
         assert_eq!(step(&mut q, &quiet(PROBE_AFTER), &need), None);
         assert_eq!(q.waiting()[0].id, head);
-        assert_eq!(q.cap(), Some(75 * GIB), "the blocked head triggers a probe");
+        assert_eq!(q.cap(), Some(55 * GIB), "the blocked head triggers a probe");
     }
 
     #[test]
@@ -1972,12 +2055,12 @@ mod tests {
                 ..at(time, level)
             };
             let first = ask(&mut q, 1, "first");
-            assert_eq!(step(&mut q, &calm(0.0), &need), Some(first));
+            assert_eq!(step(&mut q, &warned(0.0, 50), &need), Some(first));
             ask(&mut q, 2, "second");
             assert_eq!(run(&mut q, 1, 60, 90, &need), None);
-            assert_eq!(q.cap(), Some(75 * GIB), "probed in calm memory");
+            assert_eq!(q.cap(), Some(55 * GIB), "probed in calm memory");
             assert_eq!(step(&mut q, &reading(61.0, 90), &need), None);
-            assert_eq!(q.cap(), Some(75 * GIB), "occupancy alone keeps the probe");
+            assert_eq!(q.cap(), Some(55 * GIB), "occupancy alone keeps the probe");
 
             assert_eq!(step(&mut q, &reading(62.0, 35), &need), None);
             assert_eq!(
@@ -1988,13 +2071,17 @@ mod tests {
             for time in 63..=122 {
                 assert_eq!(step(&mut q, &reading(f64::from(time), 35), &need), None);
                 if time >= 76 {
-                    assert_eq!(q.cap(), Some(65 * GIB), "no probe under sustained pressure");
+                    assert_eq!(
+                        q.cap(),
+                        Some(60 * GIB),
+                        "bounded by the ceiling under sustained pressure"
+                    );
                 }
             }
             assert_eq!(step(&mut q, &reading(123.0, 90), &need), None);
             assert_eq!(
                 q.cap(),
-                Some(65 * GIB),
+                Some(60 * GIB),
                 "quiet time restarts after pressure"
             );
         }
@@ -2004,9 +2091,9 @@ mod tests {
     fn an_oversized_head_can_start_beside_others_when_pressure_clears() {
         let learned = |s: &str| match s {
             "small" => memory(Some(8 * GIB)),
-            _ => memory(Some(47 * GIB)),
+            _ => memory(Some(35 * GIB)),
         };
-        // 5 GiB in use: 5 + 10 reserved + 58.75 needed fits under the 75 GiB ceiling.
+        // 5 GiB in use: 5 + 10 reserved + 43.75 needed fits under the 60 GiB ceiling.
         let quiet = |time, occupancy| Sample {
             occupancy,
             ..at(time, 95)
@@ -2057,7 +2144,7 @@ mod tests {
         assert_eq!(q.cap(), Some(3744 * GIB / 100), "the head is now oversized");
 
         let timeout = 1.0 + EXCLUSIVE_WAIT_SECONDS;
-        // The two 38.3 GiB reservations alone exceed the 72 GiB ceiling.
+        // The two 38.3 GiB reservations alone exceed the tight-line ceiling.
         for time in [2.0, 1.0 + PROBE_AFTER, timeout - 1.0] {
             assert_eq!(
                 step(&mut q, &reading(time, 90), &learned),
@@ -2080,7 +2167,7 @@ mod tests {
         let big = |_: &str| memory(Some(30 * GIB));
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 1, "b"));
-        // The tight reading sets both background and cap to 65 GiB.
+        // The tight reading sees 65 GiB in use, above the 60 GiB cap ceiling.
         assert_eq!(
             step(&mut q, &at(0.0, 35), &big),
             Some(a),
@@ -2100,7 +2187,7 @@ mod tests {
         assert_eq!(step(&mut q, &calm(0.0), &learned), Some(running));
         step(&mut q, &at(20.0, 25), &learned);
         let head = ask(&mut q, 2, "head");
-        assert_eq!(step(&mut q, &at(25.0, 38), &learned), None);
+        assert_eq!(step(&mut q, &warned(25.0, 46), &learned), None);
         assert!(q.fits_memory(5 * GIB / 2, q.reserved()));
         assert_eq!(q.waiting()[0].id, head);
     }
@@ -2117,19 +2204,20 @@ mod tests {
         let mut q = Scheduler::with_cpu_budget(2 * MILLICORES);
         let running = ask(&mut q, 1, "running");
         assert_eq!(step(&mut q, &calm(0.0), &learned), Some(running));
-        let head = ask(&mut q, 2, "head");
-        let minimum = ask(&mut q, 3, "minimum");
-        let small = ask(&mut q, 4, "small");
-        let another = ask(&mut q, 5, "another");
-        assert_eq!(step(&mut q, &at(20.0, 25), &learned), None, "at the cap");
-        assert_eq!(step(&mut q, &at(25.0, 35), &learned), Some(small));
+        let wall = calm(20.0).wall;
+        let head = ask_at(&mut q, 2, "head", wall);
+        let minimum = ask_at(&mut q, 3, "minimum", wall);
+        let small = ask_at(&mut q, 4, "small", wall);
+        let another = ask_at(&mut q, 5, "another", wall);
+        assert_eq!(step(&mut q, &at(20.0, 25), &learned), None, "above the cap");
+        assert_eq!(step(&mut q, &warned(25.0, 44), &learned), Some(small));
         assert_eq!(
             q.waiting().iter().map(|w| w.id).collect::<Vec<_>>(),
             [head, minimum, another]
         );
         assert_eq!(q.running()[1].backfill_for, Some(head));
         assert_eq!(
-            step(&mut q, &at(30.0, 38), &learned),
+            step(&mut q, &warned(30.0, 45), &learned),
             None,
             "at the CPU budget with memory to spare"
         );
@@ -2176,7 +2264,7 @@ mod tests {
     fn the_cap_is_learned_from_a_tight_episode() {
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         run(&mut q, 0, 9, 80, &unknown);
-        assert_eq!(q.cap(), Some(70 * GIB));
+        assert_eq!(q.cap(), Some(60 * GIB));
         step(&mut q, &at(10.0, 25), &unknown);
         assert_eq!(q.cap(), Some(25 * GIB), "(10 x 20 + 75) / 11");
         step(&mut q, &at(11.0, 25), &unknown);
@@ -2184,8 +2272,8 @@ mod tests {
         run(&mut q, 12, 40, 25, &unknown);
         assert_eq!(
             q.cap(),
-            Some(75 * GIB),
-            "the calm seconds have left the window"
+            Some(60 * GIB),
+            "sustained tight memory use is capped at the tight line"
         );
     }
 
@@ -2193,45 +2281,87 @@ mod tests {
     /// again every 60 s; the request that fits at last is admitted.
     #[test]
     fn the_cap_is_probed_upwards_while_a_request_is_blocked_by_it() {
-        let need = |s: &str| memory((s == "b").then_some(15 * GIB));
+        let need = |s: &str| memory((s == "b").then_some(8 * GIB));
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
-        assert!(step(&mut q, &calm(0.0), &need).is_some());
-        run(&mut q, 1, 10, 45, &need); // 55 GiB in use, the 5 s average settled
+        assert!(step(&mut q, &warned(0.0, 55), &need).is_some());
+        run(&mut q, 1, 10, 57, &need); // 43 GiB in use, the 5 s average settled
         let b = ask(&mut q, 2, "b");
-        // 55 + 18.75 does not fit under 70.
-        for t in 11..=59 {
-            assert_eq!(step(&mut q, &at(f64::from(t), 45), &need), None, "t = {t}");
-            assert_eq!(q.cap(), Some(70 * GIB), "t = {t}");
+        // 43 + 1 + 10 does not fit under 45 or 50.
+        for t in 11..=119 {
+            assert_eq!(step(&mut q, &at(f64::from(t), 57), &need), None, "t = {t}");
+            assert_eq!(
+                q.cap(),
+                Some((if t < 60 { 45 } else { 50 }) * GIB),
+                "t = {t}"
+            );
         }
         assert_eq!(
-            step(&mut q, &at(60.0, 45), &need),
+            step(&mut q, &at(120.0, 57), &need),
             Some(b),
-            "75 GiB: 55 + 18.75 fits"
+            "55 GiB: 43 + 1 + 10 fits"
         );
-        assert_eq!(q.cap(), Some(75 * GIB));
+        assert_eq!(q.cap(), Some(55 * GIB));
     }
 
     #[test]
-    fn probing_stops_at_75_percent_of_ram_and_waits_for_a_blocked_request() {
+    fn the_start_and_exclusive_reservation_ceiling_follow_the_tight_line() {
+        let policy = Policy::default();
+        let ceiling = at(0.0, policy.tight_level).used();
+        let learned = |name: &str| memory(Some(if name == "head" { 40 } else { 8 } * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        ask(&mut q, 1, "watch");
+        step(&mut q, &calm(0.0), &learned);
+        assert!(
+            q.cap().unwrap() <= ceiling,
+            "starting cap {:?} exceeds {ceiling}",
+            q.cap()
+        );
+        step(&mut q, &warned(1.0, 80), &learned);
+        let head = ask(&mut q, 2, "head");
+        assert_eq!(
+            step(&mut q, &at(2.0, 99), &learned),
+            None,
+            "1 + 10 + 50 exceeds the tight line"
+        );
+        assert_eq!(q.waiting()[0].id, head);
+        assert_eq!(
+            step(&mut q, &at(3.0, 100), &learned),
+            None,
+            "exactly at the ceiling"
+        );
+        // A smaller head is eligible for the same exclusive rule below the ceiling.
+        q.release(head);
+        let smaller = ask(&mut q, 2, "smaller head");
+        let learned = |name: &str| memory(Some(if name == "smaller head" { 39 } else { 8 } * GIB));
+        assert_eq!(step(&mut q, &at(4.0, 99), &learned), Some(smaller));
+        assert_eq!(
+            q.running()[1].exclusive,
+            Some(ExclusiveAdmission::Reservations)
+        );
+    }
+
+    #[test]
+    fn probing_stops_at_the_tight_line_and_waits_for_a_blocked_request() {
         let huge = |_: &str| memory(Some(95 * GIB));
+        let ceiling = at(0.0, Policy::default().tight_level).used();
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         ask(&mut q, 1, "a");
         assert!(step(&mut q, &calm(0.0), &huge).is_some());
         assert_eq!(q.running()[0].exclusive, Some(ExclusiveAdmission::Alone));
+        step(&mut q, &warned(20.0, 50), &huge);
+        let learned = q.cap().unwrap();
         // Nobody waiting: nothing is blocked, so the cap stays where it is.
-        run(&mut q, 1, 200, 45, &huge);
-        assert_eq!(q.cap(), Some(70 * GIB));
+        run(&mut q, 21, 200, 45, &huge);
+        assert_eq!(q.cap(), Some(learned));
 
         ask(&mut q, 2, "b");
-        let mut caps = Vec::new();
         for t in 201..=600 {
             assert_eq!(step(&mut q, &at(f64::from(t), 45), &huge), None);
-            caps.push(q.cap().unwrap() / GIB);
+            let cap = q.cap().unwrap();
+            assert!(cap <= ceiling, "probe raised cap to {cap}, above {ceiling}");
         }
-        assert_eq!(caps.iter().max(), Some(&75), "never above 75% of RAM");
-        assert_eq!(caps.last(), Some(&75));
-        assert!(caps.iter().all(|&cap| cap == 70 || cap == 75));
+        assert_eq!(q.cap(), Some(ceiling));
     }
 
     /// Pressure restarts the 60 s: the next probe is 60 s after the last tight reading, from
@@ -2244,10 +2374,10 @@ mod tests {
         assert!(step(&mut q, &calm(0.0), &need).is_some());
         ask(&mut q, 2, "b");
         run(&mut q, 1, 99, 45, &need);
-        assert_eq!(q.cap(), Some(75 * GIB), "probed once, at 60 s");
-        step(&mut q, &at(100.0, 35), &need);
+        assert_eq!(q.cap(), Some(60 * GIB));
+        step(&mut q, &warned(100.0, 60), &need);
         let learned = q.cap().unwrap();
-        assert_eq!(learned, (14 * 55 + 65) * GIB / 15, "the last 15 s of use");
+        assert_eq!(learned, (14 * 55 + 40) * GIB / 15, "the last 15 s of use");
         run(&mut q, 101, 159, 45, &need);
         assert_eq!(
             q.cap(),
@@ -2274,7 +2404,7 @@ mod tests {
         let learned = |s: &str| memory((s == "bun run test").then_some(30 * GIB));
         assert_eq!(need(&q, &learned), 30 * GIB * 5 / 4);
 
-        // 45 + 30 is over the 70 GiB cap; 45 + the default 1 is not.
+        // 45 + 37.5 is over the 60 GiB cap; 45 + the default 1 is not.
         assert_eq!(run(&mut q, 11, 20, 55, &learned), None);
         assert_eq!(
             q.waiting().len(),
@@ -2391,7 +2521,7 @@ mod tests {
                 match s {
                     "watch" => 8,
                     "blocker" => 16,
-                    "head" => 24,
+                    "head" => 23,
                     _ => 1,
                 } * GIB,
             ),
@@ -2412,7 +2542,7 @@ mod tests {
         q.step(&calm(0.0), &learned, &mut out);
         ask(&mut q, 1, "head");
         ask(&mut q, 1, "late");
-        q.admit_now(9.4, 9.4, &learned, &mut out);
+        q.admit_now(9.4, calm(9.4).wall, &learned, &mut out);
         assert!(out.is_empty());
     }
 }

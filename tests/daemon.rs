@@ -2437,6 +2437,102 @@ fn queue_the_learned_size_is_written_after_the_command_is_done() {
 }
 
 #[test]
+fn queue_the_learned_cap_survives_a_restart() {
+    let dir = scratch("qcap");
+    let socket = queue_socket("cap");
+    let state = dir.join("state");
+    let mut script = Script::new(&dir);
+    script.calm(1);
+    script.tight(1);
+    let before_learning = membrake::signals::wall();
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let ram = 96u64 << 30;
+    let learned = (20 * ram / 100 + 65 * ram / 100) / 2;
+    queue_cap_when(&state, &daemon, |cap| cap == learned);
+    assert!(daemon.terminate().success());
+
+    let path = state.join("cap.tsv");
+    let text = fs::read_to_string(&path).unwrap();
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3, "{text:?}");
+    assert_eq!(fields[0].parse::<u64>().unwrap(), learned);
+    assert!(
+        (before_learning..=membrake::signals::wall()).contains(&fields[1].parse::<f64>().unwrap())
+    );
+    assert_eq!(fields[2].parse::<u64>().unwrap(), ram);
+    assert_eq!(mode(&path), 0o644);
+
+    // The restarted daemon sees only calm readings, so it cannot relearn that lower cap.
+    let mut script = Script::new(&dir);
+    script.calm(1);
+    let restarted = queue_daemon(&script, &dir, &socket, NOTHING);
+    assert_eq!(
+        queue_cap_when(&state, &restarted, |_| true),
+        learned,
+        "the learned cap after restart"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    assert!(restarted.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn queue_ignores_stale_or_implausible_learned_caps() {
+    let dir = scratch("qcap-invalid");
+    let socket = queue_socket("cap-invalid");
+    let state = dir.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let ram = 96u64 << 30;
+    let tight_line = (100 - membrake::engine::Policy::default().tight_level) as u64 * ram / 100;
+    let wall = membrake::signals::wall();
+    for (case, text) in [
+        (
+            "stale",
+            format!(
+                "{}\t{}\t{ram}\n",
+                ram / 3,
+                wall - Duration::from_secs(8 * 24 * 60 * 60).as_secs_f64()
+            ),
+        ),
+        (
+            "different RAM",
+            format!("{}\t{wall}\t{}\n", ram / 3, ram + 1),
+        ),
+        (
+            "above the ceiling",
+            format!("{}\t{wall}\t{ram}\n", tight_line + 1),
+        ),
+        ("malformed", String::from("bad cap data")),
+    ] {
+        fs::write(state.join("cap.tsv"), text).unwrap();
+        let mut script = Script::new(&dir);
+        script.calm(1);
+        let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+        assert_eq!(
+            queue_cap_when(&state, &daemon, |_| true),
+            tight_line,
+            "{case}"
+        );
+        assert!(daemon.terminate().success());
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn queue_cap_when(state: &Path, daemon: &Daemon, ready: impl Fn(u64) -> bool) -> u64 {
+    let mut cap = None;
+    wait_until("the cap in queue.tsv", 10, || {
+        cap = membrake::broker::read_queue(state)
+            .unwrap()
+            .filter(|queue| queue.daemon as u32 == daemon.0.id())
+            .map(|queue| queue.cap)
+            .filter(|&value| ready(value));
+        cap.is_some()
+    });
+    cap.unwrap()
+}
+
+#[test]
 fn queue_learns_cpu_from_a_successful_command_between_samples() {
     let dir = scratch("qshort");
     let socket = queue_socket("short");
