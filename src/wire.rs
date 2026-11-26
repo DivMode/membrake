@@ -5,9 +5,11 @@
 //! client -> daemon   REQUEST  v1  <label>  <signature>  [first-attempt unix micros]
 //!                    STARTED  <pgid>
 //!                    DONE     <exit code>  [elapsed ms, cpu ns, peak bytes]
+//!                    IS_LIVE  <admitting client pid:start time in unix micros>
 //! daemon -> client   QUEUED   <position>  <need in bytes>  <reason>  (whenever any changes, and
 //!                                                             at least every `KEEP_ALIVE`)
 //!                    GO
+//!                    LIVE     <yes or no>
 //!                    ERROR    <text>
 //! ```
 //!
@@ -26,6 +28,7 @@ use crate::queue::WaitReason;
 pub(crate) const NOT_SCHEDULING: &str = "the queue is not scheduling";
 pub(crate) const TOO_MANY_CLIENTS: &str = "too many clients"; // Older brokers.
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -125,6 +128,28 @@ pub struct Completion {
     pub peak_bytes: u64,
 }
 
+/// The process that holds the admission connection. A reused pid names a different client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admission {
+    pub pid: i32,
+    pub start_us: u64,
+}
+
+impl Admission {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let (pid, start_us) = text.split_once(':')?;
+        let pid = pid.parse().ok()?;
+        let start_us = start_us.parse().ok()?;
+        (pid > 0 && start_us > 0).then_some(Self { pid, start_us })
+    }
+}
+
+impl fmt::Display for Admission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.pid, self.start_us)
+    }
+}
+
 /// Removes and returns the first complete line of `buf`, without its newline.
 pub fn take_line(buf: &mut Vec<u8>) -> Option<String> {
     let end = buf.iter().position(|&b| b == b'\n')?;
@@ -147,6 +172,7 @@ pub enum Message {
     Started(i32),
     /// The command has ended with this exit code.
     Done(i32, Option<Completion>),
+    IsLive(Admission),
 }
 
 impl Message {
@@ -171,6 +197,7 @@ impl Message {
                 "DONE\t{code}\t{}\t{}\t{}\n",
                 stats.elapsed_ms, stats.cpu_ns, stats.peak_bytes
             ),
+            Message::IsLive(admission) => format!("IS_LIVE\t{admission}\n"),
         }
     }
 
@@ -198,6 +225,11 @@ impl Message {
                 })
             }
             Some("STARTED") => Ok(Message::Started(number(fields.next())?)),
+            Some("IS_LIVE") => fields
+                .next()
+                .and_then(Admission::parse)
+                .map(Message::IsLive)
+                .ok_or_else(|| "malformed admission identity".into()),
             Some("DONE") => {
                 let code = number(fields.next())?;
                 let stats = if let Some(elapsed) = fields.next() {
@@ -232,6 +264,7 @@ pub enum Reply {
     },
     /// Start the command now.
     Go,
+    Live(bool),
     Error(String),
 }
 
@@ -271,6 +304,7 @@ impl Reply {
                 line
             }
             Reply::Go => "GO\n".to_string(),
+            Reply::Live(live) => format!("LIVE\t{}\n", if *live { "yes" } else { "no" }),
             Reply::Error(text) => format!("ERROR\t{}\n", sanitize(text, MAX_LINE / 2)),
         }
     }
@@ -306,6 +340,11 @@ impl Reply {
                 },
             }),
             "GO" => Some(Reply::Go),
+            "LIVE" => match fields.next()? {
+                "yes" => Some(Reply::Live(true)),
+                "no" => Some(Reply::Live(false)),
+                _ => None,
+            },
             "ERROR" => Some(Reply::Error(sanitize(fields.next()?, MAX_LINE))),
             _ => None,
         }

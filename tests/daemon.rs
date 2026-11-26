@@ -1439,25 +1439,24 @@ impl Client {
         Client::spawn_with(dir, name, socket, options, command, false, &[])
     }
 
-    /// `admitted`: the client runs as inside a command the queue already admitted. `env`:
-    /// variables for the client.
+    /// `legacy_admission` sets the old inherited flag. `env` contains explicit overrides.
     fn spawn_with(
         dir: &Path,
         name: &str,
         socket: &Path,
         options: &[&str],
         command: &[&str],
-        admitted: bool,
+        legacy_admission: bool,
         env: &[(&str, &str)],
     ) -> Client {
         let stderr = dir.join(format!("{name}.stderr"));
         let mut exec = Command::new(env!("CARGO_BIN_EXE_membrake"));
-        exec.envs(env.iter().copied());
         // These tests may themselves be running inside an admitted command.
         exec.env_remove("MEMBRAKE_ADMITTED");
-        if admitted {
+        if legacy_admission {
             exec.env("MEMBRAKE_ADMITTED", "1");
         }
+        exec.envs(env.iter().copied());
         let child = exec
             .arg("exec")
             .arg("--socket")
@@ -1661,6 +1660,87 @@ fn queue_a_client_waits_under_freeze_pressure_and_runs_when_it_is_calm() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn queue_a_waiting_client_rejoins_after_a_daemon_restart() {
+    let dir = scratch("qrestart");
+    let socket = queue_socket("restart");
+    let mut script = Script::new(&dir);
+    script.tight(3);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+
+    let ran = marker_file(&dir, "ran");
+    let mut client = Client::spawn(
+        &dir,
+        "c",
+        &socket,
+        &["--label", "restart"],
+        &["touch", &ran],
+    );
+    client.wait_said("memory is tight");
+    assert!(daemon.terminate().success());
+    wait_until("the client to retry during the outage", 10, || {
+        assert!(client.running(), "waiting client exited: {}", client.said());
+        assert!(!Path::new(&ran).exists(), "ran during the outage");
+        client.said().contains("retrying")
+    });
+
+    let restarted = dir.join("restarted");
+    fs::create_dir(&restarted).unwrap();
+    let mut script = Script::new(&restarted);
+    script.tight(3);
+    let daemon = queue_daemon(&script, &restarted, &socket, NOTHING);
+    let state = restarted.join("state");
+    wait_until("the new daemon to queue the client", 15, || {
+        assert!(client.running(), "waiting client exited: {}", client.said());
+        assert!(
+            !Path::new(&ran).exists(),
+            "ran before the new daemon granted a turn"
+        );
+        script.tight(1);
+        membrake::broker::read_queue(&state)
+            .ok()
+            .flatten()
+            .is_some_and(|q| q.waiting.iter().any(|job| job.label == "restart"))
+    });
+    assert_eq!(client.code_while_calm(&mut script), Some(0));
+    assert!(Path::new(&ran).exists());
+    assert!(daemon.terminate().success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn queue_a_waiting_client_gives_up_if_the_daemon_does_not_return() {
+    let dir = scratch("qrestart-timeout");
+    let socket = queue_socket("restart-timeout");
+    let mut script = Script::new(&dir);
+    script.tight(3);
+    let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
+    let ran = marker_file(&dir, "ran");
+    let mut client = Client::spawn(&dir, "c", &socket, &[], &["touch", &ran]);
+    client.wait_said("memory is tight");
+
+    let shutdown = Instant::now();
+    assert!(daemon.terminate().success());
+    wait_until(
+        "the client to give up after the reconnect window",
+        40,
+        || !client.running(),
+    );
+    assert!(
+        shutdown.elapsed() >= Duration::from_secs(30),
+        "the client gave up too early: {}",
+        client.said()
+    );
+    assert_eq!(client.code(), Some(1));
+    assert!(
+        client.said().contains("queue unavailable"),
+        "{}",
+        client.said()
+    );
+    assert!(!Path::new(&ran).exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The client exits with its command's exit code, with 128 plus the signal when the client is
 /// signalled and passes the signal on, and with a shell's 127 when there is no such command.
 #[test]
@@ -1740,13 +1820,27 @@ fn queue_a_missing_or_stale_socket_fails_without_running_the_command() {
     let dir = scratch("qclosed");
     let socket = queue_socket("stale");
     let marker = marker_file(&dir, "ran");
-    let mut absent = Client::spawn(&dir, "absent", &socket, &[], &["touch", &marker]);
-    assert_eq!(absent.code(), Some(1));
-    assert!(
-        absent.said().contains("no daemon is listening"),
-        "{}",
-        absent.said()
-    );
+    for legacy in [false, true] {
+        let mut absent = Client::spawn_with(
+            &dir,
+            "absent",
+            &socket,
+            &[],
+            &["touch", &marker],
+            legacy,
+            &[],
+        );
+        wait_until("a new client to fail without a daemon", 5, || {
+            !absent.running()
+        });
+        assert_eq!(absent.code(), Some(1));
+        assert!(
+            absent.said().contains("no daemon is listening"),
+            "{}",
+            absent.said()
+        );
+        assert!(!absent.said().contains("retrying"), "{}", absent.said());
+    }
 
     let mut script = Script::new(&dir);
     script.calm(1);
@@ -2229,28 +2323,91 @@ fn queue_keeps_places_while_samples_are_unreadable_then_recovers() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Inside an admitted command a `membrake exec` runs its command directly. The proof is a
-/// daemon that would hold it for good (memory is tight) and never hears of it.
 #[test]
-fn queue_a_nested_call_runs_directly() {
+fn queue_a_nested_call_shares_only_a_live_admission() {
     let dir = scratch("qnest");
     let socket = queue_socket("nest");
     let mut script = Script::new(&dir);
-    script.tight(5);
+    script.calm(6);
     let log = dir.join("log");
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
 
-    let mut nested =
-        Client::spawn_with(&dir, "n", &socket, &[], &["sh", "-c", "exit 3"], true, &[]);
-    assert_eq!(nested.code(), Some(3));
-    assert_eq!(nested.said(), "", "no queue, no line");
-    script.tight(2);
-    daemon.wait_samples(&log, 7);
-    assert!(
-        !events(&log).contains("asks for a turn"),
-        "{}",
-        events(&log)
+    let parent = marker_file(&dir, "parent.sh");
+    let helper = marker_file(&dir, "helper.sh");
+    let ready = dir.join("parent-ready");
+    let run_live = dir.join("run-live");
+    let live = dir.join("live-ran");
+    let helper_pid = marker_file(&dir, "helper-pid");
+    let run_expired = dir.join("run-expired");
+    let expired = dir.join("expired-ran");
+    fs::write(
+        &parent,
+        r#"set -eu
+touch "$3/parent-ready"
+while [ ! -e "$3/run-live" ]; do sleep 0.05; done
+"$1" exec --socket "$2" --label live -- touch "$3/live-ran"
+/bin/sh "$3/helper.sh" "$@" &
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &helper,
+        r#"set -eu
+echo $$ > "$3/helper-pid"
+tries=0
+while [ ! -e "$3/run-expired" ]; do
+    tries=$((tries+1))
+    [ "$tries" -lt 600 ] || exit 1
+    sleep 0.05
+done
+exec "$1" exec --socket "$2" --label expired -- touch "$3/expired-ran"
+"#,
+    )
+    .unwrap();
+
+    let mut client = Client::spawn(
+        &dir,
+        "parent",
+        &socket,
+        &["--label", "parent"],
+        &[
+            "/bin/sh",
+            &parent,
+            env!("CARGO_BIN_EXE_membrake"),
+            socket.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        ],
     );
+    wait_until("the parent to be admitted", 15, || ready.exists());
+    script.tight(3);
+    daemon.wait_samples(&log, 9);
+    fs::write(run_live, "").unwrap();
+    wait_until(
+        "the nested command to run while memory is tight",
+        10,
+        || live.exists(),
+    );
+    let left = Left::read(&helper_pid);
+    assert_eq!(client.code(), Some(0));
+    wait_until("the broker to release the parent's reservation", 10, || {
+        script.tight(1);
+        events(&log).contains("parent finished after")
+    });
+    assert!(!events(&log).contains("live asks for a turn"));
+    assert!(left.alive(), "the helper outlived its admitting parent");
+
+    fs::write(run_expired, "").unwrap();
+    wait_until("the expired admission to request a turn", 10, || {
+        assert!(!expired.exists(), "the expired admission ran directly");
+        script.tight(1);
+        events(&log).contains("expired asks for a turn")
+    });
+    assert!(left.alive(), "the helper is waiting on the new request");
+    wait_until("the helper to be admitted on calm readings", 15, || {
+        script.calm(1);
+        expired.exists()
+    });
+    wait_until("the helper to exit", 10, || !left.alive());
     assert!(daemon.terminate().success());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2361,7 +2518,7 @@ fn queue_the_command_runs_at_the_callers_priority_in_a_group_of_its_own() {
     let daemon = queue_daemon(&script, &dir, &socket, NOTHING);
 
     let env = marker_file(&dir, "env");
-    let client = Client::spawn(
+    let mut client = Client::spawn(
         &dir,
         "c",
         &socket,
@@ -2389,9 +2546,32 @@ fn queue_the_command_runs_at_the_callers_priority_in_a_group_of_its_own() {
     // SAFETY: as above.
     let caller = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
     assert_eq!(nice, caller, "the command keeps the caller's priority");
-    assert_eq!(fs::read_to_string(&env).unwrap().trim(), "1");
-    drop(client);
+    let admission = fs::read_to_string(&env).unwrap();
+    let client_start_us = jobs::bsd_info(client.pid()).unwrap().start_us;
+    assert_eq!(
+        admission.trim(),
+        format!("{}:{client_start_us}", client.pid())
+    );
+
     assert!(daemon.terminate().success());
+    assert!(
+        client.running(),
+        "losing the daemon leaves the admitted command running"
+    );
+    assert!(jobs::bsd_info(group).is_some_and(|p| p.start_us == leader.start_us));
+    let nested_ran = marker_file(&dir, "nested-ran");
+    let mut nested = Client::spawn_with(
+        &dir,
+        "nested",
+        &socket,
+        &[],
+        &["touch", &nested_ran],
+        false,
+        &[("MEMBRAKE_ADMITTED", admission.trim())],
+    );
+    assert_eq!(nested.code(), Some(0));
+    assert!(Path::new(&nested_ran).exists());
+    drop(client);
     let _ = fs::remove_dir_all(&dir);
 }
 

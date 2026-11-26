@@ -1286,7 +1286,12 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// One line from a client.
-    fn handle(&self, conn: &mut Conn, line: &str) {
+    fn handle<'a>(
+        &self,
+        conn: &mut Conn,
+        line: &str,
+        mut other_clients: impl Iterator<Item = &'a Conn>,
+    ) {
         if line.len() > wire::MAX_LINE {
             return conn.refuse("line too long");
         }
@@ -1295,6 +1300,21 @@ impl Ctx<'_> {
             Err(why) => return conn.refuse(&why),
         };
         match (message, conn.id) {
+            (Message::IsLive(admission), None) => {
+                // GO grants the reservation. DONE or a disconnect releases it; the
+                // command's group can outlive either, so check the admitting connection.
+                let live = other_clients.any(|parent| {
+                    parent.id.is_some()
+                        && parent.go_at.is_some()
+                        && !parent.dead
+                        && !parent.closing
+                        && parent.peer.pid == admission.pid
+                        && parent.peer.start_us == admission.start_us
+                });
+                conn.say(&Reply::Live(live));
+                conn.closing = true;
+            }
+            (Message::IsLive(_), Some(_)) => conn.refuse("check admission on its own connection"),
             (
                 Message::Request {
                     label,
@@ -1511,11 +1531,13 @@ fn serve(
         if fds[0].revents & libc::POLLIN != 0 {
             accept_some(listener, &mut conns, core, &mut accept_failed);
         }
-        for conn in &mut conns {
+        for i in 0..conns.len() {
+            let (before, rest) = conns.split_at_mut(i);
+            let (conn, after) = rest.split_first_mut().expect("a connection at this index");
             while !conn.closing
                 && let Some(line) = wire::take_line(&mut conn.input)
             {
-                ctx.handle(conn, &line);
+                ctx.handle(conn, &line, before.iter().chain(after.iter()));
             }
             if conn.closing {
                 // Told to go away: whatever more it sends is not read.

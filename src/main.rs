@@ -71,8 +71,9 @@ enum Command {
     /// when its expected memory fits and running jobs commit less than the CPU budget.
     /// Below the freeze tier, tight memory allows the first job to start and lets jobs
     /// smaller than the freeze minimum use spare capacity. Frozen jobs stop admissions.
-    /// If the queue is unavailable the client exits with an error. A call inside an admitted
-    /// command shares its reservation.
+    /// If the queue is unavailable the client exits with an error. A queued client whose
+    /// connection drops has up to 30 s to rejoin before it exits with an error. A call inside
+    /// an admitted command shares its reservation while the admitting client still runs.
     Exec(ExecArgs),
 }
 
@@ -182,7 +183,8 @@ struct ExecArgs {
     socket: PathBuf,
     /// When the command ends, stop what it left running in its process group (SIGTERM, then
     /// SIGKILL after 10 s). Without it, that happens only when the command was interrupted;
-    /// otherwise one line says what is left. Not inside an admitted command, which runs directly
+    /// otherwise one line says what is left. Applies when this call starts a process group of
+    /// its own.
     #[arg(long)]
     reap: bool,
     /// The command and its arguments, after `--`
