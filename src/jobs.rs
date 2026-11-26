@@ -462,7 +462,7 @@ pub(crate) fn admission_covers(
         return false;
     }
     // A debugger can reparent an ancestor to its own descendant.
-    let mut visited = [0; 64];
+    let mut visited = [0; 512];
     for depth in 0..visited.len() {
         visited[depth] = member.pid;
         if member.ppid <= 1 || visited[..=depth].contains(&member.ppid) {
@@ -485,7 +485,7 @@ fn admission_coverage_rejects_a_cycle_in_the_parent_chain() {
     let reads = std::cell::Cell::new(0);
     let process = |pid| {
         reads.set(reads.get() + 1);
-        assert!(reads.get() <= 65, "parent walk exceeded 64 steps");
+        assert!(reads.get() <= 513, "parent walk exceeded 512 steps");
         let ppid = match pid {
             12 => 13,
             13 => 12,
