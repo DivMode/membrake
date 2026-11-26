@@ -301,28 +301,35 @@ pub struct State {
     pending: Vec<i32>,
 }
 
-/// Copies of every record that a `State` was dropped with by a panic unwinding it, by the
-/// directory they belong to: what the panic leaves for `recover_dir`, whose file may by then
-/// be unreadable, gone, or one the record never reached.
-static UNSAVED: Mutex<Vec<(PathBuf, Record)>> = Mutex::new(Vec::new());
+/// The records thawed during unwinding and their outcomes, by state directory. Recovery uses
+/// these to reconcile the state file with what has already been attempted.
+static PANIC_REPORTS: Mutex<Vec<(PathBuf, Record, Recovered)>> = Mutex::new(Vec::new());
 
 impl Drop for State {
     /// Every record is still a promise to continue its group, `pending` or not.
     fn drop(&mut self) {
-        if !thread::panicking() {
+        if !thread::panicking() || self.records.is_empty() {
             return;
         }
-        let mut unsaved = UNSAVED.lock().unwrap_or_else(PoisonError::into_inner);
-        unsaved.extend(self.records.iter().map(|r| (self.dir.clone(), r.clone())));
+        // The broker drops after State and unlinks its socket. Thaw now, before that or any
+        // state-file work can block.
+        let report = thaw_records(self);
+        let mut reports = PANIC_REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+        reports.extend(
+            report
+                .into_iter()
+                .map(|(r, outcome)| (self.dir.clone(), r, outcome)),
+        );
     }
 }
 
-/// Takes the records that a panic left in `UNSAVED` for `dir`.
-fn take_unsaved(dir: &Path) -> Vec<Record> {
-    let mut unsaved = UNSAVED.lock().unwrap_or_else(PoisonError::into_inner);
-    let (mine, others): (Vec<_>, Vec<_>) = unsaved.drain(..).partition(|(d, _)| d == dir);
-    *unsaved = others;
-    mine.into_iter().map(|(_, record)| record).collect()
+fn take_panic_report(dir: &Path) -> Vec<(Record, Recovered)> {
+    let mut reports = PANIC_REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let (mine, others): (Vec<_>, Vec<_>) = reports.drain(..).partition(|(d, _, _)| d == dir);
+    *reports = others;
+    mine.into_iter()
+        .map(|(_, r, outcome)| (r, outcome))
+        .collect()
 }
 
 impl State {
@@ -514,6 +521,8 @@ pub enum ActError {
     /// The rules, asked again once the record was written and just before the signal, no
     /// longer allow this group to be touched (the reason is the text). Nothing was signalled.
     Ineligible(String),
+    /// Every member was stopped already and this freeze sent no signals.
+    AlreadyStopped,
     Io(io::Error),
 }
 
@@ -523,6 +532,7 @@ impl fmt::Display for ActError {
             ActError::Gone => write!(f, "the job has exited"),
             ActError::Unknown(why) => write!(f, "the job cannot be inspected: {why}"),
             ActError::Ineligible(why) => write!(f, "it is no longer eligible: {why}"),
+            ActError::AlreadyStopped => write!(f, "it was already stopped"),
             ActError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -697,6 +707,24 @@ fn settle(state: &mut State, pgid: i32, error: ActError) -> ActError {
     error
 }
 
+/// Settles the record when stopping is abandoned. A fresh record that never covered a
+/// SIGSTOP can be discarded without signalling any of its members.
+fn abandon(state: &mut State, pgid: i32, fresh_record: bool, sent: &[(i32, u64)], why: &ActError) {
+    if fresh_record && sent.is_empty() {
+        let _ = state.discard(pgid);
+    } else {
+        match why {
+            ActError::Gone => {
+                let _ = state.remove(pgid);
+            }
+            ActError::Unknown(_) => {}
+            _ => {
+                let _ = resume(state, pgid);
+            }
+        }
+    }
+}
+
 /// How many passes of stopping `stop_group` makes at most. A group whose members keep forking
 /// into it is not chased further: what is stopped stays recorded, the newest members are
 /// neither.
@@ -830,26 +858,16 @@ pub fn freeze(
     state.add(Record::of(job, now, insp.members()))?;
     let mut sent = Vec::new();
     match stop_group(state, job.pgid, &mut insp, &mut sent, allowed) {
-        Ok(()) => Ok(()),
-        Err(ActError::Ineligible(why)) => {
-            if sent.is_empty() {
-                let _ = state.discard(job.pgid);
-            } else {
-                // If this cannot continue the group the record stays, and it is tried again.
-                let _ = resume(state, job.pgid);
-            }
-            Err(ActError::Ineligible(why))
+        Ok(()) if sent.is_empty() && insp.members().iter().all(|member| member.stopped) => {
+            let error = ActError::AlreadyStopped;
+            abandon(state, job.pgid, true, &sent, &error);
+            Err(error)
         }
+        Ok(()) => Ok(()),
         // Stopped, and on record, in part: the rest is for `finish_pending`.
         Err(ActError::Unknown(_) | ActError::Io(_)) if !sent.is_empty() => Ok(()),
-        // Nothing was stopped, so there is nothing to promise; or the group is gone, and what
-        // was stopped of it and is still ours is continued.
         Err(e) => {
-            if sent.is_empty() {
-                let _ = state.discard(job.pgid);
-            } else {
-                let _ = state.remove(job.pgid);
-            }
+            abandon(state, job.pgid, true, &sent, &e);
             Err(e)
         }
     }
@@ -989,29 +1007,29 @@ pub struct DirRecovery {
     pub problem: Option<io::Error>,
 }
 
-/// `recover` after a panic: the records a `State` for `dir` was dropped with (every record the
-/// loop held) are continued first, from memory, before the directory is touched at all, so
-/// that nothing the filesystem does (a read that blocks, a directory that cannot be opened)
-/// can come between a panic and the first SIGCONT. Then the upkeep of the directory (creating
-/// it, the modes; best effort), and the records in the state file that memory did not have,
-/// which are continued too. A record that could not be continued stays in the file. A file
-/// that could not be read costs only the records in it, and is not written over.
+/// Reconciles the state file after a panic. The in-memory records were already thawed during
+/// unwinding. Continue any records only the file had, keep the failures, and repair the
+/// directory modes best-effort. A file that could not be read is left alone.
 pub fn recover_dir(dir: &Path) -> DirRecovery {
-    let mut state = State::new(dir, take_unsaved(dir), Vec::new());
-    let mut report = thaw_records(&mut state);
+    let mut report = take_panic_report(dir);
 
     let _ = secure_dir(dir).and_then(|()| repair_file_mode(dir));
     let problem = match read_state(dir) {
         Ok((records, unparsed)) => {
-            let kept = std::mem::take(&mut state.records);
             // Memory's copy of a group is the newer: the file's is not tried again.
-            state.records = records
+            let records = records
                 .into_iter()
                 .filter(|r| !report.iter().any(|(done, _)| done.pgid == r.pgid))
                 .collect();
-            state.unparsed = unparsed;
-            report.extend(thaw_records(&mut state));
-            state.records.extend(kept);
+            let mut state = State::new(dir, records, unparsed);
+            let from_disk = thaw_records(&mut state);
+            state.records.extend(
+                report
+                    .iter()
+                    .filter(|(_, outcome)| matches!(outcome, Recovered::Failed(_)))
+                    .map(|(r, _)| r.clone()),
+            );
+            report.extend(from_disk);
             state.save().err()
         }
         Err(e) => Some(e),
@@ -1161,47 +1179,20 @@ pub(crate) fn kill_with_pressure(
         let mut sent = Vec::new();
         match stop_group(state, pgid, &mut insp, &mut sent, allowed) {
             Ok(()) => {}
-            Err(ActError::Ineligible(why)) => {
-                // Continue what is stopped, if anything is, and spare the group.
-                if !adds_record || !sent.is_empty() {
-                    let _ = resume(state, pgid);
-                } else {
-                    let _ = state.discard(pgid);
-                }
-                return Ok(Killed::Spared(why));
-            }
-            // The group was the recorded one when the stopping began and is not now, or
-            // cannot be looked at. What `insp` holds is what a look found that was rejected:
-            // it is not ours to adopt as witnesses (a group that took over the pgid would
-            // then be signalled), and nothing more is sent to the group on its strength.
-            // Gone: whatever of the record is stopped and still ours is continued, and the
-            // job is dropped. A record this kill wrote with nothing stopped under it goes
-            // without a signal, here and below.
-            Err(ActError::Gone) => {
-                if adds_record && sent.is_empty() {
-                    let _ = state.discard(pgid);
-                } else {
-                    let _ = resume(state, pgid);
-                }
-                return Err(ActError::Gone);
-            }
-            // Unknown: the record stays, whatever was stopped with it, and every later signal
-            // (the next resume, the next kill) starts with a look of its own.
-            Err(e @ ActError::Unknown(_)) => {
-                if adds_record && sent.is_empty() {
-                    let _ = state.discard(pgid);
-                }
-                return Err(e);
-            }
-            Err(e) if sent.is_empty() => {
-                if adds_record {
-                    let _ = state.discard(pgid);
-                }
-                return Err(e);
-            }
             // Stopped in part, and on record, the group as recorded at the last look. Whether
             // the group is gone is for the waits below to decide.
-            Err(_) => {}
+            Err(ActError::Io(_)) if !sent.is_empty() => {}
+            Err(e) => {
+                // An I/O failure before the first stop leaves any pre-existing record intact.
+                if adds_record || !matches!(e, ActError::Io(_)) {
+                    abandon(state, pgid, adds_record, &sent, &e);
+                }
+                // A rejected look is never used as an identity witness.
+                return match e {
+                    ActError::Ineligible(why) => Ok(Killed::Spared(why)),
+                    e => Err(e),
+                };
+            }
         }
         // What was born while the others were stopped is stopped too, and recorded.
         id.remember(insp.members());
@@ -1427,6 +1418,41 @@ mod tests {
     use crate::jobs;
     use crate::testutil::{Sleeper, fault, mkfifo, scratch};
     use std::io::Read;
+    use std::time::Instant;
+
+    const FIFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Opening succeeds only once the reader has opened its end. Keep the returned writer
+    /// alive until data is sent so the reader can consume it before it sees EOF.
+    fn fifo_writer(path: &Path) -> fs::File {
+        let deadline = Instant::now() + FIFO_TIMEOUT;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => return file,
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(Instant::now() < deadline, "no reader opened {path:?}");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("opening FIFO writer for {path:?}: {e}"),
+            }
+        }
+    }
+
+    fn join_fifo_reader<T>(reader: JoinHandle<T>) -> T {
+        let deadline = Instant::now() + FIFO_TIMEOUT;
+        while !reader.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "FIFO reader did not finish after the writer closed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        reader.join().unwrap()
+    }
 
     /// A clock that jumps or a bad deadline must not put the brake to sleep.
     #[test]
@@ -2120,15 +2146,78 @@ mod tests {
                 })
             }
         });
-        assert!(sleeper.settles(false), "continued from memory");
+        let mut writer = fifo_writer(&file);
+        let continued_from_memory = sleeper.settles(false);
         assert!(
             !recovering.is_finished(),
             "while the read of the state file is still blocked"
         );
-        // A writer that opens and closes: the read ends, and finds no records.
-        drop(fs::OpenOptions::new().write(true).open(&file).unwrap());
-        let message = recovering.join().unwrap().unwrap_err();
+        // A non-record line proves the reader consumed data before the writer closed.
+        writer.write_all(b"unparsed test record\n").unwrap();
+        drop(writer);
+        let message = join_fifo_reader(recovering).unwrap_err();
+        assert!(continued_from_memory, "continued from memory");
         assert!(message.contains("resumed 1 frozen job(s)"), "{message}");
+        assert!(fs::metadata(&file).unwrap().is_file());
+        assert_eq!(read_state(&dir).unwrap().1, ["unparsed test record"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panic_continues_a_child_before_blocking_cleanup_during_unwind() {
+        struct BlockingCleanup(PathBuf);
+
+        impl Drop for BlockingCleanup {
+            fn drop(&mut self) {
+                let _ = fs::read_to_string(&self.0);
+            }
+        }
+
+        let dir = scratch("continue-during-unwind");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        freeze_plain(&mut state, &job, signals::wall()).unwrap();
+        assert!(sleeper.settles(true));
+        let fifo = dir.join("cleanup");
+        mkfifo(&fifo);
+
+        let recovering = thread::spawn({
+            let dir = dir.clone();
+            let fifo = fifo.clone();
+            move || {
+                crate::runner::guarded(Some(&dir), move || {
+                    // Runner drops its State before its Broker. Model a blocked socket unlink
+                    // with a FIFO read in the destructor that runs after State.
+                    let _runner_fields = (state, BlockingCleanup(fifo));
+                    panic!("simulated bug");
+                })
+            }
+        });
+        let mut writer = fifo_writer(&fifo);
+        let continued_during_unwind = sleeper.settles(false);
+        assert!(
+            !recovering.is_finished(),
+            "cleanup is held by the FIFO writer"
+        );
+        if continued_during_unwind {
+            // SAFETY: stopping the child this test spawned.
+            assert_eq!(unsafe { libc::kill(sleeper.pid(), libc::SIGSTOP) }, 0);
+            assert!(sleeper.settles(true), "the new stop took effect");
+        }
+        writer.write_all(b"\n").unwrap();
+        drop(writer);
+        let message = join_fifo_reader(recovering).unwrap_err();
+        assert!(
+            continued_during_unwind,
+            "the child was still stopped while the unwind was blocked in cleanup"
+        );
+        assert!(message.contains("resumed 1 frozen job(s)"), "{message}");
+        assert!(
+            sleeper.stopped(),
+            "file recovery continued the child a second time"
+        );
+        assert_eq!(records_on_disk(&dir), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2790,6 +2879,34 @@ mod tests {
             "the kill continued what it never stopped"
         );
         assert_eq!(records_on_disk(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_leaves_an_externally_stopped_group_stopped() {
+        let dir = scratch("already-stopped");
+        let sleeper = Sleeper::spawn();
+        let job = sleeper.job(1);
+        let mut state = State::open(&dir).unwrap();
+        // SAFETY: stopping the child this test spawned, after the job was scanned.
+        assert_eq!(unsafe { libc::kill(sleeper.pid(), libc::SIGSTOP) }, 0);
+        assert!(sleeper.settles(true), "the external stop took effect");
+
+        let outcome = freeze_plain(&mut state, &job, signals::wall());
+        let recorded = state.records().len();
+        let on_disk = records_on_disk(&dir);
+        state.reload().unwrap();
+        let released = recover(&mut state).unwrap();
+        assert!(
+            sleeper.stopped(),
+            "release continued the externally stopped child: freeze={outcome:?}, release={released:?}"
+        );
+        assert!(
+            matches!(outcome, Err(ActError::AlreadyStopped)),
+            "{outcome:?}"
+        );
+        assert_eq!((recorded, on_disk), (0, 0));
+        assert!(released.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
