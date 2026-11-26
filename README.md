@@ -124,7 +124,7 @@ group footprint as excess for unqueued groups. Waiting and relaying
 `membrake exec` clients contribute no bytes to the victim ranking or the
 `--min-job-gb` threshold. A group needs a positive footprint to be eligible,
 even with `--min-job-gb 0`.
-The daemon measures admitted command groups in full for their queue reservations.
+The daemon measures all groups covered by an admission in full for its reservation.
 Cold jobs above their starting reservation rank next.
 Jobs within their starting reservation are eligible only at the cliff
 and rank last, newest first. The samples log records the starting reservations
@@ -463,6 +463,13 @@ client sends its child's CPU time,
 maximum RSS and elapsed time in `DONE`, using `wait4`. Up to 1000 profiles
 live in `sizes.tsv`. A labeled command uses its legacy command-signature
 profile until it learns a profile of its own.
+
+Each footprint sample sums the admitted command's own process group and other
+groups whose leaders descend from that command, including groups created by shell
+job control. The daemon follows parent PIDs back to the live command leader and
+checks its PID and start time. These groups are eligible for a kill only at the
+cliff. Orphans reparented to launchd after the command leader exits fall outside
+the admission.
 
 `membrake status` shows the cap, measured background use, running jobs and
 current reservations, and waiting jobs' positions and reasons. After more

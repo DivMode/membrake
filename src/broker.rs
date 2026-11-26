@@ -34,8 +34,8 @@
 //! in the line or report its own completion. Strings and protocol lines are bounded.
 //! Process identities are checked before measuring groups.
 
-use crate::engine::Policy;
-use crate::jobs::{self, AGENT_CLI, Inspector, Probe, Regex};
+use crate::engine::{Policy, include_covered_groups};
+use crate::jobs::{self, AGENT_CLI, Inspector, Job, Probe, ProcessTable, Regex};
 use crate::queue::{Id, Released, Reservation, Sample, Scheduler, Snapshot, WaitReason};
 use crate::runner::{age, gb};
 use crate::signals::{self, Signals};
@@ -415,13 +415,14 @@ pub struct Broker {
     /// Reused, so a tick that has nothing to say allocates nothing.
     text: String,
     written: String,
-    /// The admitted groups to measure this tick: the request, the group, and when its leader
+    /// The admissions to measure this tick: the request, the group, and when its leader
     /// started.
     groups: Vec<(Id, i32, u64)>,
     /// What this tick measured of them.
     seen: Vec<(Id, jobs::GroupUsage)>,
     reservations: Vec<Reservation>,
     inspector: Inspector,
+    processes: ProcessTable,
     /// Where the queue stood at the last tick, copied out of the core.
     view: Snapshot,
     /// Reused output of the scheduler's admission loop.
@@ -530,6 +531,7 @@ impl Broker {
             seen: Vec::with_capacity(16),
             reservations: Vec::with_capacity(16),
             inspector: Inspector::new(),
+            processes: ProcessTable::default(),
             view: Snapshot::default(),
             admitted: Vec::new(),
             scheduled: 0,
@@ -562,10 +564,26 @@ impl Broker {
             );
         }
         self.seen.clear();
+        if !self.groups.is_empty() {
+            self.processes.refresh();
+        }
         for &(id, pgid, leader_start_us) in &self.groups {
-            if let Some(usage) = jobs::group_usage(&mut self.inspector, pgid, leader_start_us) {
-                self.seen.push((id, usage));
+            let Some(mut usage) = jobs::group_usage(&mut self.inspector, pgid, leader_start_us)
+            else {
+                continue;
+            };
+            for leader in self.processes.group_leaders().filter(|p| p.pid != pgid) {
+                if jobs::admission_covers(
+                    (leader.pid, leader.start_us),
+                    (pgid, leader_start_us),
+                    |pid| self.processes.get(pid),
+                ) && let Some(child) =
+                    jobs::group_usage(&mut self.inspector, leader.pid, leader.start_us)
+                {
+                    usage.bytes = usage.bytes.saturating_add(child.bytes);
+                }
             }
+            self.seen.push((id, usage));
         }
         let mut core = lock(&self.core);
         for (id, usage) in &self.seen {
@@ -582,18 +600,22 @@ impl Broker {
     }
 
     /// Fetch after scanning candidates so STARTED messages checked during that scan
-    /// also take part in ranking. The returned slice is also what replay records.
-    pub(crate) fn refresh_reservations(&mut self) -> &[Reservation] {
-        let core = lock(&self.core);
+    /// also take part in ranking. Resolve descendants of those commands for both
+    /// current candidates and previously frozen groups.
+    pub(crate) fn refresh_reservations<'a>(
+        &mut self,
+        candidates: impl Iterator<Item = &'a Job>,
+    ) -> &[Reservation] {
         self.reservations.clear();
         self.reservations
-            .extend(core.sched.running().iter().filter_map(|r| {
+            .extend(lock(&self.core).sched.running().iter().filter_map(|r| {
                 Some(Reservation {
                     pgid: r.pgid?,
                     start_us: r.leader_start_us,
                     limit: r.limit(),
                 })
             }));
+        include_covered_groups(&mut self.reservations, candidates, jobs::live_process);
         &self.reservations
     }
 
@@ -2098,6 +2120,64 @@ mod tests {
     }
 
     #[test]
+    fn a_job_control_group_contributes_to_the_learned_peak() {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+
+        let (mut broker, socket, dir) = broker("job-control-peak", false);
+        let mut time = 0.0;
+        let mut client = go(&mut broker, &mut time, &socket, "job control");
+        let script = dir.join("job-control.sh");
+        fs::write(
+            &script,
+            "set -m\nexec 3<&0\n/bin/cat <&3 &\nprintf '%s\\n' \"$!\"\nwait\n",
+        )
+        .unwrap();
+        let mut command = Command::new("/bin/bash")
+            .arg(&script)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pgid = command.id() as i32;
+        let input = command.stdin.take().unwrap();
+        let mut line = String::new();
+        BufReader::new(command.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let worker: i32 = line.trim().parse().unwrap();
+        tick_until(&mut broker, &mut time, 80, || {
+            jobs::bsd_info(worker).is_some_and(|p| p.name == "cat")
+        });
+        let process = jobs::bsd_info(worker).unwrap();
+        assert_eq!((process.pgid, process.ppid), (worker, pgid));
+        client.send(&format!("STARTED\t{pgid}\n"));
+        let core = Arc::clone(&broker.core);
+        tick_until(&mut broker, &mut time, 80, || {
+            lock(&core)
+                .sched
+                .running()
+                .iter()
+                .any(|r| r.pgid == Some(pgid) && r.peak > 0)
+        });
+        let (leader_bytes, worker_bytes) = (jobs::footprint(pgid), jobs::footprint(worker));
+        let peak = lock(&core).sched.running()[0].peak;
+        drop(input); // EOF lets the worker and then the admitted shell exit.
+        assert!(command.wait().unwrap().success());
+        client.send("DONE\t0\n");
+        assert!(client.hung_up());
+        let learned = lock(&core).sizes.demand("job control").bytes;
+        assert!(leader_bytes > 0 && worker_bytes > 0);
+        assert!(
+            peak >= leader_bytes + worker_bytes,
+            "recorded peak {peak}, admitted shell {leader_bytes}, separate worker group {worker_bytes}"
+        );
+        assert_eq!(learned, Some(peak));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_completion_is_learned_even_if_the_child_was_reaped_before_started_arrived() {
         let (mut broker, socket, dir) = broker("reaped-before-started", false);
         let mut time = 0.0;
@@ -2402,7 +2482,11 @@ mod tests {
             let mut e = Engine::new(Policy::default());
             let mut s = reading(2.0, 35);
             s.segments = 0.93;
-            let step = e.step_with_candidates(&s, || (candidates, broker.refresh_reservations()));
+            let step = e.step_with_candidates(&s, |frozen| {
+                let reservations = broker
+                    .refresh_reservations(candidates.iter().chain(frozen.iter().map(|f| &f.job)));
+                (candidates, reservations)
+            });
             returned.send(step.actions).unwrap();
         });
         ready.recv().unwrap();
