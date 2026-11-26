@@ -83,7 +83,7 @@ struct PolicyArgs {
     /// Minimum time between freezes, between resumes, and after a kill
     #[arg(long, value_name = "SECONDS", default_value_t = 10.0)]
     settle_seconds: f64,
-    /// Allow an overdue frozen job to bypass the settle period at sustained freeze pressure
+    /// Time a frozen unqueued job can wait before sustained freeze pressure allows an overdue kill
     #[arg(long, value_name = "MINUTES", default_value_t = 15.0)]
     max_freeze_minutes: f64,
 }

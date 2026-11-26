@@ -779,6 +779,7 @@ pub fn replay_with(
     let mut engine = Engine::new(policy);
     let mut summary = Summary::default();
     let mut jobs: Vec<Job> = Vec::new();
+    let mut reservations = Vec::new();
     let mut killed: Vec<(i32, u64)> = Vec::new();
     let mut raw = Vec::new();
     let mut n = 0;
@@ -816,9 +817,10 @@ pub fn replay_with(
                     .any(|&(pgid, start)| j.pgid == pgid && j.start_us == start)
             });
             jobs = list;
+            reservations = row.reservations;
         }
         summary.samples += 1;
-        let step = engine.step_with_admissions(&row.signals, &row.reservations, || jobs.clone());
+        let step = engine.step_with_admissions(&row.signals, &reservations, || jobs.clone());
         for action in &step.actions {
             match action {
                 Action::Stall { .. } => summary.stalls += 1,
@@ -1038,6 +1040,33 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("freeze 8.0GB group 10"), "{out}");
         assert!(!out.contains("freeze 4.0GB group 11"), "{out}");
+    }
+
+    #[test]
+    fn replay_carries_reservations_until_the_next_job_scan() {
+        let jobs = [job(10, 1_000, 8, (false, false, false), "tsc --build")];
+        let reservations = [Reservation {
+            pgid: jobs[0].pgid,
+            start_us: jobs[0].start_us,
+            limit: ReservationLimit::Learned(4 << 30),
+        }];
+        for (rescan, expected_kills) in [(false, 0), (true, 1)] {
+            let mut tsv = String::from(HEADER);
+            let mut line = String::new();
+            for i in 0..12 {
+                let s = signals(i, 0.86, 35);
+                let step = Engine::new(Policy::default()).step(&s, Vec::new);
+                let list = (i == 0 || rescan && i == 1).then_some(&jobs[..]);
+                let recorded_reservations = if i == 0 { &reservations[..] } else { &[] };
+                format_row_with_admissions(&mut line, &s, &step, list, recorded_reservations);
+                tsv.push_str(&line);
+            }
+            let mut out = Vec::new();
+            let summary = replay(tsv.as_bytes(), Policy::default(), &mut out).unwrap();
+            let printed = String::from_utf8(out).unwrap();
+            assert_eq!(summary.freezes, 1, "{printed}");
+            assert_eq!(summary.kills, expected_kills, "{printed}");
+        }
     }
 
     #[test]

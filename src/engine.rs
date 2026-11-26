@@ -2,8 +2,9 @@
 //! every scenario is tested with synthetic samples.
 //!
 //! Measured pressure must persist before freezing or an ordinary kill. The two emergency
-//! thresholds bypass the settle period. Recovery counts calm readings and restarts the
-//! count when a measured freeze arm fires.
+//! thresholds bypass the settle period and are the only ones that can kill admitted jobs.
+//! Overdue kills apply only to unqueued groups. Recovery counts calm readings and
+//! restarts the count when a measured freeze arm fires.
 
 use crate::jobs::Job;
 use crate::queue::{Reservation, ReservationLimit};
@@ -17,7 +18,8 @@ pub struct Policy {
     /// Minimum time between two freezes, two resumes, or after a kill before the strike
     /// arms may fire again.
     pub settle: f64,
-    /// At sustained freeze pressure, an overdue frozen job can bypass the settle period.
+    /// At sustained freeze pressure, a frozen unqueued job past this limit lets an overdue
+    /// kill bypass the settle period. Admitted jobs are eligible only for immediate kills.
     pub max_freeze: f64,
     /// Report gaps longer than this as a stall.
     pub stall_gap: f64,
@@ -238,11 +240,14 @@ fn same(a: &Job, b: &Job) -> bool {
     a.pgid == b.pgid && a.start_us == b.start_us
 }
 
-fn rank(reservations: &[Reservation], job: &Job) -> (u8, u64) {
-    match reservations
+fn reservation_for<'a>(reservations: &'a [Reservation], job: &Job) -> Option<&'a Reservation> {
+    reservations
         .iter()
         .find(|r| r.pgid == job.pgid && r.pgid == job.leader_pid && r.start_us == job.start_us)
-    {
+}
+
+fn rank(reservations: &[Reservation], job: &Job) -> (u8, u64) {
+    match reservation_for(reservations, job) {
         None => (2, job.bytes),
         Some(r) => match r.limit {
             ReservationLimit::Learned(need) if job.bytes > need => (2, job.bytes - need),
@@ -340,13 +345,11 @@ impl Engine {
         } else if !pressure {
             self.calm_streak = self.calm_streak.saturating_add(1);
         }
-        let overdue = sustained_freeze
-            && self
-                .frozen
-                .iter()
-                .any(|f| now - f.since > self.policy.max_freeze);
+        let past_freeze_limit = |f: &Frozen| now - f.since > self.policy.max_freeze;
 
-        if !kill.is_empty() || (!quiet && sustained_freeze) || overdue {
+        if !kill.is_empty()
+            || (sustained_freeze && (!quiet || self.frozen.iter().any(past_freeze_limit)))
+        {
             let (mut pool, reservations) = candidates();
             for f in &self.frozen {
                 if !pool.iter().any(|j| same(j, &f.job)) {
@@ -355,27 +358,39 @@ impl Engine {
             }
             pool.retain(|j| j.bytes >= self.policy.min_job_bytes || self.holds(j));
             pool.retain(|j| !j.protected);
+            let immediate = kill.iter().any(|a| a.immediate());
+            let overdue = sustained_freeze
+                && self.frozen.iter().any(|f| {
+                    past_freeze_limit(f) && reservation_for(reservations, &f.job).is_none()
+                });
+            // The cliff still uses time spent frozen as a tiebreaker for admitted jobs.
+            let rank_expired = overdue || (immediate && sustained_freeze);
             let expired_job = |job: &Job| {
                 self.frozen
                     .iter()
-                    .any(|f| same(&f.job, job) && now - f.since > self.policy.max_freeze)
+                    .any(|f| same(&f.job, job) && past_freeze_limit(f))
             };
             pool.sort_unstable_by_key(|j| {
                 let (class, excess) = rank(reservations, j);
                 (
                     class,
                     excess,
-                    overdue && expired_job(j),
+                    rank_expired && expired_job(j),
                     j.prefer,
                     j.start_us,
                     j.bytes,
                 )
             });
             let victim = pool.last();
-            let immediate = kill.iter().any(|a| a.immediate());
+            let mut unqueued = pool
+                .iter()
+                .rev()
+                .filter(|j| reservation_for(reservations, j).is_none());
+            let unqueued_victim = unqueued.clone().next();
             let urgent = !kill.is_empty();
             let highest = victim.map(|j| rank(reservations, j).0);
-            let ordinary_kill = highest != Some(0) || s.pressure == Pressure::Critical;
+            let highest_unqueued = unqueued_victim.map(|j| rank(reservations, j).0);
+            let ordinary_kill = highest_unqueued != Some(0) || s.pressure == Pressure::Critical;
             let reason = self.reasons(if urgent { &kill } else { &freeze });
             if immediate {
                 self.kill(
@@ -390,7 +405,7 @@ impl Engine {
                 let reason = format!("measured pressure persists; {}", self.overdue_reason());
                 self.kill(
                     now,
-                    victim,
+                    unqueued_victim,
                     false,
                     reason,
                     KillThreshold::Overdue,
@@ -399,13 +414,12 @@ impl Engine {
             } else if urgent
                 && !quiet
                 && ordinary_kill
-                && pool
-                    .iter()
-                    .any(|j| self.holds(j) && Some(rank(reservations, j).0) == highest)
+                && unqueued
+                    .any(|j| self.holds(j) && Some(rank(reservations, j).0) == highest_unqueued)
             {
                 self.kill(
                     now,
-                    victim,
+                    unqueued_victim,
                     false,
                     reason,
                     KillThreshold::Arms(kill),
@@ -447,7 +461,7 @@ impl Engine {
                 } else if urgent && !quiet && ordinary_kill {
                     self.kill(
                         now,
-                        victim,
+                        unqueued_victim,
                         false,
                         reason,
                         KillThreshold::Arms(kill),
@@ -897,13 +911,17 @@ mod tests {
                 limit: ReservationLimit::Learned(12 * GIB),
             },
         ];
-        for s in steady(0.0, 30, 0.86, 35) {
-            assert!(
+        let actions: Vec<_> = steady(0.0, 30, 0.86, 35)
+            .into_iter()
+            .flat_map(|s| {
                 e.step_with_admissions(&s, &reservations, || jobs.to_vec())
                     .actions
-                    .is_empty()
-            );
-        }
+            })
+            .collect();
+        assert!(
+            matches!(actions.as_slice(), [Action::Warn { text }] if text.ends_with("to kill")),
+            "{actions:?}"
+        );
         let step = e.step_with_admissions(&sample(30.0, 0.93, 35), &reservations, || jobs.to_vec());
         assert!(
             matches!(step.actions.as_slice(), [Action::Kill { job, immediate: true, .. }] if job.pgid == 11)
@@ -984,6 +1002,52 @@ mod tests {
         assert_eq!(kills(&actions), vec![(11.0, 10, false)]);
     }
 
+    #[test]
+    fn an_urgent_kill_skips_admitted_and_protected_groups() {
+        let mut e = Engine::new(Policy::default());
+        let admitted = job(10, 100, 8);
+        let mut protected = job(11, 200, 12);
+        protected.protected = true;
+        let mut jobs = vec![admitted.clone(), protected];
+        let reservations = [Reservation {
+            pgid: admitted.pgid,
+            start_us: admitted.start_us,
+            limit: ReservationLimit::Learned(4 * GIB),
+        }];
+        let actions: Vec<_> = steady(0.0, 13, 0.86, 35)
+            .iter()
+            .flat_map(|s| {
+                e.step_with_admissions(s, &reservations, || jobs.clone())
+                    .actions
+                    .into_iter()
+                    .map(|action| (s.time, action))
+            })
+            .collect();
+        assert!(
+            matches!(actions.as_slice(), [(1.0, Action::Freeze { job, .. }), (11.0, Action::Warn { text })]
+                if *job == admitted && text.ends_with("to kill")),
+            "{actions:?}"
+        );
+
+        jobs.extend([job(12, 300, 2), job(13, 400, 3)]);
+        let step = e.step_with_admissions(&sample(13.0, 0.86, 35), &reservations, || jobs.clone());
+        assert!(
+            matches!(step.actions.as_slice(), [Action::Freeze { job, .. }] if job.pgid == 13),
+            "{step:?}"
+        );
+        let actions: Vec<_> = steady(14.0, 11, 0.86, 35)
+            .iter()
+            .flat_map(|s| {
+                e.step_with_admissions(s, &reservations, || jobs.clone())
+                    .actions
+                    .into_iter()
+                    .map(|action| (s.time, action))
+            })
+            .collect();
+        assert_eq!(kills(&actions), [(24.0, 13, false)], "{actions:?}");
+        assert!(e.frozen().iter().any(|f| f.job == admitted));
+    }
+
     /// The cliff comes into view while an earlier freeze's settle period is still running:
     /// the jobs still running are frozen at once, not when the period ends. Only the kill
     /// that follows waits for the settle period.
@@ -1005,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn overdue_healthy_work_cannot_displace_a_runaway_or_unprofiled_candidate() {
+    fn at_the_cliff_a_runaway_outranks_an_overdue_admitted_job() {
         for profiled in [false, true] {
             let mut e = Engine::new(Policy::default());
             let healthy = job(11, 200, 8);
@@ -1042,12 +1106,11 @@ mod tests {
                 vec![healthy.clone()]
             });
             assert!(step.actions.is_empty());
-            let step =
-                e.step_with_admissions(&sample(904.0, 0.65, 35), &reservations, || vec![healthy]);
-            assert!(
-                matches!(step.actions.as_slice(), [Action::Kill { job, reason, .. }]
-                if job.pgid == 11 && reason.contains("frozen for more than"))
-            );
+            let step = e.step_with_admissions(&sample(904.0, 0.65, 35), &reservations, || {
+                vec![healthy.clone()]
+            });
+            assert!(step.actions.is_empty(), "{step:?}");
+            assert!(matches!(e.frozen(), [f] if f.job == healthy));
         }
     }
 
@@ -1108,6 +1171,30 @@ mod tests {
         let k = kills(&actions);
         assert_eq!(k.len(), 1);
         assert_eq!(k[0].0, 19.0);
+    }
+
+    #[test]
+    fn critical_pressure_spares_a_job_within_its_reservation() {
+        let mut e = Engine::new(Policy::default());
+        let admitted = job(10, 100, 8);
+        let reservations = [Reservation {
+            pgid: admitted.pgid,
+            start_us: admitted.start_us,
+            limit: ReservationLimit::Learned(12 * GIB),
+        }];
+        for second in 0..12 {
+            let mut s = sample(f64::from(second), 0.10, 35);
+            s.pressure = Pressure::Critical;
+            let step = e.step_with_admissions(&s, &reservations, || vec![admitted.clone()]);
+            if second == 9 {
+                assert!(
+                    matches!(step.actions.as_slice(), [Action::Warn { text }] if text.ends_with("to kill")),
+                    "{step:?}"
+                );
+            } else {
+                assert!(step.actions.is_empty(), "{step:?}");
+            }
+        }
     }
 
     /// One kill, then the strike arms stay quiet for the settle period while an emergency arm
@@ -1415,5 +1502,37 @@ mod tests {
         let jobs = [job(10, 100, 8)];
         let actions = drive(&mut e, &steady(0.0, 903, 0.65, 35), &jobs);
         assert_eq!(kills(&actions), [(902.0, 10, false)]);
+    }
+
+    #[test]
+    fn an_admitted_job_stays_frozen_past_the_overdue_limit() {
+        let admitted = job(10, 100, 8);
+        let reservations = [Reservation {
+            pgid: admitted.pgid,
+            start_us: admitted.start_us,
+            limit: ReservationLimit::Learned(4 * GIB),
+        }];
+        let unqueued = job(11, 200, 12);
+        for late_jobs in [vec![admitted.clone()], vec![unqueued.clone()]] {
+            let mut e = Engine::new(Policy::default());
+            let actions: Vec<_> = steady(0.0, 903, 0.65, 35)
+                .iter()
+                .flat_map(|s| {
+                    e.step_with_admissions(s, &reservations, || {
+                        if s.time == 902.0 {
+                            late_jobs.clone()
+                        } else {
+                            vec![admitted.clone()]
+                        }
+                    })
+                    .actions
+                    .into_iter()
+                    .map(|action| (s.time, action))
+                })
+                .collect();
+            assert_eq!(freezes(&actions).first(), Some(&(1.0, admitted.pgid)));
+            assert!(kills(&actions).is_empty(), "{actions:?}");
+            assert!(e.frozen().iter().any(|f| f.job == admitted));
+        }
     }
 }

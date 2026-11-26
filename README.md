@@ -11,7 +11,7 @@
 <p align="center">
   <b>A memory brake and queue for macOS.</b><br>
   Queues heavy dev and coding-agent jobs until there is memory for them, freezes runaway ones
-  before your Mac freezes, and kills only at the cliff.
+  before your Mac freezes, and kills admitted jobs only at the cliff.
 </p>
 
 <p align="center">
@@ -75,7 +75,8 @@ and a brake, working from the same view of memory:
   and it waits in line until there is memory for it, then starts. Admission is by
   memory, not by a fixed count. See [Queue](#queue-membrake-exec).
 - **The brake** deals with memory that runs short all the same: it freezes runaway
-  jobs before the Mac freezes, and kills only at the cliff.
+  jobs before the Mac freezes. Only the cliff's immediate thresholds can kill
+  admitted jobs.
 
 They are one ordered system: while the brake holds a frozen job the queue admits
 nothing, so frozen work comes back before new work starts.
@@ -89,8 +90,8 @@ stateDiagram-v2
     direction LR
     Running --> Frozen: measured pressure persists
     Frozen --> Running: five calm readings without sustained freeze pressure
-    Frozen --> Killed: measured kill pressure persists through the settle period
-    Running --> Killed: the measured cliff
+    Frozen --> Killed: sustained pressure (unqueued only), or the cliff
+    Running --> Killed: the cliff, or sustained pressure (unqueued only)
 ```
 
 1. **Freeze.** With tight memory, two readings at 60% compressor occupancy or
@@ -106,14 +107,16 @@ stateDiagram-v2
    resets it. Subsequent groups resume oldest first, spaced by the settle period.
    The queue's low-memory admission gate still applies.
 3. **Kill.** At sustained measured kill pressure the brake can send
-   `SIGTERM` with up to 5 s of grace (`--term-seconds`) before `SIGKILL`.
+   `SIGTERM` with up to 5 s of grace (`--term-seconds`) before `SIGKILL` to an
+   unqueued job.
    With tight memory and occupancy at 92% or swap headroom below 2 GB,
-   it sends `SIGKILL` immediately. An overdue frozen job can bypass the
-   settle period after 15 minutes of freezing once a freeze arm fully trips.
-   The same victim ranking applies. After the `SIGTERM` grace period, the brake
-   checks the kill thresholds that fired, or the freeze tier for an overdue
-   kill. If the triggering pressure has cleared, the brake leaves the group
-   running and logs the abandoned kill.
+   it sends `SIGKILL` immediately and admitted jobs are eligible. A frozen
+   unqueued job can trigger an overdue kill after 15 minutes of freezing once
+   a freeze arm fully trips, bypassing the settle period.
+   The same victim ranking applies among eligible groups. After the `SIGTERM`
+   grace period, the brake checks the kill thresholds that fired, or the freeze
+   tier for an overdue kill. If the triggering pressure has cleared, the brake
+   leaves the group running and logs the abandoned kill.
 
 The first victim class includes unqueued heavy groups and jobs that exceed
 a learned reservation. The brake ranks by excess bytes and counts the full
@@ -123,7 +126,7 @@ group footprint as excess for unqueued groups. Waiting and relaying
 even with `--min-job-gb 0`.
 The daemon measures admitted command groups in full for their queue reservations.
 Cold jobs above their starting reservation rank next.
-Jobs within their starting reservation are eligible only at the kill tiers
+Jobs within their starting reservation are eligible only at the cliff
 and rank last, newest first. The samples log records the starting reservations
 so replay uses the same ranking.
 
@@ -304,7 +307,7 @@ membrake replay samples.tsv    # run a recording back through the policy
 | `--min-job-gb GB` | `1` | Ignore jobs smaller than this |
 | `--settle-seconds S` | `10` | Spacing between freezes, resumes and kills |
 | `--cpu-headroom-percent PERCENT` | `20` | Share of logical cores subtracted from the soft CPU budget, which has a one-core minimum |
-| `--max-freeze-minutes M` | `15` | Allow an overdue kill once a freeze arm fully trips |
+| `--max-freeze-minutes M` | `15` | Allow an overdue kill of an unqueued job once a freeze arm fully trips |
 | `--term-seconds S` | `5` | Grace between `SIGTERM` and `SIGKILL` (none at the cliff) |
 | `--on-event CMD` | — | Run on every freeze, resume and kill, with `MEMBRAKE_*` variables |
 | `--state-dir DIR` | `/var/db/membrake` | Where frozen jobs are recorded, and the queue's `queue.tsv` and `sizes.tsv` |
