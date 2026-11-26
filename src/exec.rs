@@ -77,9 +77,14 @@ impl Admission {
         (pid > 0 && start_us > 0).then_some(Self { pid, start_us })
     }
 
+    /// A command that switched to another user cannot read its admitting client (macOS answers
+    /// EPERM for another uid's process); a process that exists is then taken to be it.
     fn is_live(&self) -> bool {
-        matches!(jobs::probe(self.pid), jobs::Probe::Found(client)
-            if !client.zombie && client.start_us == self.start_us)
+        match jobs::probe(self.pid) {
+            jobs::Probe::Found(client) => !client.zombie && client.start_us == self.start_us,
+            jobs::Probe::Unreadable(e) => e.kind() == io::ErrorKind::PermissionDenied,
+            jobs::Probe::Gone => false,
+        }
     }
 }
 
