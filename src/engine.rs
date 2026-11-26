@@ -65,6 +65,14 @@ impl Policy {
     pub(crate) fn freeze_occupancy_tripped(&self, tight: bool, occupancy: f64) -> bool {
         tight && occupancy >= self.freeze_occupancy
     }
+
+    pub(crate) fn freeze_pressure(&self, s: &Signals, tight: bool) -> bool {
+        View {
+            tight,
+            ..View::new(s, self)
+        }
+        .freeze_pressure(self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

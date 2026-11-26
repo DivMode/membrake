@@ -397,9 +397,12 @@ Requests are ordered by the time of their first connection attempt. A
 reconnecting request keeps that timestamp. The scheduler uses the following
 conditions:
 
-- Reliable memory readings must show that memory has recovered, and the brake
-  must hold no frozen job. An unresolved stop record holds admission for up to
-  300 s while the brake continues trying to resume it.
+- Reliable memory readings must be below the freeze tier, and the brake must
+  hold no frozen job. With nothing running, the head can start even while
+  memory is tight or its estimate exceeds the cap. While memory is tight with
+  another job running, a request estimated below `--min-job-gb` may pass a held
+  head if it fits the memory cap and CPU budget. An unresolved stop record
+  holds admission for up to 300 s while the brake continues trying to resume it.
 - `background + reserved + need < cap`. Background is the last 5 s of
   measured memory in use, less the admitted footprints measured with each
   reading. Each running job holds the greater of its starting need and 125%
@@ -462,7 +465,9 @@ live in `sizes.tsv`. A labeled command uses its legacy command-signature
 profile until it learns a profile of its own.
 
 `membrake status` shows the cap, measured background use, running jobs and
-current reservations, and waiting jobs' positions and reasons.
+current reservations, and waiting jobs' positions and reasons. After more
+than ten minutes in the queue, a request still waiting while nothing runs is
+marked stalled and gets one warning per idle spell in the events log.
 
 ### When the queue is unavailable
 

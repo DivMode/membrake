@@ -27,6 +27,7 @@ const PROBE_MAX_PERCENT: u64 = 75;
 const HISTORY: usize = 64;
 const FRESH_SAMPLE_SECONDS: f64 = 2.5;
 const EXCLUSIVE_WAIT_SECONDS: f64 = 600.0;
+const STALL_WAIT_SECONDS: f64 = 10.0 * 60.0;
 const CPU_WINDOW_SECONDS: f64 = 10.0;
 const COLD_PLATEAU_SECONDS: f64 = 30.0;
 /// Readings a plateau needs inside its window (the sampler runs once a second), so a gap in
@@ -131,6 +132,7 @@ pub struct Waiting {
     pub signature: String,
     /// Wall-clock seconds when it asked.
     pub since: f64,
+    stalled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -372,6 +374,7 @@ pub struct Place {
     pub session: i32,
     pub since: f64,
     pub label: String,
+    pub(crate) stalled: bool,
 }
 
 /// A command that has been told to start, as it is shown to the world.
@@ -419,8 +422,9 @@ pub struct Scheduler {
     background: History,
     /// None until the first reading says how much RAM there is.
     cap: Option<u64>,
-    /// The latest reading trips the engine's compressor freeze arm.
+    /// The latest reading reaches the freeze tier or is critical.
     freeze_pressure: bool,
+    min_job_bytes: u64,
     ram: u64,
     /// Background memory averaged over the last `USED_WINDOW`.
     used: u64,
@@ -469,6 +473,7 @@ impl Scheduler {
             background: History::new(),
             cap: None,
             freeze_pressure: false,
+            min_job_bytes: Policy::default().min_job_bytes,
             ram: 0,
             used: 0,
             cpu_budget,
@@ -518,6 +523,7 @@ impl Scheduler {
                 label,
                 signature,
                 since: wall,
+                stalled: false,
             },
         );
         self.next_id
@@ -722,6 +728,32 @@ impl Scheduler {
         self.used.saturating_add(reserved).saturating_add(need) < self.cap.unwrap_or(0)
     }
 
+    /// A command whose learned peak is below the engine's freeze minimum: the brake would never
+    /// freeze it. Compared without the reservation margin, which the engine does not see.
+    fn below_freeze_minimum(&self, estimate: Estimate) -> bool {
+        estimate
+            .demand
+            .bytes
+            .is_some_and(|bytes| bytes < self.min_job_bytes)
+    }
+
+    /// Marks old requests still waiting after admission, and yields each once per idle spell.
+    pub(crate) fn new_stalls(&mut self, wall: f64) -> impl Iterator<Item = &Waiting> {
+        let waiting = if self.running.is_empty() {
+            self.waiting.as_mut_slice()
+        } else {
+            &mut []
+        };
+        waiting.iter_mut().filter_map(move |job| {
+            if !job.stalled && wall - job.since > STALL_WAIT_SECONDS {
+                job.stalled = true;
+                Some(&*job)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Copies the queue in reservation order and each admitted job's current reservation.
     pub fn snapshot(&self, learned: &dyn Fn(&str) -> Demand, out: &mut Snapshot) {
         out.ram = self.ram;
@@ -767,6 +799,7 @@ impl Scheduler {
             place.session = w.session;
             place.since = w.since;
             place.label.clone_from(&w.label);
+            place.stalled = w.stalled;
         }
 
         refit(&mut out.running, self.running.len());
@@ -786,7 +819,15 @@ impl Scheduler {
     /// Takes one reading and admits every request that fits. Clears `out`, then appends the
     /// admitted ids in order. Allocation-free when nobody is waiting.
     pub fn step(&mut self, s: &Sample, learned: &dyn Fn(&str) -> Demand, out: &mut Vec<Id>) {
-        self.step_at(s, s.time, &Policy::default(), learned, out);
+        let policy = Policy::default();
+        self.step_at(
+            s,
+            s.time,
+            &policy,
+            policy.freeze_occupancy_tripped(s.tight, s.occupancy),
+            learned,
+            out,
+        );
     }
 
     pub(crate) fn step_at(
@@ -794,6 +835,7 @@ impl Scheduler {
         s: &Sample,
         decision_time: f64,
         policy: &Policy,
+        freeze_pressure: bool,
         learned: &dyn Fn(&str) -> Demand,
         out: &mut Vec<Id>,
     ) {
@@ -803,7 +845,8 @@ impl Scheduler {
         self.ram = s.ram;
         self.tight = s.tight;
         self.frozen = s.frozen;
-        self.freeze_pressure = policy.freeze_occupancy_tripped(s.tight, s.occupancy);
+        self.freeze_pressure = freeze_pressure;
+        self.min_job_bytes = policy.min_job_bytes;
         if self.cap.is_none() {
             self.cap = Some(percent(s.ram, START_PERCENT));
             self.quiet_since = now;
@@ -869,25 +912,31 @@ impl Scheduler {
                 .exclusive_turn
                 .filter(|(id, _)| *id == head.id)
                 .or_else(|| self.exclusive(estimate.need).then_some((head.id, now)));
-            if self.tight || self.frozen {
+            if self.freeze_pressure || self.frozen {
                 break;
             }
             let exclusive = match self.exclusive_turn {
-                Some((_, since)) => {
+                Some((_, since)) if !self.tight || self.running.is_empty() => {
                     let Some(rule) = self.exclusive_admission(estimate.need, reserved, since)
                     else {
                         break;
                     };
                     Some(rule)
                 }
-                None => None,
+                _ => None,
             };
             let fits = |need| self.fits(need, reserved, committed);
+            let head_fits =
+                (!self.tight || self.below_freeze_minimum(estimate)) && fits(estimate.need);
             let (at, estimate, backfill_for) =
-                if self.running.is_empty() || exclusive.is_some() || fits(estimate.need) {
+                if self.running.is_empty() || exclusive.is_some() || head_fits {
                     (head_at, estimate, None)
                 } else {
-                    let start = self.earliest_start(estimate.need);
+                    let start = if self.tight {
+                        None
+                    } else {
+                        self.earliest_start(estimate.need)
+                    };
                     let Some(backfill) = self
                         .waiting
                         .iter()
@@ -901,12 +950,17 @@ impl Scheduler {
                             {
                                 return None;
                             }
-                            let can_backfill = match start {
-                                Some(start) => candidate.demand.runtime_ms.is_some_and(|ms| {
+                            let can_backfill = if self.tight {
+                                // A large head has no start time while tight. Small jobs may
+                                // still use capacity available under the cap and CPU budget.
+                                self.below_freeze_minimum(candidate)
+                            } else if let Some(start) = start {
+                                candidate.demand.runtime_ms.is_some_and(|ms| {
                                     let runtime = ms as f64 / 1000.0;
                                     now + runtime + (runtime * 0.25).max(0.25) <= start
-                                }),
-                                None => self.fits_spare(head.id, estimate.need, candidate),
+                                })
+                            } else {
+                                self.fits_spare(head.id, estimate.need, candidate)
                             };
                             can_backfill.then_some((at, candidate, Some(head.id)))
                         })
@@ -918,6 +972,11 @@ impl Scheduler {
             let Estimate { need, demand, .. } = estimate;
             let cpu_need = self.cpu_need(demand);
             let w = self.waiting.remove(at);
+            if self.running.is_empty() {
+                for job in &mut self.waiting {
+                    job.stalled = false;
+                }
+            }
             self.running.push(Running {
                 id: w.id,
                 session: w.session,
@@ -1556,31 +1615,26 @@ mod tests {
         );
     }
 
-    /// Memory the engine calls tight, or a job it holds frozen, stops every admission, however
-    /// little is in use.
     #[test]
-    fn nothing_is_admitted_while_memory_is_tight_or_a_job_is_frozen() {
+    fn nothing_is_admitted_while_freeze_pressure_is_active_or_a_job_is_frozen() {
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
-        let a = ask(&mut q, 1, "a");
-        assert_eq!(step(&mut q, &at(0.0, 35), &unknown), None, "tight");
+        let small = |_: &str| memory(Some(GIB / 5));
+        let a = ask(&mut q, 1, "small");
+        let pressure = Sample {
+            tight: true,
+            occupancy: Policy::default().freeze_occupancy,
+            ..calm(0.0)
+        };
+        assert_eq!(step(&mut q, &pressure, &small), None, "freeze pressure");
         let frozen = Sample {
             frozen: true,
             ..calm(1.0)
         };
-        assert_eq!(step(&mut q, &frozen, &unknown), None, "frozen");
-        let pressure = Sample {
-            tight: true,
-            ..calm(2.0)
-        };
+        assert_eq!(step(&mut q, &frozen, &small), None, "frozen");
         assert_eq!(
-            step(&mut q, &pressure, &unknown),
-            None,
-            "tight by pressure alone"
-        );
-        assert_eq!(
-            step(&mut q, &calm(3.0), &unknown),
+            step(&mut q, &at(2.0, 35), &small),
             Some(a),
-            "calm and thawed"
+            "below the freeze tier and thawed"
         );
     }
 
@@ -1787,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn arrivals_obey_the_last_samples_tight_and_frozen_conditions() {
+    fn arrivals_obey_the_last_samples_freeze_pressure_and_frozen_conditions() {
         for (tight, frozen) in [(true, false), (false, true)] {
             let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
             let mut out = Vec::new();
@@ -1795,6 +1849,7 @@ mod tests {
                 &Sample {
                     tight,
                     frozen,
+                    occupancy: Policy::default().freeze_occupancy,
                     ..at(0.0, 35)
                 },
                 &unknown,
@@ -2018,25 +2073,100 @@ mod tests {
         assert_eq!(q.running()[1].exclusive, Some(ExclusiveAdmission::TimedOut));
     }
 
-    /// With nothing running the next command starts although it does not fit (a machine that
-    /// is busy with other things never gets quieter), but never while memory is tight, and
-    /// once it runs the next one has to fit.
+    /// With nothing running the next command starts even when memory is tight and it does
+    /// not fit. Once it runs the next large command waits.
     #[test]
     fn the_next_command_starts_when_nothing_runs_even_if_it_does_not_fit() {
         let big = |_: &str| memory(Some(30 * GIB));
         let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
         let (a, b) = (ask(&mut q, 1, "a"), ask(&mut q, 1, "b"));
-        assert_eq!(step(&mut q, &at(0.0, 35), &big), None, "never while tight");
-        // 55 + 30 is over the cap, which the tight reading set to 65.
+        // The tight reading sets both background and cap to 65 GiB.
         assert_eq!(
-            step(&mut q, &at(1.0, 45), &big),
+            step(&mut q, &at(0.0, 35), &big),
             Some(a),
-            "alone: forward progress"
+            "alone: forward progress even while tight"
         );
         assert_eq!(run(&mut q, 2, 20, 45, &big), None, "now it has to fit");
         assert_eq!(q.waiting().len(), 1);
         q.release(a);
         assert_eq!(step(&mut q, &at(21.0, 45), &big), Some(b), "alone again");
+    }
+
+    #[test]
+    fn tight_memory_holds_a_large_head_while_another_job_runs() {
+        let learned = |_: &str| memory(Some(2 * GIB));
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let running = ask(&mut q, 1, "running");
+        assert_eq!(step(&mut q, &calm(0.0), &learned), Some(running));
+        step(&mut q, &at(20.0, 25), &learned);
+        let head = ask(&mut q, 2, "head");
+        assert_eq!(step(&mut q, &at(25.0, 38), &learned), None);
+        assert!(q.fits_memory(5 * GIB / 2, q.reserved()));
+        assert_eq!(q.waiting()[0].id, head);
+    }
+
+    #[test]
+    fn tight_memory_lets_small_jobs_backfill_within_the_cap_and_cpu_budget() {
+        let learned = |name: &str| match name {
+            "head" => memory(Some(80 * GIB)),
+            "minimum" => unknown(name),
+            // Below the freeze minimum, although its reservation (with margin) is not.
+            _ => memory(Some(900 * GIB / 1024)),
+        };
+        let mut q = Scheduler::with_cpu_budget(2 * MILLICORES);
+        let running = ask(&mut q, 1, "running");
+        assert_eq!(step(&mut q, &calm(0.0), &learned), Some(running));
+        let head = ask(&mut q, 2, "head");
+        let minimum = ask(&mut q, 3, "minimum");
+        let small = ask(&mut q, 4, "small");
+        let another = ask(&mut q, 5, "another");
+        assert_eq!(step(&mut q, &at(20.0, 25), &learned), None, "at the cap");
+        assert_eq!(step(&mut q, &at(25.0, 35), &learned), Some(small));
+        assert_eq!(
+            q.waiting().iter().map(|w| w.id).collect::<Vec<_>>(),
+            [head, minimum, another]
+        );
+        assert_eq!(q.running()[1].backfill_for, Some(head));
+        assert_eq!(
+            step(&mut q, &at(30.0, 38), &learned),
+            None,
+            "at the CPU budget with memory to spare"
+        );
+    }
+
+    #[test]
+    fn old_waiters_are_reported_once_per_idle_stall() {
+        let mut q = Scheduler::with_cpu_budget(24 * MILLICORES);
+        let first = ask(&mut q, 1, "first");
+        let second = ask(&mut q, 2, "second");
+        let recent = q.enqueue(3, "recent".into(), "recent".into(), 10.0);
+        let stalls =
+            |q: &mut Scheduler, wall| q.new_stalls(wall).map(|job| job.id).collect::<Vec<_>>();
+        assert!(stalls(&mut q, STALL_WAIT_SECONDS).is_empty());
+        assert_eq!(stalls(&mut q, STALL_WAIT_SECONDS + 1.0), [first, second]);
+        assert!(stalls(&mut q, STALL_WAIT_SECONDS + 2.0).is_empty());
+
+        let time = STALL_WAIT_SECONDS + 3.0;
+        assert_eq!(
+            step(
+                &mut q,
+                &Sample {
+                    wall: time,
+                    ..at(time, 35)
+                },
+                &unknown
+            ),
+            Some(first)
+        );
+        let mut view = Snapshot::default();
+        q.snapshot(&unknown, &mut view);
+        assert!(view.waiting.iter().all(|w| !w.stalled));
+        assert!(stalls(&mut q, STALL_WAIT_SECONDS + 11.0).is_empty());
+
+        q.release(first);
+        assert_eq!(stalls(&mut q, STALL_WAIT_SECONDS + 12.0), [second, recent]);
+        q.snapshot(&unknown, &mut view);
+        assert!(view.waiting.iter().all(|w| w.stalled));
     }
 
     /// The cap is what was in use over the last 15 s whenever a reading is tight: here ten
