@@ -498,11 +498,9 @@ rejoin, it exits with an error. A new client exits immediately if there is
 no daemon, and a stale heartbeat (older than 60 s) also produces an error.
 A daemon restart leaves already running commands running.
 
-Inside an admitted command, a nested `membrake exec` runs directly while the
-daemon confirms that the admission in `MEMBRAKE_ADMITTED` is still live. A
-helper that outlives the reservation asks for its own turn, as does a caller
-with an invalid identity such as the legacy `1` value. If the daemon is
-unreachable, a nested call with a well-formed identity still runs directly.
+A nested `membrake exec` runs directly while the admitting client identified
+by `MEMBRAKE_ADMITTED` is still running. The call queues when that client exits
+or the inherited identity is invalid.
 `membrake run --dry-run` grants turns immediately and logs what the queue
 would have decided.
 
@@ -643,9 +641,8 @@ killing or rerunning it.
 
 ### Other agents and scripts
 
-Any tool that runs shell commands can use the same line. Inside a command that
-is already admitted, nested `membrake exec` calls share its live reservation,
-so a script that is queued as a whole can run its steps directly:
+Any tool that runs shell commands can use the same line. A script admitted as
+a whole can run its nested steps directly while its admitting client runs:
 
 ```sh
 membrake exec --label "full check" -- ./scripts/verify.sh

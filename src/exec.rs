@@ -3,7 +3,7 @@
 //!
 //! The client retries while the live broker keeps publishing samples. If a queued
 //! connection drops, it has a bounded window to rejoin. Nested commands run directly
-//! while they share a live admission, or when the broker cannot answer the liveness check.
+//! while the client that admitted them is still running.
 //!
 //! The command runs in a process group of its own (the job the brake freezes and the queue
 //! measures), at the caller's own priority: no nice, no QoS clamp. A clamp put admitted work
@@ -28,7 +28,7 @@
 
 use crate::jobs;
 use crate::queue::WaitReason;
-use crate::wire::{self, Admission, Completion, Message, Reply};
+use crate::wire::{self, Completion, Message, Reply};
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -61,6 +61,26 @@ pub struct Args {
     /// Stop what the command leaves running in its group when it ends, even when nothing
     /// interrupted it.
     pub reap: bool,
+}
+
+/// The client that started an admitted command, distinguished from a later user of its pid.
+struct Admission {
+    pid: i32,
+    start_us: u64,
+}
+
+impl Admission {
+    fn parse(text: &str) -> Option<Self> {
+        let (pid, start_us) = text.split_once(':')?;
+        let pid = pid.parse().ok()?;
+        let start_us = start_us.parse().ok()?;
+        (pid > 0 && start_us > 0).then_some(Self { pid, start_us })
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(jobs::probe(self.pid), jobs::Probe::Found(client)
+            if !client.zombie && client.start_us == self.start_us)
+    }
 }
 
 /// Best-effort stderr line. Not `eprintln!`, which panics when stderr is closed.
@@ -241,7 +261,7 @@ fn wait_for_turn(
                     return Err(Stopped::Unavailable(why));
                 }
                 Some(Reply::Error(why)) => return Err(Stopped::Refused(why)),
-                Some(Reply::Live(_)) | None => return Err(Stopped::Refused(UNEXPECTED.into())),
+                None => return Err(Stopped::Refused(UNEXPECTED.into())),
             }
         }
         if let Some(failure) = liveness.failure(socket, false) {
@@ -367,7 +387,10 @@ fn spawn(command: &[OsString], admission: Option<Admission>) -> Result<i32, NotR
     let mut env: Vec<(OsString, OsString)> =
         std::env::vars_os().filter(|(k, _)| k != ADMITTED).collect();
     if let Some(admission) = admission {
-        env.push((ADMITTED.into(), admission.to_string().into()));
+        env.push((
+            ADMITTED.into(),
+            format!("{}:{}", admission.pid, admission.start_us).into(),
+        ));
     }
     let envp = env
         .into_iter()
@@ -765,42 +788,6 @@ fn run_command(command: &[OsString], stream: UnixStream, reap_always: bool) -> i
     code
 }
 
-/// A parseable inherited identity may be used directly if the daemon cannot answer.
-/// A definitive answer must confirm the admission before the nested command shares it.
-fn shares_admission(socket: &Path, admission: Admission) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket) else {
-        return true;
-    };
-    if stream.set_write_timeout(Some(FIRST_ANSWER)).is_err()
-        || stream
-            .write_all(Message::IsLive(admission).line().as_bytes())
-            .is_err()
-    {
-        return true;
-    }
-    let deadline = Instant::now() + FIRST_ANSWER;
-    let mut input = Vec::new();
-    loop {
-        if let Some(line) = wire::take_line(&mut input) {
-            return line.len() <= wire::MAX_LINE && Reply::parse(&line) == Some(Reply::Live(true));
-        }
-        if input.len() > wire::MAX_LINE {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
-            return true;
-        }
-        let mut chunk = [0u8; 256];
-        match stream.read(&mut chunk) {
-            Ok(0) => return true,
-            Ok(n) => input.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return true,
-        }
-    }
-}
-
 /// Runs `args.command`, queued for memory. Returns the exit code.
 pub fn run(args: Args) -> i32 {
     let Args {
@@ -809,11 +796,11 @@ pub fn run(args: Args) -> i32 {
         command,
         reap: reap_always,
     } = args;
-    if let Some(admission) = std::env::var(ADMITTED)
+    if std::env::var(ADMITTED)
         .ok()
         .as_deref()
         .and_then(Admission::parse)
-        && shares_admission(&socket, admission)
+        .is_some_and(|admission| admission.is_live())
     {
         // Replaces this process: the command is as direct as it can be.
         let error = Command::new(&command[0]).args(&command[1..]).exec();

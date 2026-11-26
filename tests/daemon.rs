@@ -2571,6 +2571,35 @@ fn queue_the_command_runs_at_the_callers_priority_in_a_group_of_its_own() {
     );
     assert_eq!(nested.code(), Some(0));
     assert!(Path::new(&nested_ran).exists());
+
+    // A fresh daemon holds new requests under freeze-tier pressure and has no record of
+    // the command that is still running under its original client.
+    let restarted = dir.join("restarted");
+    fs::create_dir(&restarted).unwrap();
+    let mut script = Script::new(&restarted);
+    script.tight(3);
+    let daemon = queue_daemon(&script, &restarted, &socket, NOTHING);
+    let after_restart = marker_file(&dir, "nested-after-restart");
+    let mut nested = Client::spawn_with(
+        &dir,
+        "after-restart",
+        &socket,
+        &["--label", "after-restart"],
+        &["touch", &after_restart],
+        false,
+        &[("MEMBRAKE_ADMITTED", admission.trim())],
+    );
+    let log = restarted.join("log");
+    wait_until("the nested command to run after the restart", 10, || {
+        assert!(
+            !events(&log).contains("after-restart asks for a turn"),
+            "the replacement daemon queued a nested call with a live admitting client"
+        );
+        script.tight(1);
+        Path::new(&after_restart).exists()
+    });
+    assert_eq!(nested.code(), Some(0));
+    assert!(daemon.terminate().success());
     drop(client);
     let _ = fs::remove_dir_all(&dir);
 }

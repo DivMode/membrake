@@ -72,8 +72,9 @@ enum Command {
     /// Below the freeze tier, tight memory allows the first job to start and lets jobs
     /// smaller than the freeze minimum use spare capacity. Frozen jobs stop admissions.
     /// If the queue is unavailable the client exits with an error. A queued client whose
-    /// connection drops has up to 30 s to rejoin before it exits with an error. A call inside
-    /// an admitted command shares its reservation while the admitting client still runs.
+    /// connection drops has up to 30 s to rejoin before it exits with an error. A nested
+    /// call runs directly while the `membrake exec` that admitted it is still running.
+    /// Otherwise, it queues.
     Exec(ExecArgs),
 }
 
